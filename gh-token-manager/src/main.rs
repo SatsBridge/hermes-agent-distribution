@@ -1,9 +1,12 @@
+#![cfg_attr(coverage, feature(coverage_attribute))]
+
 use std::{
+    collections::HashMap,
     error::Error,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -14,6 +17,7 @@ use http::header::ACCEPT;
 use octocrab::auth::{DeviceCodes, OAuth};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 #[derive(Parser)]
 #[command(about = "Issue and refresh a GitHub App user access token")]
@@ -29,7 +33,7 @@ struct Args {
     scope: String,
     /// Restrict the token to one repository ID
     #[arg(long)]
-    repository_id: Option<u64>,
+    repository_id: Option<String>,
     /// Ignore a cached token and start a new device authorization
     #[arg(long)]
     reauthenticate: bool,
@@ -43,59 +47,120 @@ fn parse_scope(scope: &str) -> Result<String, String> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct TokenCache {
-    client_id: String,
     #[serde(default)]
-    username: String,
-    #[serde(default)]
-    repository_id: Option<u64>,
-    access_token: String,
-    expires_at: Option<u64>,
-    refresh_token: Option<String>,
-    refresh_token_expires_at: Option<u64>,
+    clients: HashMap<String, ClientTokens>,
 }
 
-impl TokenCache {
-    fn from_oauth(
-        client_id: &str,
-        username: &str,
-        repository_id: Option<u64>,
-        oauth: &OAuth,
-    ) -> Self {
-        let now = unix_time();
-        Self {
-            client_id: client_id.to_owned(),
-            username: username.to_owned(),
-            repository_id,
+#[derive(Default, Serialize, Deserialize)]
+struct ClientTokens {
+    #[serde(default)]
+    users: HashMap<String, UserTokens>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct UserTokens {
+    token: Option<CachedToken>,
+    #[serde(default)]
+    repository_tokens: HashMap<String, CachedToken>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedToken {
+    verified_username: String,
+    access_token: String,
+    #[serde(with = "time::serde::timestamp::option")]
+    expires_at: Option<OffsetDateTime>,
+    refresh_token: Option<String>,
+    #[serde(with = "time::serde::timestamp::option")]
+    refresh_token_expires_at: Option<OffsetDateTime>,
+}
+
+impl CachedToken {
+    fn from_oauth(verified_username: &str, oauth: &OAuth) -> Result<Self, Box<dyn Error>> {
+        let now = OffsetDateTime::now_utc();
+        Ok(Self {
+            verified_username: verified_username.to_owned(),
             access_token: oauth.access_token.expose_secret().to_owned(),
-            expires_at: oauth.expires_in.map(|seconds| now + seconds as u64),
+            expires_at: token_expiry(now, oauth.expires_in)?,
             refresh_token: oauth
                 .refresh_token
                 .as_ref()
                 .map(|token| token.expose_secret().to_owned()),
-            refresh_token_expires_at: oauth
-                .refresh_token_expires_in
-                .map(|seconds| now + seconds as u64),
-        }
+            refresh_token_expires_at: token_expiry(now, oauth.refresh_token_expires_in)?,
+        })
     }
 
     fn access_token_valid(&self) -> bool {
-        self.expires_at
-            .is_none_or(|expiry| expiry > unix_time() + 60)
+        self.expires_at.is_none_or(|expiry| {
+            expiry > OffsetDateTime::now_utc().saturating_add(TimeDuration::seconds(60))
+        })
     }
 
     fn refresh_token_valid(&self) -> bool {
         self.refresh_token.is_some()
             && self
                 .refresh_token_expires_at
-                .is_none_or(|expiry| expiry > unix_time())
+                .is_none_or(|expiry| expiry > OffsetDateTime::now_utc())
+    }
+}
+
+impl TokenCache {
+    fn get(
+        &self,
+        client_id: &str,
+        username: &str,
+        repository_id: Option<&str>,
+    ) -> Option<&CachedToken> {
+        let user = self
+            .clients
+            .get(client_id)?
+            .users
+            .get(&username.to_ascii_lowercase())?;
+        match repository_id {
+            Some(repository_id) => user.repository_tokens.get(repository_id),
+            None => user.token.as_ref(),
+        }
     }
 
-    fn matches_request(&self, client_id: &str, username: &str, repository_id: Option<u64>) -> bool {
-        self.client_id == client_id
-            && self.username.eq_ignore_ascii_case(username)
-            && self.repository_id == repository_id
+    fn insert(
+        &mut self,
+        client_id: &str,
+        username: &str,
+        repository_id: Option<&str>,
+        token: CachedToken,
+    ) {
+        let user = self
+            .clients
+            .entry(client_id.to_owned())
+            .or_default()
+            .users
+            .entry(username.to_ascii_lowercase())
+            .or_default();
+        match repository_id {
+            Some(repository_id) => {
+                user.repository_tokens
+                    .insert(repository_id.to_owned(), token);
+            }
+            None => user.token = Some(token),
+        }
+    }
+
+    fn remove(&mut self, client_id: &str, username: &str, repository_id: Option<&str>) {
+        let Some(user) = self
+            .clients
+            .get_mut(client_id)
+            .and_then(|client| client.users.get_mut(&username.to_ascii_lowercase()))
+        else {
+            return;
+        };
+        match repository_id {
+            Some(repository_id) => {
+                user.repository_tokens.remove(repository_id);
+            }
+            None => user.token = None,
+        }
     }
 }
 
@@ -105,7 +170,7 @@ struct RefreshRequest<'a> {
     grant_type: &'static str,
     refresh_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repository_id: Option<u64>,
+    repository_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -114,7 +179,7 @@ struct DevicePollRequest<'a> {
     device_code: &'a str,
     grant_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repository_id: Option<u64>,
+    repository_id: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -174,7 +239,7 @@ async fn obtain_token(
     crab: &octocrab::Octocrab,
     api_base: &str,
     cache_path: &Path,
-) -> Result<TokenCache, Box<dyn Error>> {
+) -> Result<CachedToken, Box<dyn Error>> {
     let parent = cache_path
         .parent()
         .ok_or("cache path has no parent directory")?;
@@ -189,19 +254,16 @@ async fn obtain_token(
     let lock = lock_options.open(lock_path)?;
     lock.lock()?;
 
-    if args.reauthenticate {
-        match fs::remove_file(cache_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let mut token_cache = read_cache(cache_path)?;
+    let user_key = args.username.to_ascii_lowercase();
     let cached = if args.reauthenticate {
+        token_cache.remove(&args.client_id, &user_key, args.repository_id.as_deref());
+        write_cache(cache_path, &token_cache)?;
         None
     } else {
-        read_cache(cache_path)?.filter(|cache| {
-            cache.matches_request(&args.client_id, &args.username, args.repository_id)
-        })
+        token_cache
+            .get(&args.client_id, &user_key, args.repository_id.as_deref())
+            .cloned()
     };
     let (cache, changed) = match cached {
         Some(cache) if cache.access_token_valid() => (cache, false),
@@ -215,7 +277,7 @@ async fn obtain_token(
                         client_id: &args.client_id,
                         grant_type: "refresh_token",
                         refresh_token,
-                        repository_id: args.repository_id,
+                        repository_id: args.repository_id.as_deref(),
                     }),
                 ),
             )
@@ -224,15 +286,15 @@ async fn obtain_token(
                 (device_authorize(crab, args).await?, true)
             } else {
                 let oauth = reply.into_oauth()?;
-                (
-                    TokenCache::from_oauth(
-                        &args.client_id,
-                        &args.username,
-                        args.repository_id,
-                        &oauth,
-                    ),
-                    true,
-                )
+                let rotated = CachedToken::from_oauth(&cache.verified_username, &oauth)?;
+                token_cache.insert(
+                    &args.client_id,
+                    &user_key,
+                    args.repository_id.as_deref(),
+                    rotated.clone(),
+                );
+                write_cache(cache_path, &token_cache)?;
+                (rotated, false)
             }
         }
         _ => (device_authorize(crab, args).await?, true),
@@ -240,9 +302,15 @@ async fn obtain_token(
 
     let login = verify_username(&cache, &args.username, api_base).await?;
     let mut cache = cache;
-    cache.username = login;
+    cache.verified_username = login;
     if changed {
-        write_cache(cache_path, &cache)?;
+        token_cache.insert(
+            &args.client_id,
+            &user_key,
+            args.repository_id.as_deref(),
+            cache.clone(),
+        );
+        write_cache(cache_path, &token_cache)?;
     }
     Ok(cache)
 }
@@ -257,7 +325,7 @@ fn client(base_uri: &str) -> Result<octocrab::Octocrab, Box<dyn Error>> {
 async fn device_authorize(
     crab: &octocrab::Octocrab,
     args: &Args,
-) -> Result<TokenCache, Box<dyn Error>> {
+) -> Result<CachedToken, Box<dyn Error>> {
     let client_id = SecretString::from(args.client_id.clone());
     let codes = tokio::time::timeout(
         Duration::from_secs(10),
@@ -268,13 +336,8 @@ async fn device_authorize(
         "Open {} and enter code {}",
         codes.verification_uri, codes.user_code
     );
-    let oauth = poll_for_token(crab, &client_id, &codes, args.repository_id).await?;
-    Ok(TokenCache::from_oauth(
-        &args.client_id,
-        &args.username,
-        args.repository_id,
-        &oauth,
-    ))
+    let oauth = poll_for_token(crab, &client_id, &codes, args.repository_id.as_deref()).await?;
+    CachedToken::from_oauth(&args.username, &oauth)
 }
 
 #[derive(Deserialize)]
@@ -283,7 +346,7 @@ struct GitHubUser {
 }
 
 async fn verify_username(
-    cache: &TokenCache,
+    cache: &CachedToken,
     requested: &str,
     api_base: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -307,7 +370,7 @@ async fn poll_for_token(
     crab: &octocrab::Octocrab,
     client_id: &SecretString,
     codes: &DeviceCodes,
-    repository_id: Option<u64>,
+    repository_id: Option<&str>,
 ) -> Result<OAuth, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(codes.expires_in);
     let mut interval = Duration::from_secs(codes.interval);
@@ -350,10 +413,12 @@ fn cache_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(data_dir.join("gh-token-manager/token.json"))
 }
 
-fn read_cache(path: &Path) -> Result<Option<TokenCache>, Box<dyn Error>> {
+fn read_cache(path: &Path) -> Result<TokenCache, Box<dyn Error>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TokenCache::default());
+        }
         Err(error) => return Err(error.into()),
     };
     if !metadata.file_type().is_file() {
@@ -364,7 +429,7 @@ fn read_cache(path: &Path) -> Result<Option<TokenCache>, Box<dyn Error>> {
 
     let mut contents = Vec::new();
     File::open(path)?.read_to_end(&mut contents)?;
-    Ok(Some(serde_json::from_slice(&contents)?))
+    Ok(serde_json::from_slice(&contents)?)
 }
 
 fn write_cache(path: &Path, cache: &TokenCache) -> Result<(), Box<dyn Error>> {
@@ -393,32 +458,43 @@ fn write_cache(path: &Path, cache: &TokenCache) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn print_token(cache: &TokenCache) -> Result<(), Box<dyn Error>> {
+fn print_token(cache: &CachedToken) -> Result<(), Box<dyn Error>> {
     let output = TokenOutput {
-        username: &cache.username,
+        username: &cache.verified_username,
         access_token: &cache.access_token,
-        expires_at: cache.expires_at,
+        expires_at: cache
+            .expires_at
+            .and_then(|expiry| u64::try_from(expiry.unix_timestamp()).ok()),
         refresh_token: cache.refresh_token.as_deref(),
-        refresh_token_expires_at: cache.refresh_token_expires_at,
+        refresh_token_expires_at: cache
+            .refresh_token_expires_at
+            .and_then(|expiry| u64::try_from(expiry.unix_timestamp()).ok()),
     };
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
 
-fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+fn token_expiry(
+    now: OffsetDateTime,
+    seconds: Option<usize>,
+) -> Result<Option<OffsetDateTime>, Box<dyn Error>> {
+    seconds
+        .map(|seconds| {
+            let seconds = i64::try_from(seconds)?;
+            now.checked_add(TimeDuration::seconds(seconds))
+                .ok_or_else(|| "token expiry is out of range".into())
+        })
+        .transpose()
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use std::{
         fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::Command,
         sync::mpsc,
         thread,
@@ -429,12 +505,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        Args, DeviceCodes, TokenCache, client, obtain_token, parse_scope, poll_for_token,
-        read_cache, unix_time, write_cache,
+        Args, CachedToken, DeviceCodes, OAuthReply, TokenCache, cache_path, client, obtain_token,
+        parse_scope, poll_for_token, print_token, read_cache, token_expiry, write_cache,
     };
+    use time::OffsetDateTime;
 
     const TOKEN: &str = r#"{"access_token":"rotated-access","token_type":"bearer","scope":"offline_access","expires_in":3600,"refresh_token":"rotated-refresh","refresh_token_expires_in":86400}"#;
     const USER: &str = r#"{"login":"alice"}"#;
+    const USER_BOB: &str = r#"{"login":"bob"}"#;
 
     fn mock_server(
         responses: Vec<(u16, &'static str)>,
@@ -499,12 +577,33 @@ mod tests {
         }
     }
 
-    fn test_args(repository_id: Option<u64>) -> Args {
+    #[test]
+    fn request_reader_waits_for_header_and_body_completion() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream)
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"\r\n").unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"hello").unwrap();
+        assert!(server.join().unwrap().ends_with("hello"));
+    }
+
+    fn test_args(repository_id: Option<&str>) -> Args {
         Args {
             client_id: "app-id".into(),
             username: "alice".into(),
             scope: "offline_access".into(),
-            repository_id,
+            repository_id: repository_id.map(str::to_owned),
             reauthenticate: false,
         }
     }
@@ -516,15 +615,29 @@ mod tests {
             .join("token.json")
     }
 
-    fn expired_cache(repository_id: Option<u64>) -> TokenCache {
-        TokenCache {
-            client_id: "app-id".into(),
-            username: "alice".into(),
+    fn write_one_cache(
+        path: &Path,
+        client_id: &str,
+        repository_id: Option<&str>,
+        cache: &CachedToken,
+    ) {
+        let mut token_cache = TokenCache::default();
+        token_cache.insert(
+            client_id,
+            &cache.verified_username,
             repository_id,
+            cache.clone(),
+        );
+        write_cache(path, &token_cache).unwrap();
+    }
+
+    fn expired_cache() -> CachedToken {
+        CachedToken {
+            verified_username: "alice".into(),
             access_token: "old-access".into(),
-            expires_at: Some(unix_time()),
+            expires_at: Some(OffsetDateTime::now_utc()),
             refresh_token: Some("old-refresh".into()),
-            refresh_token_expires_at: Some(unix_time() + 3600),
+            refresh_token_expires_at: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
         }
     }
 
@@ -536,29 +649,48 @@ mod tests {
     }
 
     #[test]
+    fn oauth_reply_errors_and_missing_fields_are_rejected() {
+        for (reply, expected) in [
+            (r#"{"error":"access_denied"}"#, "access_denied"),
+            (
+                r#"{"error":"access_denied","error_description":"user denied"}"#,
+                "user denied",
+            ),
+        ] {
+            let reply: OAuthReply = serde_json::from_str(reply).unwrap();
+            match reply.into_oauth() {
+                Err(error) => assert_eq!(error, expected),
+                Ok(_) => panic!("OAuth error response unexpectedly became a token"),
+            }
+        }
+
+        let reply: OAuthReply =
+            serde_json::from_str(r#"{"token_type":"bearer","scope":"offline_access"}"#).unwrap();
+        assert!(reply.into_oauth().is_err());
+    }
+
+    #[test]
     fn cached_token_expiry_and_persistence_are_respected() {
-        let now = unix_time();
-        let cache = TokenCache {
-            client_id: "app-id".into(),
-            username: "user".into(),
-            repository_id: None,
+        let now = OffsetDateTime::now_utc();
+        let cache = CachedToken {
+            verified_username: "user".into(),
             access_token: "access".into(),
-            expires_at: Some(now + 120),
+            expires_at: Some(now + time::Duration::seconds(120)),
             refresh_token: Some("refresh".into()),
-            refresh_token_expires_at: Some(now + 600),
+            refresh_token_expires_at: Some(now + time::Duration::seconds(600)),
         };
         assert!(cache.access_token_valid());
         assert!(cache.refresh_token_valid());
-        assert!(cache.matches_request("app-id", "USER", None));
-        assert!(!cache.matches_request("app-id", "user", Some(42)));
-        assert!(!cache.matches_request("other-app", "user", None));
-
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!("cache-test-{}", std::process::id()))
             .join("token.json");
-        write_cache(&path, &cache).unwrap();
-        let restored = read_cache(&path).unwrap().unwrap();
+        write_one_cache(&path, "app-id", None, &cache);
+        let restored = read_cache(&path)
+            .unwrap()
+            .get("app-id", "USER", None)
+            .unwrap()
+            .clone();
         assert_eq!(restored.access_token, "access");
         assert_eq!(restored.refresh_token.as_deref(), Some("refresh"));
         #[cfg(unix)]
@@ -567,7 +699,7 @@ mod tests {
             0o600
         );
 
-        let expired = TokenCache {
+        let expired = CachedToken {
             expires_at: Some(now),
             refresh_token_expires_at: Some(now),
             ..restored
@@ -578,12 +710,234 @@ mod tests {
     }
 
     #[test]
+    fn cache_read_handles_missing_files_and_rejects_directories() {
+        let path = test_cache_path("cache-path-test");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        assert!(read_cache(&path).unwrap().clients.is_empty());
+        fs::create_dir_all(&path).unwrap();
+        assert!(read_cache(&path).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cache_path_and_expiry_conversion_are_bounded() {
+        assert!(
+            cache_path()
+                .unwrap()
+                .ends_with("gh-token-manager/token.json")
+        );
+        let now = OffsetDateTime::now_utc();
+        assert!(token_expiry(now, None).unwrap().is_none());
+        assert!(token_expiry(now, Some(usize::MAX)).is_err());
+    }
+
+    #[test]
+    fn cache_removal_is_scoped_to_requested_token() {
+        let mut cache = TokenCache::default();
+        cache.insert("app", "alice", None, expired_cache());
+        cache.insert("app", "alice", Some("repo"), expired_cache());
+        cache.remove("app", "alice", Some("repo"));
+        assert!(cache.get("app", "alice", Some("repo")).is_none());
+        assert!(cache.get("app", "alice", None).is_some());
+        cache.remove("app", "alice", None);
+        assert!(cache.get("app", "alice", None).is_none());
+        cache.remove("missing", "alice", None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_permission_errors_are_not_treated_as_missing() {
+        let path = test_cache_path("cache-permission-test");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::set_permissions(
+            path.parent().unwrap(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+        let result = read_cache(&path);
+        fs::set_permissions(
+            path.parent().unwrap(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(result.is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cache_write_removes_temporary_file_if_rename_fails() {
+        let path = test_cache_path("cache-write-failure-test");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        fs::create_dir_all(&path).unwrap();
+        let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        assert!(write_cache(&path, &TokenCache::default()).is_err());
+        assert!(!temp_path.exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn token_output_is_serialized() {
+        let cache = expired_cache();
+        print_token(&cache).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_keeps_tokens_for_multiple_users() {
+        let (base, seen, _release, server) =
+            mock_server(vec![(200, USER), (200, USER), (200, USER_BOB)], false);
+        let path = test_cache_path("multi-user-cache-test");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let mut alice = expired_cache();
+        alice.access_token = "alice-access".into();
+        alice.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        alice.refresh_token = None;
+        let mut alice_repository = expired_cache();
+        alice_repository.access_token = "alice-repository-42".into();
+        alice_repository.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        alice_repository.refresh_token = None;
+        let mut bob = expired_cache();
+        bob.verified_username = "bob".into();
+        bob.access_token = "bob-access".into();
+        bob.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        bob.refresh_token = None;
+        let mut caches = TokenCache::default();
+        caches.insert("app-id", "alice", None, alice);
+        caches.insert("app-id", "alice", Some("42"), alice_repository);
+        caches.insert("app-id", "bob", None, bob);
+        write_cache(&path, &caches).unwrap();
+        let serialized = serde_json::to_value(&caches).unwrap();
+        assert_eq!(
+            serialized["clients"]["app-id"]["users"]["alice"]["token"]["access_token"],
+            "alice-access"
+        );
+        assert_eq!(
+            serialized["clients"]["app-id"]["users"]["alice"]["repository_tokens"]["42"]["access_token"],
+            "alice-repository-42"
+        );
+
+        assert_eq!(
+            obtain_token(&test_args(None), &client(&base).unwrap(), &base, &path)
+                .await
+                .unwrap()
+                .access_token,
+            "alice-access"
+        );
+        let repository_args = test_args(Some("42"));
+        assert_eq!(
+            obtain_token(&repository_args, &client(&base).unwrap(), &base, &path)
+                .await
+                .unwrap()
+                .access_token,
+            "alice-repository-42"
+        );
+        let mut bob_args = test_args(None);
+        bob_args.username = "bob".into();
+        assert_eq!(
+            obtain_token(&bob_args, &client(&base).unwrap(), &base, &path)
+                .await
+                .unwrap()
+                .access_token,
+            "bob-access"
+        );
+
+        let caches = read_cache(&path).unwrap();
+        assert_eq!(caches.clients.len(), 1);
+        assert_eq!(caches.clients["app-id"].users.len(), 2);
+        assert_eq!(
+            caches.get("app-id", "alice", None).unwrap().access_token,
+            "alice-access"
+        );
+        assert_eq!(
+            caches
+                .get("app-id", "alice", Some("42"))
+                .unwrap()
+                .access_token,
+            "alice-repository-42"
+        );
+        assert_eq!(
+            caches.get("app-id", "bob", None).unwrap().access_token,
+            "bob-access"
+        );
+        for _ in 0..3 {
+            assert!(
+                seen.recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .starts_with("GET /user ")
+            );
+        }
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_token_without_refresh_and_reauthentication_are_scoped_by_user() {
+        let temporary_error = (400, r#"{"message":"invalid request"}"#);
+        let (base, seen, _release, server) = mock_server(vec![temporary_error; 2], false);
+        let path = test_cache_path("reauth-multi-user-test");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let mut alice = expired_cache();
+        alice.refresh_token = None;
+        let mut alice_repository = expired_cache();
+        alice_repository.access_token = "alice-repository-42".into();
+        alice_repository.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        let mut bob = expired_cache();
+        bob.verified_username = "bob".into();
+        bob.access_token = "bob-access".into();
+        bob.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        bob.refresh_token = None;
+        let mut caches = TokenCache::default();
+        caches.insert("app-id", "alice", None, alice);
+        caches.insert("app-id", "alice", Some("42"), alice_repository);
+        caches.insert("app-id", "bob", None, bob);
+        write_cache(&path, &caches).unwrap();
+
+        assert!(
+            obtain_token(&test_args(None), &client(&base).unwrap(), &base, &path)
+                .await
+                .is_err()
+        );
+        assert!(
+            read_cache(&path)
+                .unwrap()
+                .get("app-id", "alice", None)
+                .is_some()
+        );
+
+        let mut args = test_args(None);
+        args.reauthenticate = true;
+        assert!(
+            obtain_token(&args, &client(&base).unwrap(), &base, &path)
+                .await
+                .is_err()
+        );
+        let caches = read_cache(&path).unwrap();
+        assert!(caches.get("app-id", "alice", None).is_none());
+        assert_eq!(
+            caches
+                .get("app-id", "alice", Some("42"))
+                .unwrap()
+                .access_token,
+            "alice-repository-42"
+        );
+        assert_eq!(
+            caches.get("app-id", "bob", None).unwrap().access_token,
+            "bob-access"
+        );
+        for _ in 0..2 {
+            seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn concurrent_refresh_processes_keep_rotated_cache_and_repository_restriction() {
         let (base, seen, release, server) =
             mock_server(vec![(200, TOKEN), (200, USER), (200, USER)], true);
         let path = test_cache_path("process-lock-test");
         let _ = fs::remove_dir_all(path.parent().unwrap());
-        write_cache(&path, &expired_cache(Some(42))).unwrap();
+        write_one_cache(&path, "app-id", Some("42"), &expired_cache());
         let spawn = || {
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "tests::lock_child_process", "--nocapture"])
@@ -595,7 +949,7 @@ mod tests {
         };
         let mut first = spawn();
         let refresh = seen.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(refresh.contains(r#""repository_id":42"#));
+        assert!(refresh.contains(r#""repository_id":"42""#));
         assert!(refresh.contains(r#""refresh_token":"old-refresh""#));
         let mut second = spawn();
         thread::sleep(Duration::from_millis(100));
@@ -611,7 +965,12 @@ mod tests {
         }
         server.join().unwrap();
         assert_eq!(
-            read_cache(&path).unwrap().unwrap().refresh_token.as_deref(),
+            read_cache(&path)
+                .unwrap()
+                .get("app-id", "alice", Some("42"))
+                .unwrap()
+                .refresh_token
+                .as_deref(),
             Some("rotated-refresh")
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -624,9 +983,14 @@ mod tests {
         }
         let base = std::env::var("GH_TOKEN_MANAGER_TEST_BASE").unwrap();
         let path = PathBuf::from(std::env::var("GH_TOKEN_MANAGER_TEST_CACHE").unwrap());
-        let token = obtain_token(&test_args(Some(42)), &client(&base).unwrap(), &base, &path)
-            .await
-            .unwrap();
+        let token = obtain_token(
+            &test_args(Some("42")),
+            &client(&base).unwrap(),
+            &base,
+            &path,
+        )
+        .await
+        .unwrap();
         assert_eq!(token.access_token, "rotated-access");
     }
 
@@ -646,8 +1010,8 @@ mod tests {
         );
         let path = test_cache_path("bad-refresh-test");
         let _ = fs::remove_dir_all(path.parent().unwrap());
-        write_cache(&path, &expired_cache(Some(42))).unwrap();
-        let args = test_args(Some(42));
+        write_one_cache(&path, "app-id", Some("42"), &expired_cache());
+        let args = test_args(Some("42"));
         assert_eq!(
             obtain_token(&args, &client(&base).unwrap(), &base, &path)
                 .await
@@ -660,9 +1024,69 @@ mod tests {
             .collect();
         assert!(requests[0].contains(r#""grant_type":"refresh_token""#));
         assert!(requests[1].starts_with("POST /login/device/code "));
-        assert!(requests[2].contains(r#""repository_id":42"#));
+        assert!(requests[2].contains(r#""repository_id":"42""#));
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_poll_rejects_expiry_before_and_after_sleep() {
+        let client = client("http://127.0.0.1:1").unwrap();
+        let client_id = secrecy::SecretString::from("app-id");
+        let expired: DeviceCodes = serde_json::from_str(
+            r#"{"device_code":"device","user_code":"CODE","verification_uri":"https://github.com/login/device","expires_in":0,"interval":0}"#,
+        )
+        .unwrap();
+        assert!(
+            poll_for_token(&client, &client_id, &expired, None)
+                .await
+                .is_err()
+        );
+
+        let expires_after_sleep: DeviceCodes = serde_json::from_str(
+            r#"{"device_code":"device","user_code":"CODE","verification_uri":"https://github.com/login/device","expires_in":1,"interval":1}"#,
+        )
+        .unwrap();
+        assert!(
+            poll_for_token(&client, &client_id, &expires_after_sleep, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn device_poll_handles_pending_slowdown_and_terminal_error() {
+        let (base, seen, _release, server) = mock_server(
+            vec![
+                (200, r#"{"error":"authorization_pending"}"#),
+                (200, r#"{"error":"slow_down"}"#),
+                (200, r#"{"error":"access_denied"}"#),
+                (200, r#"{"error":"expired_token"}"#),
+            ],
+            false,
+        );
+        let codes: DeviceCodes = serde_json::from_str(
+            r#"{"device_code":"device","user_code":"CODE","verification_uri":"https://github.com/login/device","expires_in":30,"interval":0}"#,
+        )
+        .unwrap();
+        let client_id = secrecy::SecretString::from("app-id");
+        let client = client(&base).unwrap();
+        let denied = poll_for_token(&client, &client_id, &codes, None).await;
+        let expired = poll_for_token(&client, &client_id, &codes, None).await;
+        for (result, expected) in [(denied, true), (expired, false)] {
+            assert_eq!(
+                matches!(result, Err(error) if error.to_string().contains("access_denied")),
+                expected
+            );
+        }
+        for _ in 0..4 {
+            assert!(
+                seen.recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .starts_with("POST /login/oauth/access_token ")
+            );
+        }
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -694,11 +1118,11 @@ mod tests {
         let (base, seen, _release, server) = mock_server(vec![(200, r#"{"login":"bob"}"#)], false);
         let path = test_cache_path("username-test");
         let _ = fs::remove_dir_all(path.parent().unwrap());
-        let mut cache = expired_cache(None);
+        let mut cache = expired_cache();
         cache.access_token = "valid-access".into();
-        cache.expires_at = Some(unix_time() + 3600);
+        cache.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
         cache.refresh_token = None;
-        write_cache(&path, &cache).unwrap();
+        write_one_cache(&path, "app-id", None, &cache);
         let before = fs::read(&path).unwrap();
         assert!(
             obtain_token(&test_args(None), &client(&base).unwrap(), &base, &path)
@@ -721,7 +1145,7 @@ mod tests {
             mock_server(vec![(500, r#"{"message":"temporary failure"}"#)], false);
         let path = test_cache_path("transient-test");
         let _ = fs::remove_dir_all(path.parent().unwrap());
-        write_cache(&path, &expired_cache(None)).unwrap();
+        write_one_cache(&path, "app-id", None, &expired_cache());
         let before = fs::read(&path).unwrap();
         let args = test_args(None);
         assert!(
@@ -736,6 +1160,53 @@ mod tests {
         );
         server.join().unwrap();
         assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotated_credentials_survive_identity_verification_failure() {
+        let (base, seen, _release, server) = mock_server(
+            vec![
+                (200, TOKEN),
+                (500, r#"{"message":"temporary failure"}"#),
+                (500, r#"{"message":"temporary failure"}"#),
+                (500, r#"{"message":"temporary failure"}"#),
+                (500, r#"{"message":"temporary failure"}"#),
+                (200, USER),
+            ],
+            false,
+        );
+        let path = test_cache_path("rotated-before-user-test");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        write_one_cache(&path, "app-id", None, &expired_cache());
+
+        assert!(
+            obtain_token(&test_args(None), &client(&base).unwrap(), &base, &path)
+                .await
+                .is_err()
+        );
+        let rotated_cache = read_cache(&path).unwrap();
+        let rotated = rotated_cache.get("app-id", "alice", None).unwrap();
+        assert_eq!(rotated.access_token, "rotated-access");
+        assert_eq!(rotated.refresh_token.as_deref(), Some("rotated-refresh"));
+
+        assert_eq!(
+            obtain_token(&test_args(None), &client(&base).unwrap(), &base, &path)
+                .await
+                .unwrap()
+                .access_token,
+            "rotated-access"
+        );
+        let requests: Vec<_> = (0..6)
+            .map(|_| seen.recv_timeout(Duration::from_secs(2)).unwrap())
+            .collect();
+        assert!(requests[0].contains(r#""refresh_token":"old-refresh""#));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.starts_with("GET /user "))
+        );
+        server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
