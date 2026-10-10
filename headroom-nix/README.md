@@ -72,6 +72,3 @@ it under `share/doc/`.
 - `nix flake check` builds every package, runs their test suites and clippy, and
   checks formatting. This is what CI runs.
 - Commit messages follow Conventional Commits (a `convco` git hook enforces it).
-
-`headroom-nix/AGENTS.md` has the details an automated agent — or a hurried
-human — needs to work on the packaging itself.
