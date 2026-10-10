@@ -8,6 +8,8 @@
     git-hooks.url = "github:cachix/git-hooks.nix";
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
     git-hooks.inputs.flake-compat.follows = "flake-compat";
+    nix-github-actions.url = "github:nix-community/nix-github-actions";
+    nix-github-actions.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -18,6 +20,7 @@
       nixpkgs,
       nixpkgs-unstable,
       git-hooks,
+      nix-github-actions,
       treefmt-nix,
       ...
     }:
@@ -27,6 +30,22 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      ghTokenManagerFor =
+        system:
+        import ./gh-token-manager/nix.nix {
+          pkgs = nixpkgs.legacyPackages.${system};
+          coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
+          gitHooks = git-hooks.lib.${system};
+        };
+      headroomFor =
+        system:
+        import ./headroom-nix/nix {
+          pkgs = nixpkgs.legacyPackages.${system};
+          unstable = nixpkgs-unstable.legacyPackages.${system};
+          lib = nixpkgs.lib;
+          inherit system treefmt-nix;
+          inherit git-hooks;
+        };
       treefmtEval = forAllSystems (
         system:
         treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} {
@@ -39,50 +58,41 @@
     {
       packages = forAllSystems (
         system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
-          ghTokenManager = import ./gh-token-manager/nix.nix {
-            inherit pkgs coveragePkgs;
-            gitHooks = git-hooks.lib.${system};
-          };
-        in
-        {
-          gh-token-manager = ghTokenManager.package;
+        (headroomFor system).packages
+        // {
+          gh-token-manager = (ghTokenManagerFor system).package;
           default = self.packages.${system}.gh-token-manager;
         }
       );
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
-          ghTokenManager = import ./gh-token-manager/nix.nix {
-            inherit pkgs coveragePkgs;
-            gitHooks = git-hooks.lib.${system};
-          };
-        in
-        {
-          default = ghTokenManager.devShell;
-        }
-      );
+      apps = forAllSystems (system: {
+        inherit ((headroomFor system).apps) headroom headroom-proxy;
+      });
+      devShells = forAllSystems (system: {
+        gh-token-manager = (ghTokenManagerFor system).devShell;
+        headroom = (headroomFor system).devShell;
+      });
       checks = forAllSystems (
         system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
-          ghTokenManager = import ./gh-token-manager/nix.nix {
-            inherit pkgs coveragePkgs;
-            gitHooks = git-hooks.lib.${system};
-          };
-        in
-        {
+        (headroomFor system).checks
+        // {
           gh-token-manager = self.packages.${system}.gh-token-manager;
-          coverage = ghTokenManager.coverage;
+          coverage = (ghTokenManagerFor system).coverage;
           formatting = treefmtEval.${system}.config.build.check self;
-          pre-commit-check = ghTokenManager.pre-commit-check;
+          pre-commit-check = (ghTokenManagerFor system).pre-commit-check;
         }
       );
       formatter = forAllSystems (system: treefmtEval.${system}.config.build.wrapper);
+      overlays.default = final: _prev: {
+        gh-token-manager = self.packages.${final.stdenv.hostPlatform.system}.gh-token-manager;
+        inherit ((headroomFor final.stdenv.hostPlatform.system).packages)
+          headroom-proxy
+          headroom-py
+          headroom
+          headroom-hermes-plugin
+          ;
+      };
+      githubActions = nix-github-actions.lib.mkGithubMatrix {
+        checks = nixpkgs.lib.getAttrs [ "x86_64-linux" "aarch64-linux" ] self.checks;
+      };
     };
 }

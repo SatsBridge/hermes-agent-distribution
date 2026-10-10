@@ -1,0 +1,35 @@
+name: Nix Flake actions
+on:
+  pull_request:
+  push:
+permissions: {}
+jobs:
+  nix-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@71cf2267d89c5cb81562390fa70a37fa40b1305e # v6-beta
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+      - id: set-matrix
+        name: Generate Nix Matrix
+        run: |
+          set -Eeu
+          matrix="$(nix eval --json '.#githubActions.matrix')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+  nix-build:
+    name: ${{ matrix.name }} (${{ matrix.system }})
+    needs: nix-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix: ${{ fromJSON(needs.nix-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@71cf2267d89c5cb81562390fa70a37fa40b1305e # v6-beta
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+      - run: nix build -L ".#${MATRIX}"
+        env:
+          MATRIX: ${{ matrix.attr }}
