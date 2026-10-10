@@ -1,5 +1,5 @@
 {
-  description = "Small Rust utilities packaged with nixpkgs";
+  description = "Hermes Agent distribution and supporting tools";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -41,15 +41,14 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
+          ghTokenManager = import ./gh-token-manager/nix.nix {
+            inherit pkgs coveragePkgs;
+            gitHooks = git-hooks.lib.${system};
+          };
         in
         {
-          gh-token-manager = pkgs.rustPlatform.buildRustPackage {
-            pname = "gh-token-manager";
-            version = "0.1.0";
-            src = ./gh-token-manager;
-            nativeBuildInputs = [ pkgs.cacert ];
-            cargoLock.lockFile = ./gh-token-manager/Cargo.lock;
-          };
+          gh-token-manager = ghTokenManager.package;
           default = self.packages.${system}.gh-token-manager;
         }
       );
@@ -58,30 +57,13 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
-          hooks = self.checks.${system}.pre-commit-check;
+          ghTokenManager = import ./gh-token-manager/nix.nix {
+            inherit pkgs coveragePkgs;
+            gitHooks = git-hooks.lib.${system};
+          };
         in
         {
-          default = pkgs.mkShell {
-            packages =
-              builtins.attrValues {
-                inherit (pkgs)
-                  cargo
-                  rustc
-                  clippy
-                  rustfmt
-                  cacert
-                  ;
-              }
-              ++ [
-                coveragePkgs.cargo-llvm-cov
-                coveragePkgs.llvmPackages.llvm
-                coveragePkgs.python3
-              ]
-              ++ hooks.enabledPackages;
-            LLVM_COV = "${coveragePkgs.llvmPackages.llvm}/bin/llvm-cov";
-            LLVM_PROFDATA = "${coveragePkgs.llvmPackages.llvm}/bin/llvm-profdata";
-            shellHook = hooks.shellHook;
-          };
+          default = ghTokenManager.devShell;
         }
       );
       checks = forAllSystems (
@@ -89,64 +71,16 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
-          coverageCheck = coveragePkgs.rustPlatform.buildRustPackage {
-            pname = "gh-token-manager-coverage";
-            version = "0.1.0";
-            src = ./gh-token-manager;
-            cargoLock.lockFile = ./gh-token-manager/Cargo.lock;
-            doCheck = false;
-            nativeBuildInputs = [
-              coveragePkgs.cacert
-              coveragePkgs.cargo-llvm-cov
-              coveragePkgs.llvmPackages.llvm
-              coveragePkgs.python3
-            ];
-            LLVM_COV = "${coveragePkgs.llvmPackages.llvm}/bin/llvm-cov";
-            LLVM_PROFDATA = "${coveragePkgs.llvmPackages.llvm}/bin/llvm-profdata";
-            RUSTC_BOOTSTRAP = "1";
-            postBuild = ''
-              mkdir -p coverage
-              cargo llvm-cov --manifest-path Cargo.toml --offline --branch --json \
-                --output-path coverage/report.json
-              python3 check_coverage.py coverage/report.json
-            '';
-            installPhase = ''
-              mkdir -p "$out"
-              cp coverage/report.json "$out/coverage.json"
-            '';
+          ghTokenManager = import ./gh-token-manager/nix.nix {
+            inherit pkgs coveragePkgs;
+            gitHooks = git-hooks.lib.${system};
           };
         in
         {
           gh-token-manager = self.packages.${system}.gh-token-manager;
-          coverage = coverageCheck;
+          coverage = ghTokenManager.coverage;
           formatting = treefmtEval.${system}.config.build.check self;
-          pre-commit-check = git-hooks.lib.${system}.run {
-            src = ./gh-token-manager;
-            rootSrc = pkgs.lib.mkForce (
-              pkgs.runCommand "gh-token-manager-hook-source" { } ''
-                mkdir -p "$out"
-                cp -r ${./.}/. "$out/"
-                cp ${./gh-token-manager/Cargo.lock} "$out/Cargo.lock"
-              ''
-            );
-            package = pkgs.prek;
-            settings.rust = {
-              cargoManifestPath = "gh-token-manager/Cargo.toml";
-              check.cargoDeps = pkgs.rustPlatform.importCargoLock {
-                lockFile = ./gh-token-manager/Cargo.lock;
-              };
-            };
-            hooks.clippy = {
-              enable = true;
-              packageOverrides = {
-                inherit (pkgs) cargo clippy;
-              };
-              settings = {
-                denyWarnings = true;
-                offline = false;
-              };
-            };
-          };
+          pre-commit-check = ghTokenManager.pre-commit-check;
         }
       );
       formatter = forAllSystems (system: treefmtEval.${system}.config.build.wrapper);
