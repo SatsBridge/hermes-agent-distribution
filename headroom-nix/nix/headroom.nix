@@ -13,8 +13,8 @@
 # `headroom/` directory on sys.path and shadow this complete one.
 #
 # The upstream pytest suite runs against this installed tree with the real
-# dependency set; only individual network / process-spawn cases are deselected,
-# each with a reason below.
+# dependency set. Only individual sandbox-incompatible or variant-inapplicable
+# tests are deselected, with reasons below.
 {
   lib,
   stdenv,
@@ -28,11 +28,12 @@
   ast-grep,
   difftastic,
   scc,
+  git,
   headroomSource,
   headroom-py,
   headroom-proxy,
   rtk,
-  litellm,
+  codebaseMemoryMcp,
 }:
 let
   inherit (python3Packages) python;
@@ -50,25 +51,25 @@ let
     sys.exit(main())
   '';
 
-  # The three external CLI tools Headroom shells out to (headroom/binaries.py +
-  # headroom/rtk). Upstream fetches difft/scc/rtk from GitHub releases on first
-  # use; providing them on PATH makes `which()`/`get_rtk_path()` resolve them
-  # with no network, so the CLI is fully functional offline. ast-grep ships as a
-  # PyPI wheel dep but nixpkgs packages the same binary.
+  buildInfo = writeText "headroom-build-info.py" ''
+    BUILD_VERSION = "${headroomSource.version}"
+  '';
+
+  # Provide every subprocess tool on PATH; CBM and the other tools are Nix-built.
   bundledTools = builtins.attrValues {
     inherit ast-grep scc;
     difft = difftastic;
     inherit rtk;
+    codebase-memory-mcp = codebaseMemoryMcp;
   };
 
-  # The optional non-dev extras that make up `[all]` in pyproject.toml:
+  # The optional non-dev extras included by upstream's `[all]` in pyproject.toml:
   #   proxy, code, ml, memory, relevance, image, reports, otel, mcp,
   #   spreadsheet, html, evals, voice.
-  # Everything resolvable from nixpkgs 26.05 is listed here so the CLI is fully
-  # functional offline; litellm is the packaged 1.86.2 (nix/litellm.nix). Deps
-  # whose nixpkgs version is too old or absent are covered in nix/changes.md.
+  # Python packages come from the compatible nixpkgs-unstable Python 3.13 set;
+  # see nix/headroom-python.nix for the few upstream-version overrides.
   runtimeDeps = [
-    litellm
+    py.litellm
   ]
   ++ builtins.attrValues {
     inherit (py)
@@ -82,10 +83,12 @@ let
       magika
       zstandard
       websockets
+      orjson
       onnxruntime
       transformers
       # transformers 5.x (nixpkgs) needs huggingface-hub >=1.5.
       huggingface-hub
+      torch
       watchdog
       sqlite-vec
       # core (from pyproject [project.dependencies])
@@ -93,11 +96,14 @@ let
       pydantic
       click
       rich
+      pyyaml
+      tomlkit
+      truststore
       opentelemetry-api
       # [code]
       tree-sitter
+      tree-sitter-language-pack
       # [relevance]
-      fastembed
       numpy
       # [image]
       pillow
@@ -120,7 +126,9 @@ let
       # [memory]
       sentence-transformers
       ;
-  };
+  }
+  # nixpkgs marks fastembed unsupported on aarch64-linux.
+  ++ lib.optionals (stdenv.hostPlatform.system != "aarch64-linux") [ py.fastembed ];
 
   # tiktoken downloads its BPE vocab from openaipublic.blob.core.windows.net the
   # first time an encoding is used. The sandbox has no network, so the ~445
@@ -165,10 +173,8 @@ let
     )
   );
 
-  # Individual tests / whole files deselected for a sandbox-only reason (no
-  # network, no spawnable server, no /bin/bash, tmpfs mtime quirks, or a model
-  # download). No feature suite is disabled wholesale; each entry is a network /
-  # process / environment limitation of the build sandbox.
+  # Exclude individual tests only for sandbox limits, test-harness assumptions,
+  # or missing-extra cases that do not apply to the full `[all]` runtime package.
   disabledTestPaths = [
     "tests/test_memory_bridge.py" # optional qdrant vector backend
     "tests/test_memory/test_qdrant_env.py" # needs a live qdrant
@@ -184,8 +190,12 @@ let
     "test_init_codex_config_routes_messages_through_headroom"
     "test_provider_scope_codex_config_routes_messages_through_headroom"
     "test_dynamic_detector_import_skips_optional_ml_dependencies" # subprocess env
+    # Missing-extra tests are invalid for the `[all]` runtime package and can start a real proxy.
+    "test_proxy_command_exits_when_mcp_missing"
+    "test_ensure_proxy_dependencies_exits_when_fastapi_missing"
     "test_register_claude_hooks_survives_forked_daemon" # needs /bin/bash
     "test_switching_provider_recaptures" # tmpfs identical st_mtime_ns
+    "test_official_resets_a_captured_third_party_upstream" # same tmpfs mtime quirk
     "test_code_graph_watcher_init_start_stop_and_event_filtering" # same mtime quirk
     "test_no_native_tls_in_wheel_build_tree" # spawns cargo (no registry access)
     "test_harness_runs_against_mock_proxy_and_exits_zero" # spawns a mock proxy process
@@ -202,6 +212,27 @@ let
     # restart probe non-deterministic.
     "test_ensure_proxy_restarts_idle_stale_persistent_deployment"
     "test_ensure_proxy_restarts_idle_stale_ephemeral_proxy"
+    # These depend on a live process/PID or POSIX /usr/bin layout unavailable in the sandbox.
+    "test_ensure_proxy_stale_idle_restart_failures_are_actionable"
+    "test_sighup_on_launch_tool_releases_the_proxy"
+    "test_seized_gil_is_dumped_and_exited"
+    "test_healthy_process_is_never_shot"
+    "test_swapped_stderr_does_not_kill_the_heartbeat"
+    # These fixtures use public upstream hosts; the proxy's SSRF guard correctly rejects them offline.
+    "test_contract_disabled_by_env"
+    "test_claude_proxy_preserves_tool_use_items"
+    "test_claude_proxy_bypass_header_skips_compression"
+    "test_claude_proxy_no_model_forwarded_unchanged"
+    "test_claude_proxy_compression_applies_to_chat_messages"
+    "test_header_passed_as_upstream_base_url"
+    "test_header_value_is_trimmed_and_trailing_slash_stripped"
+    "test_chat_upstream_reconstruction_base_fails_head_passes"
+    "test_responses_upstream_reconstruction_base_fails_head_passes"
+    "test_query_string_is_preserved_for_reconstructed_upstream_paths"
+    "test_opencode_zen_reconstructed_chat_path_records_zen_provider"
+    # These assert unavailable installed extras, CLI test imports, or model readiness.
+    "test_ordinary_install_does_not_adopt_serena"
+    "test_cli_stateless_flag_exports_env_for_children"
     # These load HuggingFace-hosted embedding models at test time. The models are
     # small enough to package later, but not yet present in the offline build
     # cache, so keep the sandbox closed rather than allowing runtime downloads.
@@ -219,12 +250,19 @@ let
   # pytest `--deselect` needs a full node id, so bare test-name disables must go
   # through `-k` (substring match on the node id). `--ignore` works for whole
   # files. `-m` drops the slow / real-LLM / live-network marked cases.
-  deselectArgs = (map (p: "--ignore=${p}") disabledTestPaths) ++ [
-    "-k"
-    ("not (" + lib.concatStringsSep " or " disabledTests + ")")
-    "-m"
-    "not slow and not real_llm and not live"
+  # The offline LiteLLM backup omits this provider key; its remote refresh is intentionally disabled.
+  deselectedNodeIds = [
+    "tests/test_pricing_from_litellm.py::test_provider_prices_models_its_table_never_covered[groq/llama-guard-3-8b-0.2-0.2]"
   ];
+  deselectArgs =
+    (map (p: "--ignore=${p}") disabledTestPaths)
+    ++ (map (id: "--deselect=${id}") deselectedNodeIds)
+    ++ [
+      "-k"
+      ("not (" + lib.concatStringsSep " or " disabledTests + ")")
+      "-m"
+      "not slow and not real_llm and not live"
+    ];
 in
 py.buildPythonPackage {
   pname = "headroom";
@@ -249,11 +287,24 @@ py.buildPythonPackage {
   # Extra wrapper arguments applied by wrapPythonProgramsHook (which also injects
   # the propagated dependencies onto PYTHONPATH): the offline CLI tools on PATH
   # and libonnxruntime for the compiled core.
+  # Keep LiteLLM on its bundled map; a refresh would violate the offline runtime.
   makeWrapperArgs = [
+    # Prevent a caller's Python path from shadowing the pinned package set.
+    "--unset"
+    "PYTHONPATH"
     "--prefix"
     "PATH"
     ":"
     (lib.makeBinPath bundledTools)
+    "--set-default"
+    "LITELLM_LOCAL_MODEL_COST_MAP"
+    "True"
+    "--set"
+    "HEADROOM_BINARIES_OFFLINE"
+    "1"
+    "--set"
+    "DO_NOT_TRACK"
+    "1"
     "--set-default"
     "ORT_DYLIB_PATH"
     ortDylib
@@ -272,6 +323,7 @@ py.buildPythonPackage {
     cp -r headroom "$site/"
     cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.coreLib} \
       "$site/headroom/${headroom-py.coreLib}"
+    cp ${buildInfo} "$site/headroom/_build_info.py"
 
     mkdir -p "$out/bin"
     # The console-script body from pyproject (`headroom = headroom.cli:main`),
@@ -289,7 +341,19 @@ py.buildPythonPackage {
   # Full offline test run against the installed source with the real dependency
   # set. Only individual network / process-spawn cases are deselected, each with
   # a reason above.
-  nativeCheckInputs = builtins.attrValues { inherit (py) pytest pytest-asyncio; } ++ bundledTools;
+  # Test-only dependencies; these do not enter the runtime closure.
+  nativeCheckInputs =
+    builtins.attrValues {
+      inherit (py)
+        pytest
+        pytest-asyncio
+        respx
+        langchain-core
+        socksio
+        ;
+    }
+    ++ bundledTools
+    ++ [ git ];
   checkPhase = ''
     runHook preCheck
 
@@ -303,6 +367,7 @@ py.buildPythonPackage {
     # nixpkgs sets HOME=/homeless-shelter (non-writable); several tests write
     # under $HOME (rtk/wrap setup, memory db). Point it at a writable temp dir.
     export HOME=$(mktemp -d)
+    export USER=hermes LOGNAME=hermes
     # nixpkgs' stdenv forces SSL_CERT_FILE=/no-cert-file.crt for hermeticity.
     # The proxy startup builds an httpx.AsyncClient, and httpx reads that var to
     # seed its SSL context — a nonexistent path makes ssl.create_default_context
@@ -311,6 +376,7 @@ py.buildPythonPackage {
     # the context builds; no test makes an outbound TLS connection.
     export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
     export NIX_SSL_CERT_FILE=$SSL_CERT_FILE
+    export LITELLM_LOCAL_MODEL_COST_MAP=True
     export ORT_DYLIB_PATH=${ortDylib}
     # The proxy's /readyz and /health probe the configured upstream API with a
     # HEAD request at startup; with no network in the sandbox that probe fails
@@ -320,11 +386,19 @@ py.buildPythonPackage {
     # reports for real. Tests that exercise the probe itself override this per
     # test via monkeypatch (setenv/delenv), so the global default is safe.
     export HEADROOM_SKIP_UPSTREAM_CHECK=1
+    # Model artifacts are not vendored; prevent HuggingFace clients from retrying egress.
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
     # difft/scc/rtk/ast-grep resolve from PATH (no GitHub fetch). Belt-and-braces:
     # if any code path still tries to fetch a binary, fail closed instead of
     # reaching the network — the sandbox has none anyway.
     export PATH=${lib.makeBinPath bundledTools}:$PATH
     export HEADROOM_BINARIES_OFFLINE=1
+
+    # Preserve the Nix upstream-health opt-out; test-local HEADROOM flags stay scrubbed.
+    substituteInPlace tests/conftest.py \
+      --replace-fail 'if key.startswith("HEADROOM_"):' \
+                     'if key.startswith("HEADROOM_") and key != "HEADROOM_SKIP_UPSTREAM_CHECK":'
 
     ${py.python.interpreter} -m pytest -p no:cacheprovider -q \
       ${lib.escapeShellArgs deselectArgs}
@@ -335,6 +409,7 @@ py.buildPythonPackage {
   pythonImportsCheck = [
     "headroom"
     "headroom._core"
+    "headroom._build_info"
   ];
 
   passthru = {

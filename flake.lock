@@ -1,5 +1,26 @@
 {
   "nodes": {
+    "codebase-memory-mcp": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs-unstable"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789492584,
+        "narHash": "sha256-6CrxqkyxfsSENQBAuS7hwZFgQX+4Ocxx0CH6eIeqw3E=",
+        "owner": "DeusData",
+        "repo": "codebase-memory-mcp",
+        "rev": "8972ea69c6ad94b1ef1d4ffbf0a92d78d2db1798",
+        "type": "github"
+      },
+      "original": {
+        "owner": "DeusData",
+        "ref": "v0.11.0",
+        "repo": "codebase-memory-mcp",
+        "type": "github"
+      }
+    },
     "flake-compat": {
       "locked": {
         "lastModified": 1767039857,
@@ -92,6 +113,7 @@
     },
     "root": {
       "inputs": {
+        "codebase-memory-mcp": "codebase-memory-mcp",
         "flake-compat": "flake-compat",
         "git-hooks": "git-hooks",
         "nix-github-actions": "nix-github-actions",

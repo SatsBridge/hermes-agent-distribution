@@ -5,16 +5,17 @@ for Nix as part of the Hermes Agent distribution flake. Headroom sits in front
 of LLM APIs and trims token usage; its reproducible Nix packages are exposed by
 the parent flake.
 
-None of Headroom's source lives here. The flake fetches a pinned release with
-`fetchFromGitHub`, applies a couple of small patches, and builds it. Moving to a
-new Headroom version is a two-line change in
-`headroom-nix/nix/headroom-source.nix` (the commit and its hash).
+None of Headroom's source lives here. The flake fetches and builds a pinned
+release with `fetchFromGitHub`. The release, commit, and source hash are pinned
+in `headroom-nix/nix/headroom-source.nix`.
 
 ## The packages
 
 - **`headroom`** — the full command-line tool. It bundles the compiled core, the
-  Python code, and every optional non-dev runtime dependency, so the CLI works
-  offline out of the box.
+  Python code, and every dependency in upstream's `[all]` extra (not `dev`), so
+  the CLI works offline out of the box. Specialized extras outside `[all]` stay
+  opt-in. The wrapper provides `codebase-memory-mcp` v0.11.0 from the pinned
+  source flake and forces binary-download and telemetry opt-outs.
 - **`headroom-proxy`** — the Rust reverse proxy (axum + tokio): one binary you
   point your LLM client at.
 - **`headroom-py`** — the compiled Rust extension `headroom._core`, built as a
@@ -52,6 +53,9 @@ packages load ONNX Runtime dynamically from the Nix store instead. The binaries
 are wrapped to find it, so you don't set anything. If you build in an unusual
 environment and hit a "cannot find libonnxruntime" error, point
 `ORT_DYLIB_PATH` at a `libonnxruntime.so`.
+
+LiteLLM uses its bundled model-cost map instead of refreshing it from GitHub at
+startup; pricing metadata therefore stays at the packaged version.
 
 ## The Hermes plugin
 

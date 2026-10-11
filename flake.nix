@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
+    codebase-memory-mcp = {
+      url = "github:DeusData/codebase-memory-mcp/v0.11.0";
+      inputs.nixpkgs.follows = "nixpkgs-unstable";
+    };
     flake-compat.url = "github:NixOS/flake-compat";
     git-hooks.url = "github:cachix/git-hooks.nix";
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
@@ -19,6 +23,7 @@
       self,
       nixpkgs,
       nixpkgs-unstable,
+      codebase-memory-mcp,
       git-hooks,
       nix-github-actions,
       treefmt-nix,
@@ -42,6 +47,12 @@
         import ./headroom-nix/nix {
           pkgs = nixpkgs.legacyPackages.${system};
           unstable = nixpkgs-unstable.legacyPackages.${system};
+          codebaseMemory = codebase-memory-mcp.packages.${system}.default.overrideAttrs (_: {
+            version = "0.11.0";
+            src = codebase-memory-mcp.outPath;
+            # Keep the embedded binary version aligned with this flake pin.
+            CFLAGS_EXTRA = "-DCBM_VERSION=\\\"0.11.0\\\"";
+          });
           lib = nixpkgs.lib;
           inherit system treefmt-nix;
           inherit git-hooks;

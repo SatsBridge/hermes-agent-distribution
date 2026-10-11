@@ -3,6 +3,7 @@
 {
   pkgs,
   unstable,
+  codebaseMemory,
   lib,
   system,
   treefmt-nix,
@@ -10,6 +11,7 @@
 }:
 let
   headroomSource = import ./headroom-source.nix { inherit pkgs; };
+  headroomPythonPackages = import ./headroom-python.nix { inherit pkgs unstable; };
 
   # treefmt wrapper — the `nix fmt` formatter and the engine behind the treefmt
   # git hook. Built explicitly so the exact same wrapper backs `formatter`, the
@@ -26,17 +28,18 @@ let
   # fetched from GitHub at runtime.
   rtk = pkgs.callPackage ./rtk.nix { inherit unstable; };
 
-  # litellm: nixpkgs 26.05 ships 1.83, below Headroom's >=1.86.2 floor. Built as
-  # its own package (by analogy with rtk) by adapting the nixpkgs recipe to the
-  # newer version.
-  litellm = pkgs.callPackage ./litellm.nix { };
-
   # headroom-proxy: the Rust reverse-proxy binary.
-  headroom-proxy = pkgs.callPackage ./headroom-proxy.nix { inherit headroomSource; };
+  headroom-proxy = pkgs.callPackage ./headroom-proxy.nix {
+    inherit headroomSource;
+    inherit (unstable) onnxruntime;
+  };
 
   # headroom-py: the compiled Rust extension `headroom._core` as a standalone
   # Python package (maturin cdylib), stripped to just the `.so`.
-  headroom-py = pkgs.callPackage ./headroom-py.nix { inherit headroomSource; };
+  headroom-py = pkgs.callPackage ./headroom-py.nix {
+    inherit headroomSource;
+    inherit (unstable) onnxruntime;
+  };
 
   # headroom: the full Python distribution (pure-Python `headroom/` + the CLI),
   # depending on headroom-py for the compiled core.
@@ -46,8 +49,10 @@ let
       headroom-py
       headroom-proxy
       rtk
-      litellm
       ;
+    codebaseMemoryMcp = codebaseMemory;
+    python3Packages = headroomPythonPackages;
+    inherit (unstable) onnxruntime;
   };
 
   # headroom-hermes-plugin: the Hermes-Agent CCR retrieve plugin
