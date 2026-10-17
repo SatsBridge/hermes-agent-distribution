@@ -15,6 +15,7 @@
   perl,
   makeWrapper,
   clippy,
+  python3,
   onnxruntime,
   stdenv,
   libiconv,
@@ -23,7 +24,7 @@
 let
   # ONNX Runtime shared library that `ort` dlopens at runtime (load-dynamic;
   # see patches/0001). Wired at build, test, and run time.
-  ortDylib = "${lib.getLib onnxruntime}/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
+  ortDylib = "${lib.getLib onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
 
   commonArgs = {
     pname = "headroom-proxy";
@@ -35,6 +36,7 @@ let
     };
 
     buildAndTestSubdir = "crates/headroom-proxy";
+    checkType = "debug";
 
     strictDeps = true;
 
@@ -85,6 +87,7 @@ rustPlatform.buildRustPackage (
     postInstall = ''
       wrapProgram $out/bin/headroom-proxy \
         --set-default ORT_DYLIB_PATH "${ortDylib}"
+      ${python3}/bin/python3 -c 'import ctypes; ctypes.CDLL("${ortDylib}")'
     '';
 
     passthru.clippy = clippyCheck;

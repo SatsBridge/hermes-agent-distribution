@@ -80,6 +80,7 @@ python3Packages.buildPythonPackage {
   # removed), so a plain `pythonImportsCheck` would fail. Verify the extension
   # is present and dynamically loadable instead.
   doCheck = false;
+  dontCheckPythonMetadata = true; # The wheel's distribution name is headroom-ai.
   dontCheckRuntimeDeps = true;
   installCheckPhase = ''
     runHook preInstallCheck

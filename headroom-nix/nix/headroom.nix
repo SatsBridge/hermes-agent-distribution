@@ -63,11 +63,8 @@ let
     codebase-memory-mcp = codebaseMemoryMcp;
   };
 
-  # The optional non-dev extras included by upstream's `[all]` in pyproject.toml:
-  #   proxy, code, ml, memory, relevance, image, reports, otel, mcp,
-  #   spreadsheet, html, evals, voice.
-  # Python packages come from the compatible nixpkgs-unstable Python 3.13 set;
-  # see nix/headroom-python.nix for the few upstream-version overrides.
+  # All applicable optional extras except dev, including extras not selected by
+  # upstream's narrower `[all]`; see check-extra-dependencies.py.
   runtimeDeps = [
     py.litellm
   ]
@@ -75,6 +72,7 @@ let
     inherit (py)
       # [proxy]
       fastapi
+      gunicorn
       uvicorn
       httpx
       h2 # httpx[http2] extra — required by the proxy's HTTP/2 client
@@ -103,6 +101,11 @@ let
       # [code]
       tree-sitter
       tree-sitter-language-pack
+      # [vector] and [memory-stack]
+      hnswlib
+      mem0ai
+      qdrant-client
+      neo4j
       # [relevance]
       numpy
       # [image]
@@ -125,6 +128,20 @@ let
       anthropic
       # [memory]
       sentence-transformers
+      # [anyllm]
+      any-llm-sdk
+      # [langchain] and [langgraph]
+      langchain-core
+      langchain-openai
+      langgraph
+      # [agno], [strands], [autogen], [voice-train], and [bedrock]
+      agno
+      strands-agents
+      autogen-agentchat
+      accelerate
+      boto3
+      botocore
+      awscrt
       ;
   }
   # nixpkgs marks fastembed unsupported on aarch64-linux.
@@ -174,9 +191,8 @@ let
   );
 
   # Exclude individual tests only for sandbox limits, test-harness assumptions,
-  # or missing-extra cases that do not apply to the full `[all]` runtime package.
+  # or missing-extra cases that do not apply to the full runtime package.
   disabledTestPaths = [
-    "tests/test_memory_bridge.py" # optional qdrant vector backend
     "tests/test_memory/test_qdrant_env.py" # needs a live qdrant
     "tests/test_install/test_native_installers.py" # bash installers + docker
     "tests/test_install/test_runtime.py" # runtime locks / process spawn
@@ -190,7 +206,7 @@ let
     "test_init_codex_config_routes_messages_through_headroom"
     "test_provider_scope_codex_config_routes_messages_through_headroom"
     "test_dynamic_detector_import_skips_optional_ml_dependencies" # subprocess env
-    # Missing-extra tests are invalid for the `[all]` runtime package and can start a real proxy.
+    # Missing-extra tests are invalid for the full runtime package and can start a real proxy.
     "test_proxy_command_exits_when_mcp_missing"
     "test_ensure_proxy_dependencies_exits_when_fastapi_missing"
     "test_register_claude_hooks_survives_forked_daemon" # needs /bin/bash
@@ -247,22 +263,14 @@ let
     "test_hybrid_scoring"
   ];
 
-  # pytest `--deselect` needs a full node id, so bare test-name disables must go
-  # through `-k` (substring match on the node id). `--ignore` works for whole
-  # files. `-m` drops the slow / real-LLM / live-network marked cases.
-  # The offline LiteLLM backup omits this provider key; its remote refresh is intentionally disabled.
-  deselectedNodeIds = [
-    "tests/test_pricing_from_litellm.py::test_provider_prices_models_its_table_never_covered[groq/llama-guard-3-8b-0.2-0.2]"
+  # `-k` matches disabled test-name substrings; `--ignore` excludes whole files.
+  # `-m` drops the slow / real-LLM / live-network marked cases.
+  deselectArgs = (map (p: "--ignore=${p}") disabledTestPaths) ++ [
+    "-k"
+    ("not (" + lib.concatStringsSep " or " disabledTests + ")")
+    "-m"
+    "not slow and not real_llm and not live"
   ];
-  deselectArgs =
-    (map (p: "--ignore=${p}") disabledTestPaths)
-    ++ (map (id: "--deselect=${id}") deselectedNodeIds)
-    ++ [
-      "-k"
-      ("not (" + lib.concatStringsSep " or " disabledTests + ")")
-      "-m"
-      "not slow and not real_llm and not live"
-    ];
 in
 py.buildPythonPackage {
   pname = "headroom";
@@ -347,8 +355,8 @@ py.buildPythonPackage {
       inherit (py)
         pytest
         pytest-asyncio
+        packaging
         respx
-        langchain-core
         socksio
         ;
     }
@@ -394,6 +402,8 @@ py.buildPythonPackage {
     # reaching the network — the sandbox has none anyway.
     export PATH=${lib.makeBinPath bundledTools}:$PATH
     export HEADROOM_BINARIES_OFFLINE=1
+
+    ${python.interpreter} ${./check-extra-dependencies.py}
 
     # Preserve the Nix upstream-health opt-out; test-local HEADROOM flags stay scrubbed.
     substituteInPlace tests/conftest.py \

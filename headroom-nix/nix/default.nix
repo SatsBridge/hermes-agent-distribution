@@ -28,16 +28,18 @@ let
   # fetched from GitHub at runtime.
   rtk = pkgs.callPackage ./rtk.nix { inherit unstable; };
 
+  # Keep consumers on unstable too: ONNX Runtime's shared library uses its glibc.
   # headroom-proxy: the Rust reverse-proxy binary.
-  headroom-proxy = pkgs.callPackage ./headroom-proxy.nix {
+  headroom-proxy = unstable.callPackage ./headroom-proxy.nix {
     inherit headroomSource;
     inherit (unstable) onnxruntime;
   };
 
   # headroom-py: the compiled Rust extension `headroom._core` as a standalone
   # Python package (maturin cdylib), stripped to just the `.so`.
-  headroom-py = pkgs.callPackage ./headroom-py.nix {
+  headroom-py = unstable.callPackage ./headroom-py.nix {
     inherit headroomSource;
+    python3Packages = headroomPythonPackages;
     inherit (unstable) onnxruntime;
   };
 

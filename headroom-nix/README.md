@@ -12,10 +12,12 @@ in `headroom-nix/nix/headroom-source.nix`.
 ## The packages
 
 - **`headroom`** — the full command-line tool. It bundles the compiled core, the
-  Python code, and every dependency in upstream's `[all]` extra (not `dev`), so
-  the CLI works offline out of the box. Specialized extras outside `[all]` stay
-  opt-in. The wrapper provides `codebase-memory-mcp` v0.11.0 from the pinned
-  source flake and forces binary-download and telemetry opt-outs.
+  Python code, and every platform-applicable optional dependency except `dev`,
+  including extras outside upstream's narrower `[all]` set. Python packages
+  missing from nixpkgs are built from pinned source distributions. `fastembed`
+  is omitted on aarch64-linux because nixpkgs does not support it there. The
+  wrapper provides `codebase-memory-mcp` v0.11.0 from the pinned source flake
+  and forces binary-download and telemetry opt-outs.
 - **`headroom-proxy`** — the Rust reverse proxy (axum + tokio): one binary you
   point your LLM client at.
 - **`headroom-py`** — the compiled Rust extension `headroom._core`, built as a
