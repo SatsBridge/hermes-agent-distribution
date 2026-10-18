@@ -1,0 +1,34 @@
+--- a/crates/headroom-core/src/ccr/backends/in_memory.rs
++++ b/crates/headroom-core/src/ccr/backends/in_memory.rs
+@@ -163,8 +163,7 @@
+-        if let Some(mut entry) = self.map.get_mut(hash) {
++        {
++            let mut entry = self.map.get_mut(hash)?;
+             if !entry.is_expired(self.ttl, self.max_lifetime) {
+                 entry.last_accessed = Instant::now();
+                 return Some(entry.payload.clone());
+             }
+-        } else {
+-            return None;
+         }
+--- a/crates/headroom-proxy/src/config.rs
++++ b/crates/headroom-proxy/src/config.rs
+@@ -893,8 +893,5 @@
+             // `workspace_dir()` semantics (its tests pin
+             // `HEADROOM_WORKSPACE_DIR=~/custom` → `$HOME/custom`).
+             let expanded = if let Some(rest) = dir.strip_prefix("~/") {
+-                match home_dir() {
+-                    Some(home) => home.join(rest),
+-                    None => return None,
+-                }
++                home_dir()?.join(rest)
+             } else {
+--- a/crates/headroom-proxy/tests/e2e_real.rs
++++ b/crates/headroom-proxy/tests/e2e_real.rs
+@@ -321,5 +321,5 @@
+     assert!(
+         has_start && has_delta && has_stop,
+         "stream missing expected events (start={has_start} delta={has_delta} stop={has_stop}). buf:\n{}",
+-        &buf.chars().take(2000).collect::<String>()
++        buf.chars().take(2000).collect::<String>()
+     );

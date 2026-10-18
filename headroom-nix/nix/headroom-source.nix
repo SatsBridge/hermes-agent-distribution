@@ -13,8 +13,23 @@ let
     hash = "sha256-ITVrw5ruGnNI9t7pq+0Z6gsnqDDAB/5v7I3oOQM5AtE=";
   };
 
+  src = pkgs.applyPatches {
+    name = "headroom-${version}-source-patched";
+    src = raw;
+    patches = [ ./patches/0003-clippy-question-mark.patch ];
+  };
+
+  testSrc = pkgs.applyPatches {
+    name = "headroom-${version}-patched";
+    inherit src;
+    patches = [
+      ./patches/0001-hermeticize-upstream-tests.patch
+      ./patches/0002-import-cli-command-unambiguously.patch
+    ];
+  };
+
 in
 {
-  src = raw;
+  inherit src testSrc;
   inherit version rev;
 }

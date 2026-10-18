@@ -1,0 +1,66 @@
+--- a/tests/test_memory_bridge.py
++++ b/tests/test_memory_bridge.py
+@@ -545,7 +545,21 @@
+ @decorate_async_test_methods
+ class TestRoundTrip:
+     @pytest.mark.asyncio
+-    async def test_import_export_preserves_facts(self, bridge, tmp_dir, backend):
++    async def test_import_export_preserves_facts(self, bridge, tmp_dir, backend, monkeypatch):
+         """Import a MEMORY.md, export it, verify all facts are present."""
++        import hashlib
++        import numpy as np
++
++        async def deterministic_embedding(_text):
++            seed = int.from_bytes(hashlib.sha256(_text.encode()).digest()[:8], "big")
++            return np.random.default_rng(seed).standard_normal(
++                backend._config.vector_dimension, dtype=np.float32
++            )
++
++        # The round-trip contract needs storage, not an external model download.
++        monkeypatch.setattr(
++            backend._hierarchical_memory._embedder, "embed", deterministic_embedding
++        )
++
+         md_path = tmp_dir / "MEMORY.md"
+         md_path.write_text(CLAUDE_CODE_MEMORY, encoding="utf-8")
+--- a/tests/test_cli/test_init_cli.py
++++ b/tests/test_cli/test_init_cli.py
+@@ -30,2 +30,5 @@
+ def _load_init_module(monkeypatch):
++    cli_package = sys.modules.get("headroom.cli")
++    had_cli_main = cli_package is not None and hasattr(cli_package, "main")
++    saved_cli_main = getattr(cli_package, "main", None)
+     monkeypatch.delitem(sys.modules, "headroom.cli.init", raising=False)
+@@ -41,4 +44,10 @@
+     importlib.invalidate_caches()
+     init_cli = importlib.import_module("headroom.cli.init")
+     monkeypatch.delitem(sys.modules, "headroom.cli.init", raising=False)
++    cli_package = sys.modules.get("headroom.cli")
++    if cli_package is not None:
++        if had_cli_main:
++            cli_package.main = saved_cli_main
++        else:
++            cli_package.__dict__.pop("main", None)
+     return init_cli, fake_main
+--- a/tests/test_proxy/test_copilot_nes_routing.py
++++ b/tests/test_proxy/test_copilot_nes_routing.py
+@@ -176,2 +176,18 @@
+-def test_a_caller_chosen_base_url_is_left_alone() -> None:
++def test_a_caller_chosen_base_url_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
++    import socket
++
++    from headroom.proxy import upstream_guard
++
++    real_getaddrinfo = upstream_guard.socket.getaddrinfo
++
++    def resolve_public_copilot(host, *args, **kwargs):
++        if host == "api.githubcopilot.com":
++            return [
++                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", 0))
++            ]
++        return real_getaddrinfo(host, *args, **kwargs)
++
++    # Exercise upstream validation without depending on ambient DNS.
++    monkeypatch.setattr(upstream_guard.socket, "getaddrinfo", resolve_public_copilot)
++
+     send = _post(

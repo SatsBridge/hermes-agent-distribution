@@ -1,0 +1,6 @@
+--- a/tests/test_offline_egress_chokepoint.py
++++ b/tests/test_offline_egress_chokepoint.py
+@@ -64,2 +64,2 @@
+         from headroom import update_check
+-        from headroom.cli import main
++        from headroom.cli.main import main

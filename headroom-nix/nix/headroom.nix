@@ -275,7 +275,7 @@ in
 py.buildPythonPackage {
   pname = "headroom";
   inherit (headroomSource) version;
-  inherit (headroomSource) src;
+  src = headroomSource.testSrc;
 
   # The extension is copied from headroom-py, not rebuilt, so there is no
   # pyproject/maturin build step — install the source tree ourselves.
