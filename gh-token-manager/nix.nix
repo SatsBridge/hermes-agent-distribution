@@ -1,16 +1,11 @@
 {
   pkgs,
+  ghTokenManagerPackage,
   coveragePkgs,
   gitHooks,
 }:
 let
-  package = pkgs.rustPlatform.buildRustPackage {
-    pname = "gh-token-manager";
-    version = "0.1.0";
-    src = ./.;
-    nativeBuildInputs = [ pkgs.cacert ];
-    cargoLock.lockFile = ./Cargo.lock;
-  };
+  package = ghTokenManagerPackage;
   coverage = coveragePkgs.rustPlatform.buildRustPackage {
     pname = "gh-token-manager-coverage";
     version = "0.1.0";

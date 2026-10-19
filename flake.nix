@@ -39,6 +39,7 @@
         system:
         import ./gh-token-manager/nix.nix {
           pkgs = nixpkgs.legacyPackages.${system};
+          ghTokenManagerPackage = (headroomFor system).packages.gh-token-manager;
           coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
           gitHooks = git-hooks.lib.${system};
         };
@@ -78,6 +79,7 @@
             overlays = [
               self.overlays.default
               (_: prev: {
+                cacert = prev.hello;
                 onnxruntime = prev.hello;
                 rtk = prev.hello;
               })
@@ -115,6 +117,14 @@
                 headroomSource = overrideSource;
               }).name == "headroom-hermes-plugin-override-probe";
             assert
+              (independentPkgs.gh-token-manager.override {
+                rustPlatform = overrideRustPlatform;
+              }).name == "rust-platform-0.1.0";
+            assert
+              (independentPkgs.gh-token-manager.override {
+                cacert = independentPkgs.hello;
+              }).drvPath != independentPkgs.gh-token-manager.drvPath;
+            assert
               (independentPkgs.headroom-proxy.override {
                 onnxruntime = independentPkgs.hello;
               }).drvPath != independentPkgs.headroom-proxy.drvPath;
@@ -124,6 +134,7 @@
               }).drvPath != independentPkgs.headroom.drvPath;
             assert finalOverridePkgs.headroom-proxy.drvPath != independentPkgs.headroom-proxy.drvPath;
             assert finalOverridePkgs.headroom.drvPath != independentPkgs.headroom.drvPath;
+            assert finalOverridePkgs.gh-token-manager.drvPath != independentPkgs.gh-token-manager.drvPath;
             pkgs.runCommand "headroom-overlay-regression" { } "touch $out";
           gitHooks = git-hooks.lib.${system}.run {
             src = headroomHookSource;
@@ -141,6 +152,7 @@
         {
           packages = {
             inherit (pkgs)
+              gh-token-manager
               headroom-proxy
               headroom-py
               headroom
@@ -304,10 +316,7 @@
             callPackage = fn: args: final.lib.callPackageWith (packageScopeFor fn) fn args;
           };
         in
-        (byNameOverlay packageScope prev)
-        // {
-          gh-token-manager = self.packages.${system}.gh-token-manager;
-        };
+        byNameOverlay packageScope prev;
       githubActions = nix-github-actions.lib.mkGithubMatrix {
         checks = nixpkgs.lib.getAttrs [ "x86_64-linux" "aarch64-linux" ] self.checks;
       };
