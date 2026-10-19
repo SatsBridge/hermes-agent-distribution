@@ -35,14 +35,6 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      ghTokenManagerFor =
-        system:
-        import ./gh-token-manager/nix.nix {
-          pkgs = nixpkgs.legacyPackages.${system};
-          ghTokenManagerPackage = (headroomFor system).packages.gh-token-manager;
-          coveragePkgs = nixpkgs-unstable.legacyPackages.${system};
-          gitHooks = git-hooks.lib.${system};
-        };
       headroomFor =
         system:
         let
@@ -204,21 +196,12 @@
             inherit (gitHooks) shellHook;
           };
         };
-      treefmtEval = forAllSystems (
-        system:
-        treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} {
-          projectRootFile = "flake.nix";
-          programs.nixfmt.enable = true;
-          programs.rustfmt.enable = true;
-        }
-      );
     in
     {
       packages = forAllSystems (
         system:
         (headroomFor system).packages
         // {
-          gh-token-manager = (ghTokenManagerFor system).package;
           default = self.packages.${system}.gh-token-manager;
         }
       );
@@ -226,7 +209,7 @@
         inherit ((headroomFor system).apps) headroom headroom-proxy;
       });
       devShells = forAllSystems (system: {
-        gh-token-manager = (ghTokenManagerFor system).devShell;
+        gh-token-manager = self.packages.${system}.gh-token-manager.passthru.devShell;
         headroom = (headroomFor system).devShell;
       });
       checks = forAllSystems (
@@ -234,12 +217,14 @@
         (headroomFor system).checks
         // {
           gh-token-manager = self.packages.${system}.gh-token-manager;
-          coverage = (ghTokenManagerFor system).coverage;
-          formatting = treefmtEval.${system}.config.build.check self;
-          pre-commit-check = (ghTokenManagerFor system).pre-commit-check;
+          coverage = self.packages.${system}.gh-token-manager.passthru.coverage;
+          formatting = self.packages.${system}.gh-token-manager.passthru.treefmt.config.build.check self;
+          pre-commit-check = self.packages.${system}.gh-token-manager.passthru.git-hooks;
         }
       );
-      formatter = forAllSystems (system: treefmtEval.${system}.config.build.wrapper);
+      formatter = forAllSystems (
+        system: self.packages.${system}.gh-token-manager.passthru.treefmt.config.build.wrapper
+      );
       overlays.default =
         final: prev:
         let
@@ -265,6 +250,15 @@
           selectedRtk = if final.rtk.drvPath == prev.rtk.drvPath then unstable.rtk else final.rtk;
           byNameOverlay = import "${nixpkgs}/pkgs/top-level/by-name-overlay.nix" ./pkgs/by-name;
           packageScopes = {
+            gh-token-manager = final // {
+              inherit (unstable) cargo-llvm-cov;
+              coverageRustPlatform = unstable.rustPlatform;
+              coverageCacert = unstable.cacert;
+              llvm = unstable.llvmPackages.llvm;
+              coveragePython = unstable.python3;
+              gitHooks = git-hooks.lib.${system};
+              treefmtEval = module: treefmt-nix.lib.evalModule final module;
+            };
             headroom-proxy = final // {
               inherit headroomSource onnxruntime;
               lib = unstable.lib;
@@ -302,7 +296,9 @@
             let
               path = toString fn;
             in
-            if nixpkgs.lib.hasInfix "/headroom-proxy/package.nix" path then
+            if nixpkgs.lib.hasInfix "/gh-token-manager/package.nix" path then
+              packageScopes.gh-token-manager
+            else if nixpkgs.lib.hasInfix "/headroom-proxy/package.nix" path then
               packageScopes.headroom-proxy
             else if nixpkgs.lib.hasInfix "/headroom-py/package.nix" path then
               packageScopes.headroom-py
