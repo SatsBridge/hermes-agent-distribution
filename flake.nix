@@ -157,12 +157,21 @@
       });
       checks = forAllSystems (
         system:
-        (headroomFor system).checks
+        let
+          headroomChecks = (headroomFor system).checks;
+          tokenManagerHooks = self.packages.${system}.gh-token-manager.passthru.git-hooks;
+        in
+        assert
+          headroomChecks.git-hooks.drvPath == self.packages.${system}.headroom.passthru.git-hooks.drvPath;
+        assert
+          tokenManagerHooks.drvPath == self.packages.${system}.gh-token-manager.passthru.git-hooks.drvPath;
+        assert headroomChecks.git-hooks.drvPath != tokenManagerHooks.drvPath;
+        headroomChecks
         // {
           gh-token-manager = self.packages.${system}.gh-token-manager;
           coverage = self.packages.${system}.gh-token-manager.passthru.coverage;
           formatting = (rootTreefmtFor system).config.build.check self;
-          inherit (self.packages.${system}.gh-token-manager.passthru) git-hooks;
+          pre-commit-check = tokenManagerHooks;
         }
       );
       formatter = forAllSystems (system: (rootTreefmtFor system).config.build.wrapper);

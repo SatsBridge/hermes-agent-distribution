@@ -51,10 +51,13 @@ let
     src = ./.;
     rootSrc = lib.mkForce ../../../..;
     package = prek;
-    hooks.treefmt = {
-      enable = true;
-      package = treefmt.config.build.wrapper;
-      settings.fail-on-change = true;
+    hooks = {
+      convco.enable = true;
+      treefmt = {
+        enable = true;
+        package = treefmt.config.build.wrapper;
+        settings.fail-on-change = true;
+      };
     };
   };
   ortDylib = "${onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
@@ -458,7 +461,10 @@ let
     };
   };
   devShell = mkShell {
-    inputsFrom = [ headroom ];
+    inputsFrom = [
+      headroom-proxy
+      headroom
+    ];
     packages =
       git-hooks.enabledPackages
       ++ builtins.attrValues {

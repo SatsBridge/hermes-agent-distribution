@@ -13,6 +13,12 @@ _: {
     statix.enable = true;
     nixf-diagnose.enable = true;
 
+    # Rust
+    rustfmt = {
+      enable = true;
+      edition = "2024";
+    };
+
     # Shell
     beautysh.enable = true;
 
