@@ -1,14 +1,12 @@
 {
-  pkgs,
-  headroom-proxy,
-  headroomSource ? headroom-proxy.passthru.headroomSource,
-  stdenvNoCC ? pkgs.stdenvNoCC,
-  lib ? pkgs.lib,
-  python3Packages ? pkgs.python3Packages,
-  writeText ? pkgs.writeText,
+  lib,
+  stdenvNoCC,
+  python3Packages,
+  writeText,
+  headroomSource,
 }:
 
-pkgs.callPackage ./headroom-hermes-plugin.nix {
+import ./headroom-hermes-plugin.nix {
   inherit
     stdenvNoCC
     lib

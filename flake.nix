@@ -73,6 +73,16 @@
             inherit system;
             overlays = [ self.overlays.default ];
           };
+          finalOverridePkgs = import nixpkgs {
+            inherit system;
+            overlays = [
+              self.overlays.default
+              (_: prev: {
+                onnxruntime = prev.hello;
+                rtk = prev.hello;
+              })
+            ];
+          };
           overrideSourcePath = pkgs.runCommand "headroom-override-source" { } "mkdir -p $out";
           overrideSource = {
             version = "override-probe";
@@ -112,6 +122,8 @@
               (independentPkgs.headroom.override {
                 rtk = independentPkgs.hello;
               }).drvPath != independentPkgs.headroom.drvPath;
+            assert finalOverridePkgs.headroom-proxy.drvPath != independentPkgs.headroom-proxy.drvPath;
+            assert finalOverridePkgs.headroom.drvPath != independentPkgs.headroom.drvPath;
             pkgs.runCommand "headroom-overlay-regression" { } "touch $out";
           gitHooks = git-hooks.lib.${system}.run {
             src = headroomHookSource;
@@ -221,51 +233,75 @@
         let
           system = final.stdenv.hostPlatform.system;
           unstable = nixpkgs-unstable.legacyPackages.${system};
+          headroomSource = import ./pkgs/by-name/he/headroom-proxy/headroom-source.nix { pkgs = final; };
+          python3Packages = import ./pkgs/by-name/he/headroom-py/headroom-python.nix {
+            pkgs = final;
+            inherit unstable;
+          };
           codebaseMemoryMcp = codebase-memory-mcp.packages.${system}.default.overrideAttrs (_: {
             version = "0.11.0";
             src = codebase-memory-mcp.outPath;
             # Keep the embedded binary version aligned with this flake pin.
             CFLAGS_EXTRA = "-DCBM_VERSION=\\\"0.11.0\\\"";
           });
+          # Keep pinned defaults, but honor a dependency changed by a later overlay.
+          onnxruntime =
+            if final.onnxruntime.drvPath == prev.onnxruntime.drvPath then
+              unstable.onnxruntime
+            else
+              final.onnxruntime;
+          selectedRtk = if final.rtk.drvPath == prev.rtk.drvPath then unstable.rtk else final.rtk;
           byNameOverlay = import "${nixpkgs}/pkgs/top-level/by-name-overlay.nix" ./pkgs/by-name;
-          # Let each Headroom package choose its pinned set; explicit .override
-          # arguments still pass through, while nixpkgs callPackage stays intact.
-          headroomPackageArgs = [
-            "ast-grep"
-            "cacert"
-            "cmake"
-            "clippy"
-            "difftastic"
-            "fetchurl"
-            "git"
-            "lib"
-            "libiconv"
-            "makeWrapper"
-            "onnxruntime"
-            "perl"
-            "pkg-config"
-            "python3"
-            "python3Packages"
-            "rtk"
-            "runCommand"
-            "rustPlatform"
-            "scc"
-            "stdenv"
-            "stdenvNoCC"
-            "writeText"
-          ];
+          packageScopes = {
+            headroom-proxy = final // {
+              inherit headroomSource onnxruntime;
+              lib = unstable.lib;
+              rustPlatform = unstable.rustPlatform;
+              pkg-config = unstable.pkg-config;
+              cmake = unstable.cmake;
+              perl = unstable.perl;
+              makeWrapper = unstable.makeWrapper;
+              clippy = unstable.clippy;
+              python3 = unstable.python3;
+              stdenv = unstable.stdenv;
+              libiconv = unstable.libiconv;
+            };
+            headroom-py = final // {
+              inherit headroomSource python3Packages onnxruntime;
+              lib = unstable.lib;
+              writeText = unstable.writeText;
+              rustPlatform = unstable.rustPlatform;
+              pkg-config = unstable.pkg-config;
+              cmake = unstable.cmake;
+              perl = unstable.perl;
+              stdenv = unstable.stdenv;
+            };
+            headroom = final // {
+              inherit headroomSource python3Packages codebaseMemoryMcp;
+              onnxruntime = onnxruntime;
+              rtk = selectedRtk;
+            };
+            headroom-hermes-plugin = final // {
+              inherit headroomSource;
+            };
+          };
+          packageScopeFor =
+            fn:
+            let
+              path = toString fn;
+            in
+            if nixpkgs.lib.hasInfix "/headroom-proxy/package.nix" path then
+              packageScopes.headroom-proxy
+            else if nixpkgs.lib.hasInfix "/headroom-py/package.nix" path then
+              packageScopes.headroom-py
+            else if nixpkgs.lib.hasInfix "/headroom/package.nix" path then
+              packageScopes.headroom
+            else if nixpkgs.lib.hasInfix "/headroom-hermes-plugin/package.nix" path then
+              packageScopes.headroom-hermes-plugin
+            else
+              final;
           packageScope = final // {
-            callPackage =
-              fn: args:
-              let
-                isHeadroomPackage = nixpkgs.lib.hasInfix "/pkgs/by-name/he/headroom" (toString fn);
-                scope =
-                  if isHeadroomPackage then
-                    builtins.removeAttrs final headroomPackageArgs // { inherit unstable codebaseMemoryMcp; }
-                  else
-                    final;
-              in
-              final.lib.callPackageWith scope fn args;
+            callPackage = fn: args: final.lib.callPackageWith (packageScopeFor fn) fn args;
           };
         in
         (byNameOverlay packageScope prev)
