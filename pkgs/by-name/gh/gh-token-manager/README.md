@@ -23,9 +23,9 @@ Coverage uses `cargo-llvm-cov` with LLVM's line and branch reporting:
 
 ```sh
 nix develop
-RUSTC_BOOTSTRAP=1 cargo llvm-cov --manifest-path gh-token-manager/Cargo.toml --branch --json \
-  --output-path gh-token-manager/target/coverage.json
-python3 gh-token-manager/check_coverage.py gh-token-manager/target/coverage.json
+RUSTC_BOOTSTRAP=1 cargo llvm-cov --manifest-path pkgs/by-name/gh/gh-token-manager/Cargo.toml --branch --json \
+  --output-path pkgs/by-name/gh/gh-token-manager/target/coverage.json
+python3 pkgs/by-name/gh/gh-token-manager/check_coverage.py pkgs/by-name/gh/gh-token-manager/target/coverage.json
 ```
 
 The checker fails unless production line and branch coverage both reach 95%; test/mock helpers are excluded from instrumentation. `nix flake check` runs the same coverage gate. The dev shell exports `LLVM_COV` and `LLVM_PROFDATA` for this command.

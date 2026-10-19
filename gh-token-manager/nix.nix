@@ -9,8 +9,8 @@ let
   coverage = coveragePkgs.rustPlatform.buildRustPackage {
     pname = "gh-token-manager-coverage";
     version = "0.1.0";
-    src = ./.;
-    cargoLock.lockFile = ./Cargo.lock;
+    src = ../pkgs/by-name/gh/gh-token-manager;
+    cargoLock.lockFile = ../pkgs/by-name/gh/gh-token-manager/Cargo.lock;
     doCheck = false;
     nativeBuildInputs = [
       coveragePkgs.cacert
@@ -38,14 +38,14 @@ let
       pkgs.runCommand "gh-token-manager-hook-source" { } ''
         mkdir -p "$out"
         cp -r ${../.}/. "$out/"
-        cp ${./Cargo.lock} "$out/Cargo.lock"
+        cp ${../pkgs/by-name/gh/gh-token-manager/Cargo.lock} "$out/Cargo.lock"
       ''
     );
     package = pkgs.prek;
     settings.rust = {
-      cargoManifestPath = "gh-token-manager/Cargo.toml";
+      cargoManifestPath = "pkgs/by-name/gh/gh-token-manager/Cargo.toml";
       check.cargoDeps = pkgs.rustPlatform.importCargoLock {
-        lockFile = ./Cargo.lock;
+        lockFile = ../pkgs/by-name/gh/gh-token-manager/Cargo.lock;
       };
     };
     hooks.clippy = {
