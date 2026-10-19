@@ -1,3 +1,1 @@
-[
-  ./services/agent/hermes.nix
-]
+[ ./services/agent/hermes.nix ]

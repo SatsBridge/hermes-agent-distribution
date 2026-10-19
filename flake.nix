@@ -35,6 +35,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      rootTreefmtFor = system: treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} ./treefmt.nix;
       headroomFor =
         system:
         let
@@ -160,13 +161,11 @@
         // {
           gh-token-manager = self.packages.${system}.gh-token-manager;
           coverage = self.packages.${system}.gh-token-manager.passthru.coverage;
-          formatting = self.packages.${system}.gh-token-manager.passthru.treefmt.config.build.check self;
-          pre-commit-check = self.packages.${system}.gh-token-manager.passthru.git-hooks;
+          formatting = (rootTreefmtFor system).config.build.check self;
+          inherit (self.packages.${system}.gh-token-manager.passthru) git-hooks;
         }
       );
-      formatter = forAllSystems (
-        system: self.packages.${system}.gh-token-manager.passthru.treefmt.config.build.wrapper
-      );
+      formatter = forAllSystems (system: (rootTreefmtFor system).config.build.wrapper);
       overlays.default =
         final: prev:
         let
@@ -203,36 +202,47 @@
             };
             headroom-proxy = final // {
               inherit headroomSource onnxruntime;
-              lib = unstable.lib;
-              rustPlatform = unstable.rustPlatform;
-              pkg-config = unstable.pkg-config;
-              cmake = unstable.cmake;
-              perl = unstable.perl;
-              makeWrapper = unstable.makeWrapper;
-              clippy = unstable.clippy;
-              python3 = unstable.python3;
-              stdenv = unstable.stdenv;
-              libiconv = unstable.libiconv;
+              gitHooks = git-hooks.lib.${system};
+              treefmtEval = module: treefmt-nix.lib.evalModule final module;
+              inherit (unstable) lib;
+              inherit (unstable) rustPlatform;
+              inherit (unstable) pkg-config;
+              inherit (unstable) cmake;
+              inherit (unstable) perl;
+              inherit (unstable) makeWrapper;
+              inherit (unstable) clippy;
+              inherit (unstable) python3;
+              inherit (unstable) stdenv;
+              inherit (unstable) libiconv;
             };
             headroom-py = final // {
               inherit headroomSource python3Packages onnxruntime;
-              lib = unstable.lib;
-              writeText = unstable.writeText;
-              rustPlatform = unstable.rustPlatform;
-              pkg-config = unstable.pkg-config;
-              cmake = unstable.cmake;
-              perl = unstable.perl;
-              stdenv = unstable.stdenv;
+              gitHooks = git-hooks.lib.${system};
+              treefmtEval = module: treefmt-nix.lib.evalModule final module;
+              inherit (unstable) lib;
+              inherit (unstable) writeText;
+              inherit (unstable) rustPlatform;
+              inherit (unstable) pkg-config;
+              inherit (unstable) cmake;
+              inherit (unstable) perl;
+              inherit (unstable) stdenv;
             };
             headroom = final // {
               inherit headroomSource python3Packages codebaseMemoryMcp;
               gitHooks = git-hooks.lib.${system};
               treefmtEval = module: treefmt-nix.lib.evalModule final module;
-              onnxruntime = onnxruntime;
+              inherit onnxruntime;
               rtk = selectedRtk;
             };
             headroom-hermes-plugin = final // {
               inherit headroomSource;
+              gitHooks = git-hooks.lib.${system};
+              treefmtEval = module: treefmt-nix.lib.evalModule final module;
+            };
+            hermes-agent = final // {
+              pyprojectVersionPatchHook = unstable.python3.pkgs.pyprojectVersionPatchHook;
+              gitHooks = git-hooks.lib.${system};
+              treefmtEval = module: treefmt-nix.lib.evalModule final module;
             };
           };
           packageScopeFor =
@@ -250,6 +260,8 @@
               packageScopes.headroom
             else if nixpkgs.lib.hasInfix "/headroom-hermes-plugin/package.nix" path then
               packageScopes.headroom-hermes-plugin
+            else if nixpkgs.lib.hasInfix "/hermes-agent/package.nix" path then
+              packageScopes.hermes-agent
             else
               final;
           packageScope = final // {

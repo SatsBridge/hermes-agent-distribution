@@ -1,4 +1,7 @@
 /result
+/result-*
 /target
-/pkgs/by-name/gh/gh-token-manager/target
 /.pre-commit-config.yaml
+/.direnv
+/.rumdl_cache
+/pkgs/by-name/gh/gh-token-manager/target

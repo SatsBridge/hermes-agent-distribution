@@ -58,24 +58,22 @@ let
     package = prek;
     settings.rust = {
       cargoManifestPath = "pkgs/by-name/gh/gh-token-manager/Cargo.toml";
-      check.cargoDeps = rustPlatform.importCargoLock {
-        lockFile = ./Cargo.lock;
-      };
+      check.cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
     };
-    hooks.clippy = {
-      enable = true;
-      packageOverrides = {
-        inherit cargo clippy;
+    hooks = {
+      clippy = {
+        enable = true;
+        packageOverrides = { inherit cargo clippy; };
+        settings = {
+          denyWarnings = true;
+          offline = false;
+        };
       };
-      settings = {
-        denyWarnings = true;
-        offline = false;
+      treefmt = {
+        enable = true;
+        package = treefmt.config.build.wrapper;
+        settings.fail-on-change = true;
       };
-    };
-    hooks.treefmt = {
-      enable = true;
-      package = treefmt.config.build.wrapper;
-      settings.fail-on-change = true;
     };
   };
   devShell = mkShell {
@@ -93,7 +91,7 @@ let
     ++ [ treefmt.config.build.wrapper ];
     LLVM_COV = "${llvm}/bin/llvm-cov";
     LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
-    shellHook = git-hooks.shellHook;
+    inherit (git-hooks) shellHook;
   };
 in
 rustPlatform.buildRustPackage {

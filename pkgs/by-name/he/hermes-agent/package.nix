@@ -18,10 +18,26 @@
   # replace to https://github.com/arman-bd/chromiumfish
   # or https://github.com/clearcotelabs/clearcote-browser
   chromium,
-  gh
+  gh,
+  pyprojectVersionPatchHook,
+  gitHooks,
+  treefmtEval,
+  mkShell,
+  prek,
 }:
 
 let
+  treefmt = treefmtEval ./treefmt.nix;
+  git-hooks = gitHooks.run {
+    src = ./.;
+    rootSrc = lib.mkForce ../../../..;
+    package = prek;
+    hooks.treefmt = {
+      enable = true;
+      package = treefmt.config.build.wrapper;
+      settings.fail-on-change = true;
+    };
+  };
   # Native (PyO3) runtime for hermes' Relay lifecycle and shared metrics.
   # PyPI ships wheels only, so build from source with maturin.
   # Version is kept in range of hermes' pyproject constraint by update.py.
@@ -50,7 +66,7 @@ let
         maturinBuildHook
       ]
       # Tags lag the workspace Cargo.toml version that pyproject derives from.
-      ++ [ python3.pkgs.pyprojectVersionPatchHook ];
+      ++ [ pyprojectVersionPatchHook ];
 
     pythonImportsCheck = [
       "nemo_relay"
@@ -420,9 +436,7 @@ let
   # whose python-sdk pyproject declares a different SDK version, so the new
   # pythonMetadataCheckPhase fails. Skip the check until nixpkgs fixes the
   # version mismatch.
-  firecrawl-py' = python3.pkgs.firecrawl-py.overridePythonAttrs {
-    dontCheckPythonMetadata = true;
-  };
+  firecrawl-py' = python3.pkgs.firecrawl-py.overridePythonAttrs { dontCheckPythonMetadata = true; };
 
   # pyramid dropped its pkg_resources shim on python 3.14, so slack-bolt's
   # pyramid adapter tests fail at collection with ModuleNotFoundError.
@@ -435,13 +449,12 @@ let
     #    doCheck = !stdenv.hostPlatform.isDarwin;
     #  };
     #})
-    python3.pkgs.slack-bolt.overridePythonAttrs
-      (old: {
-        disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [
-          "tests/adapter_tests/pyramid/"
-          "tests/scenario_tests_async/test_events_assistant.py"
-        ];
-      });
+    python3.pkgs.slack-bolt.overridePythonAttrs (old: {
+      disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [
+        "tests/adapter_tests/pyramid/"
+        "tests/scenario_tests_async/test_events_assistant.py"
+      ];
+    });
 
   # Upstream pins agent-client-protocol==0.9.0; nixpkgs' 0.11.x regenerated the
   # ACP schema and dropped ModelInfo/SetSessionModelResponse/SessionModelState,
@@ -537,230 +550,235 @@ let
       payload = "bootstrap";
     }
   );
+
+  hermes-agent = python3.pkgs.buildPythonApplication {
+    pname = "hermes-agent";
+    inherit version src;
+    pyproject = true;
+
+    build-system = with python3.pkgs; [ setuptools ];
+
+    patches = [
+      ./0001-fix-kanban-preserve-declared-home-for-identity-worke.patch
+      ./0002-fix-kanban-scope-claims-to-uid-and-refresh-crash-gra.patch
+      ./0003-feat-fast-service_tier-flex-one-edit-in-the-centrali.patch
+      ./0004-feat-gemini-emit-service_tier-as-a-top-level-generat.patch
+      ./0005-fix-tui-send-the-configured-tier-from-TUI-desktop-bu.patch
+      ./0006-fix-align-service-tier-flex-runtime-boundaries.patch
+      ./0007-fix-tui-reject-invalid-fast-mode-mirror-requests.patch
+      ./0008-fix-tui-validate-lazy-service-tier-against-resolved-.patch
+      ./0009-feat-openrouter-service-tiers-flex-priority-and-per-.patch
+      ./0010-feat-agent-opt-in-TTFT-service-tier-escalation-for-O.patch
+      ./0011-fix-agent-principal-review-hardening-for-service-tie.patch
+      ./0012-fix-service-tier-preserve-route-and-session-compatib.patch
+      ./0013-fix-tui-validate-and-persist-fast-tier-pins.patch
+      ./0014-fix-tui-validate-fast-tier-before-worker-writes.patch
+      ./0015-fix-tui-complete-live-fast-slash-authority.patch
+      ./0016-fix-tui-preserve-fast-pins-across-compute-hosts.patch
+      ./0017-fix-tui-preserve-fast-pin-through-host-bootstrap.patch
+      ./0018-fix-aux-resolve-service-tiers-across-auxiliary-paths.patch
+      ./0019-fix-aux-preserve-tier-intent-through-route-changes.patch
+      ./0020-fix-aux-keep-auxiliary-tier-config-route-aware.patch
+      ./0021-fix-aux-omit-empty-service-tier-fields.patch
+      ./0022-fix-curator-preserve-auxiliary-tier-on-fallback.patch
+      ./0023-fix-aux-retain-service-tier-through-Codex-adapter.patch
+    ];
+
+    # These re-exec sys.executable, which is the bare interpreter without Hermes'
+    # dependencies under Nix. Use the wrapper-provided env.
+    postPatch = ''
+      substituteInPlace tui_gateway/server.py \
+        --replace-fail 'argv = [sys.executable, "-m", "tui_gateway.slash_worker"' \
+          'argv = [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "tui_gateway.slash_worker"'
+      substituteInPlace tools/browser_use_cli.py \
+        --replace-fail 'return [sys.executable, "-m", "browser_harness.run"]' \
+          'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "browser_harness.run"]'
+      substituteInPlace hermes_cli/doctor_platform.py \
+        --replace-fail '[sys.executable, "-c", "import hermes_cli.web_server"]' \
+          '[os.environ.get("HERMES_PYTHON", sys.executable), "-c", "import hermes_cli.web_server"]'
+      substituteInPlace hermes_cli/kanban_db_dispatch.py \
+        --replace-fail 'return [sys.executable, "-m", "hermes_cli.main"]' \
+          'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "hermes_cli.main"]'
+    '';
+
+    # setup.py refuses to build wheels/sdists unless it knows this is a Nix
+    # (uv2nix-style) build; upstream gates it behind this env var.
+    env.HERMES_NIX_BUILD = "1";
+
+    dependencies = hermesDeps;
+    optional-dependencies = optionalDeps;
+
+    makeWrapperArgs = [
+      "--set"
+      "HERMES_TUI_DIR"
+      "${hermes-frontend}/lib/hermes-tui"
+      "--set"
+      "HERMES_WEB_DIST"
+      "${hermes-frontend}/share/hermes-web"
+      "--set"
+      "HERMES_PYTHON"
+      "${pythonEnv}/bin/python3"
+      "--set"
+      "HERMES_PYTHON_SRC_ROOT"
+      "${placeholder "out"}/${python3.sitePackages}"
+      "--set"
+      "HERMES_NODE"
+      "${lib.getExe nodejs}"
+      # Runtime data is copied to $out/share/hermes in postInstall; point Hermes at it.
+      "--set"
+      "HERMES_BUNDLED_SKILLS"
+      "${placeholder "out"}/share/hermes/skills"
+      "--set"
+      "HERMES_OPTIONAL_SKILLS"
+      "${placeholder "out"}/share/hermes/optional-skills"
+      "--set"
+      "HERMES_BUNDLED_PLUGINS"
+      "${placeholder "out"}/share/hermes/plugins"
+      "--set"
+      "HERMES_BUNDLED_LOCALES"
+      "${placeholder "out"}/share/hermes/locales"
+      # Prevent `hermes update` from trying to modify the Nix store.
+      "--set"
+      "HERMES_MANAGED"
+      "nixos"
+      # Disable runtime pip installs; absent extras disable cleanly.
+      "--set"
+      "HERMES_DISABLE_LAZY_INSTALLS"
+      "1"
+      # node+npm on PATH short-circuits _ensure_tui_node()'s download bootstrap.
+      "--prefix"
+      "PATH"
+      ":"
+      "${lib.makeBinPath [
+        nodejs
+        cosign
+        tirith
+        agent-browser
+        playwright
+        chromium
+        gh
+      ]}"
+    ];
+
+    # Upstream keeps runtime data outside site-packages and locates it through
+    # wrapper environment variables. Preserve that layout because setuptools
+    # intentionally omits plugin manifests from the wheel since 2026.8.3.
+    postInstall = ''
+      mkdir -p $out/share/hermes
+      cp -r ${src}/skills $out/share/hermes/skills
+      cp -r ${src}/optional-skills $out/share/hermes/optional-skills
+      cp -r ${src}/plugins $out/share/hermes/plugins
+      cp -r ${src}/locales $out/share/hermes/locales
+      # The sources only carry a 0.0.0 placeholder version.
+      cp ${installStamp} $out/${python3.sitePackages}/install-stamp.json
+    '';
+
+    pythonRelaxDeps = [
+      "openai"
+      "python-dotenv"
+      "tenacity"
+      "ruamel.yaml"
+      "requests"
+      "pydantic"
+      "pathspec"
+      "firecrawl-py"
+      "pyjwt"
+      "cryptography"
+      "certifi"
+      "packaging"
+      "urllib3"
+      "websockets"
+      # nixpkgs moved past upstream's == pins
+      "rich"
+      "pillow"
+      "croniter"
+    ];
+
+    # Only used by upstream's icon generator, which is not installed.
+    pythonRemoveDeps = [ "resvg-py" ];
+
+    pythonImportsCheck = [
+      "hermes_cli"
+      "hermes_cli.dashboard_auth"
+      "hermes_cli.proxy"
+      # #7650: acp_adapter needs the pre-0.11 ACP schema; assert it imports.
+      "acp_adapter.server"
+      # #4175: adapters swallow ImportError, so assert these import.
+      "slack_bolt"
+      "discord"
+      "telegram.ext"
+      "croniter"
+      # relay_runtime imports this lazily and silently degrades to a noop
+      # runtime when missing, so assert it imports.
+      "nemo_relay"
+      "browser_harness"
+    ];
+
+    doInstallCheck = true;
+    nativeInstallCheckInputs = [ versionCheckHook ];
+    versionCheckProgramArg = [ "--version" ];
+
+    # #4364: wrapper must wire up the TUI and a deps-capable gateway python.
+    postInstallCheck = ''
+      grep -q HERMES_TUI_DIR $out/bin/hermes
+      grep -q HERMES_WEB_DIST $out/bin/hermes
+      grep -q HERMES_PYTHON $out/bin/hermes
+      grep -q HERMES_PYTHON_SRC_ROOT $out/bin/hermes
+      grep -q HERMES_BUNDLED_SKILLS $out/bin/hermes
+      grep -q HERMES_OPTIONAL_SKILLS $out/bin/hermes
+      grep -q HERMES_BUNDLED_PLUGINS $out/bin/hermes
+      grep -q HERMES_BUNDLED_LOCALES $out/bin/hermes
+      test -f $out/share/hermes/locales/en.yaml
+      grep -q HERMES_MANAGED $out/bin/hermes
+      test -f ${hermes-frontend}/lib/hermes-tui/dist/entry.js
+      test -f ${hermes-frontend}/share/hermes-web/index.html
+      test -d $out/share/hermes/skills
+      test -d $out/share/hermes/optional-skills
+      test -n "$(find $out/share/hermes/plugins -name plugin.yaml -print -quit)"
+      ${pythonEnv}/bin/python3 -c 'import dotenv, tenacity, openai'
+      # Slash workers run HERMES_PYTHON with PYTHONPATH=HERMES_PYTHON_SRC_ROOT.
+      PYTHONPATH="$out/${python3.sitePackages}" \
+        ${pythonEnv}/bin/python3 -c 'import tui_gateway.slash_worker, ruamel.yaml'
+      # #7725: DaemonThreadPoolExecutor mirrors CPython ThreadPoolExecutor
+      # internals; assert submit() actually executes work on this Python.
+      PYTHONPATH="$out/${python3.sitePackages}" \
+        ${pythonEnv}/bin/python3 -c 'from tools.daemon_pool import DaemonThreadPoolExecutor; assert DaemonThreadPoolExecutor(max_workers=1).submit(lambda: 42).result(timeout=30) == 42'
+    ''
+    + lib.optionalString stdenv.hostPlatform.isLinux ''
+      # Matrix E2EE: mautrix.crypto must import and the disable switch wired in.
+      ${pythonEnv}/bin/python3 -c 'import mautrix.crypto, asyncpg, aiosqlite'
+      grep -q HERMES_DISABLE_LAZY_INSTALLS $out/bin/hermes
+    '';
+
+    passthru = {
+      category = "AI Assistants";
+      inherit hermes-frontend nemo-relay installStamp;
+      inherit treefmt git-hooks devShell;
+    };
+
+    meta = with lib; {
+      description = "Self-improving AI agent by Nous Research — creates skills from experience and runs anywhere";
+      homepage = "https://hermes-agent.nousresearch.com/";
+      changelog = "https://github.com/NousResearch/hermes-agent/releases/tag/v${version}";
+      license = licenses.mit;
+      sourceProvenance = with sourceTypes; [ fromSource ];
+      platforms = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
+      maintainers = with lib.maintainers; [
+        aliez-ren
+        mulatta
+      ];
+      mainProgram = "hermes";
+    };
+  };
+
+  devShell = mkShell {
+    inputsFrom = [ hermes-agent ];
+    packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];
+    inherit (git-hooks) shellHook;
+  };
 in
-python3.pkgs.buildPythonApplication {
-  pname = "hermes-agent";
-  inherit version src;
-  pyproject = true;
-
-  build-system = with python3.pkgs; [
-    setuptools
-  ];
-
-  patches = [
-    ./0001-fix-kanban-preserve-declared-home-for-identity-worke.patch
-    ./0002-fix-kanban-scope-claims-to-uid-and-refresh-crash-gra.patch
-    ./0003-feat-fast-service_tier-flex-one-edit-in-the-centrali.patch
-    ./0004-feat-gemini-emit-service_tier-as-a-top-level-generat.patch
-    ./0005-fix-tui-send-the-configured-tier-from-TUI-desktop-bu.patch
-    ./0006-fix-align-service-tier-flex-runtime-boundaries.patch
-    ./0007-fix-tui-reject-invalid-fast-mode-mirror-requests.patch
-    ./0008-fix-tui-validate-lazy-service-tier-against-resolved-.patch
-    ./0009-feat-openrouter-service-tiers-flex-priority-and-per-.patch
-    ./0010-feat-agent-opt-in-TTFT-service-tier-escalation-for-O.patch
-    ./0011-fix-agent-principal-review-hardening-for-service-tie.patch
-    ./0012-fix-service-tier-preserve-route-and-session-compatib.patch
-    ./0013-fix-tui-validate-and-persist-fast-tier-pins.patch
-    ./0014-fix-tui-validate-fast-tier-before-worker-writes.patch
-    ./0015-fix-tui-complete-live-fast-slash-authority.patch
-    ./0016-fix-tui-preserve-fast-pins-across-compute-hosts.patch
-    ./0017-fix-tui-preserve-fast-pin-through-host-bootstrap.patch
-    ./0018-fix-aux-resolve-service-tiers-across-auxiliary-paths.patch
-    ./0019-fix-aux-preserve-tier-intent-through-route-changes.patch
-    ./0020-fix-aux-keep-auxiliary-tier-config-route-aware.patch
-    ./0021-fix-aux-omit-empty-service-tier-fields.patch
-    ./0022-fix-curator-preserve-auxiliary-tier-on-fallback.patch
-    ./0023-fix-aux-retain-service-tier-through-Codex-adapter.patch
-  ];
-
-  # These re-exec sys.executable, which is the bare interpreter without Hermes'
-  # dependencies under Nix. Use the wrapper-provided env.
-  postPatch = ''
-    substituteInPlace tui_gateway/server.py \
-      --replace-fail 'argv = [sys.executable, "-m", "tui_gateway.slash_worker"' \
-        'argv = [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "tui_gateway.slash_worker"'
-    substituteInPlace tools/browser_use_cli.py \
-      --replace-fail 'return [sys.executable, "-m", "browser_harness.run"]' \
-        'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "browser_harness.run"]'
-    substituteInPlace hermes_cli/doctor_platform.py \
-      --replace-fail '[sys.executable, "-c", "import hermes_cli.web_server"]' \
-        '[os.environ.get("HERMES_PYTHON", sys.executable), "-c", "import hermes_cli.web_server"]'
-    substituteInPlace hermes_cli/kanban_db_dispatch.py \
-      --replace-fail 'return [sys.executable, "-m", "hermes_cli.main"]' \
-        'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "hermes_cli.main"]'
-  '';
-
-  # setup.py refuses to build wheels/sdists unless it knows this is a Nix
-  # (uv2nix-style) build; upstream gates it behind this env var.
-  env.HERMES_NIX_BUILD = "1";
-
-  dependencies = hermesDeps;
-  optional-dependencies = optionalDeps;
-
-  makeWrapperArgs = [
-    "--set"
-    "HERMES_TUI_DIR"
-    "${hermes-frontend}/lib/hermes-tui"
-    "--set"
-    "HERMES_WEB_DIST"
-    "${hermes-frontend}/share/hermes-web"
-    "--set"
-    "HERMES_PYTHON"
-    "${pythonEnv}/bin/python3"
-    "--set"
-    "HERMES_PYTHON_SRC_ROOT"
-    "${placeholder "out"}/${python3.sitePackages}"
-    "--set"
-    "HERMES_NODE"
-    "${lib.getExe nodejs}"
-    # Runtime data is copied to $out/share/hermes in postInstall; point Hermes at it.
-    "--set"
-    "HERMES_BUNDLED_SKILLS"
-    "${placeholder "out"}/share/hermes/skills"
-    "--set"
-    "HERMES_OPTIONAL_SKILLS"
-    "${placeholder "out"}/share/hermes/optional-skills"
-    "--set"
-    "HERMES_BUNDLED_PLUGINS"
-    "${placeholder "out"}/share/hermes/plugins"
-    "--set"
-    "HERMES_BUNDLED_LOCALES"
-    "${placeholder "out"}/share/hermes/locales"
-    # Prevent `hermes update` from trying to modify the Nix store.
-    "--set"
-    "HERMES_MANAGED"
-    "nixos"
-    # Disable runtime pip installs; absent extras disable cleanly.
-    "--set"
-    "HERMES_DISABLE_LAZY_INSTALLS"
-    "1"
-    # node+npm on PATH short-circuits _ensure_tui_node()'s download bootstrap.
-    "--prefix"
-    "PATH"
-    ":"
-    "${lib.makeBinPath [
-      nodejs
-      cosign
-      tirith
-      agent-browser
-      playwright
-      chromium
-      gh
-    ]}"
-  ];
-
-  # Upstream keeps runtime data outside site-packages and locates it through
-  # wrapper environment variables. Preserve that layout because setuptools
-  # intentionally omits plugin manifests from the wheel since 2026.8.3.
-  postInstall = ''
-    mkdir -p $out/share/hermes
-    cp -r ${src}/skills $out/share/hermes/skills
-    cp -r ${src}/optional-skills $out/share/hermes/optional-skills
-    cp -r ${src}/plugins $out/share/hermes/plugins
-    cp -r ${src}/locales $out/share/hermes/locales
-    # The sources only carry a 0.0.0 placeholder version.
-    cp ${installStamp} $out/${python3.sitePackages}/install-stamp.json
-  '';
-
-  pythonRelaxDeps = [
-    "openai"
-    "python-dotenv"
-    "tenacity"
-    "ruamel.yaml"
-    "requests"
-    "pydantic"
-    "pathspec"
-    "firecrawl-py"
-    "pyjwt"
-    "cryptography"
-    "certifi"
-    "packaging"
-    "urllib3"
-    "websockets"
-    # nixpkgs moved past upstream's == pins
-    "rich"
-    "pillow"
-    "croniter"
-  ];
-
-  # Only used by upstream's icon generator, which is not installed.
-  pythonRemoveDeps = [ "resvg-py" ];
-
-  pythonImportsCheck = [
-    "hermes_cli"
-    "hermes_cli.dashboard_auth"
-    "hermes_cli.proxy"
-    # #7650: acp_adapter needs the pre-0.11 ACP schema; assert it imports.
-    "acp_adapter.server"
-    # #4175: adapters swallow ImportError, so assert these import.
-    "slack_bolt"
-    "discord"
-    "telegram.ext"
-    "croniter"
-    # relay_runtime imports this lazily and silently degrades to a noop
-    # runtime when missing, so assert it imports.
-    "nemo_relay"
-    "browser_harness"
-  ];
-
-  doInstallCheck = true;
-  nativeInstallCheckInputs = [
-    versionCheckHook
-  ];
-  versionCheckProgramArg = [ "--version" ];
-
-  # #4364: wrapper must wire up the TUI and a deps-capable gateway python.
-  postInstallCheck = ''
-    grep -q HERMES_TUI_DIR $out/bin/hermes
-    grep -q HERMES_WEB_DIST $out/bin/hermes
-    grep -q HERMES_PYTHON $out/bin/hermes
-    grep -q HERMES_PYTHON_SRC_ROOT $out/bin/hermes
-    grep -q HERMES_BUNDLED_SKILLS $out/bin/hermes
-    grep -q HERMES_OPTIONAL_SKILLS $out/bin/hermes
-    grep -q HERMES_BUNDLED_PLUGINS $out/bin/hermes
-    grep -q HERMES_BUNDLED_LOCALES $out/bin/hermes
-    test -f $out/share/hermes/locales/en.yaml
-    grep -q HERMES_MANAGED $out/bin/hermes
-    test -f ${hermes-frontend}/lib/hermes-tui/dist/entry.js
-    test -f ${hermes-frontend}/share/hermes-web/index.html
-    test -d $out/share/hermes/skills
-    test -d $out/share/hermes/optional-skills
-    test -n "$(find $out/share/hermes/plugins -name plugin.yaml -print -quit)"
-    ${pythonEnv}/bin/python3 -c 'import dotenv, tenacity, openai'
-    # Slash workers run HERMES_PYTHON with PYTHONPATH=HERMES_PYTHON_SRC_ROOT.
-    PYTHONPATH="$out/${python3.sitePackages}" \
-      ${pythonEnv}/bin/python3 -c 'import tui_gateway.slash_worker, ruamel.yaml'
-    # #7725: DaemonThreadPoolExecutor mirrors CPython ThreadPoolExecutor
-    # internals; assert submit() actually executes work on this Python.
-    PYTHONPATH="$out/${python3.sitePackages}" \
-      ${pythonEnv}/bin/python3 -c 'from tools.daemon_pool import DaemonThreadPoolExecutor; assert DaemonThreadPoolExecutor(max_workers=1).submit(lambda: 42).result(timeout=30) == 42'
-  ''
-  + lib.optionalString stdenv.hostPlatform.isLinux ''
-    # Matrix E2EE: mautrix.crypto must import and the disable switch wired in.
-    ${pythonEnv}/bin/python3 -c 'import mautrix.crypto, asyncpg, aiosqlite'
-    grep -q HERMES_DISABLE_LAZY_INSTALLS $out/bin/hermes
-  '';
-
-  passthru = {
-    category = "AI Assistants";
-    inherit hermes-frontend nemo-relay installStamp;
-  };
-
-  meta = with lib; {
-    description = "Self-improving AI agent by Nous Research — creates skills from experience and runs anywhere";
-    homepage = "https://hermes-agent.nousresearch.com/";
-    changelog = "https://github.com/NousResearch/hermes-agent/releases/tag/v${version}";
-    license = licenses.mit;
-    sourceProvenance = with sourceTypes; [ fromSource ];
-    platforms = [
-      "x86_64-linux"
-      "aarch64-linux"
-      "aarch64-darwin"
-    ];
-    maintainers = with lib.maintainers; [
-      aliez-ren
-      mulatta
-    ];
-    mainProgram = "hermes";
-  };
-}
+hermes-agent

@@ -15,7 +15,6 @@ let
     mkMerge
     mkOption
     optional
-    toSentenceCase
     types
     ;
   cfg = config.services.hermes-specialised-agent;
@@ -29,9 +28,7 @@ let
     ) { } agentFullNames
   );
   agentFullNameDuplicatesMessage = lib.concatStringsSep ", " (
-    mapAttrsToList (
-      n: count: "\"${n}\" (${builtins.toString count} times)"
-    ) duplicateAgentFullNamesCounts
+    mapAttrsToList (n: count: "\"${n}\" (${toString count} times)") duplicateAgentFullNamesCounts
   );
   sharedStateId = "hermes-shared";
   sharedStatePath = "%S/${sharedStateId}";
@@ -520,127 +517,126 @@ let
           };
       };
     };
-    mkAgent =
-      _agents: agentFullNames: name: agentCfg:
-      let
-        agentStateId = "hermes-${name}";
-        agentStatePath = "%S/${agentStateId}";
-        hermesAgentStatePath = "${agentStatePath}/.hermes";
-      in
-      mkIf (cfg.enable && agentCfg.enable) {
-        services = {
-          "hermes@${name}" = {
-            after = [
-              "network-online.target"
+  mkAgent =
+    _agents: agentFullNames: name: agentCfg:
+    let
+      agentStateId = "hermes-${name}";
+      agentStatePath = "%S/${agentStateId}";
+      hermesAgentStatePath = "${agentStatePath}/.hermes";
+    in
+    mkIf (cfg.enable && agentCfg.enable) {
+      services = {
+        "hermes@${name}" = {
+          after = [
+            "network-online.target"
+          ]
+          ++ optional (cfg.mainAgent != name) "hermes@${cfg.mainAgent}.service";
+          bindsTo = [
+            "network-online.target"
+          ]
+          ++ optional (cfg.mainAgent != name) "hermes@${cfg.mainAgent}.service";
+          environment = {
+            HERMES_PROFILE_NAME = agentCfg.fullName;
+            WEBHOOK_ENABLED = if cfg.mainAgent == name then "true" else "false";
+            #ANTHROPIC_BASE_URL = "http://localhost:${builtins.toString agentCfg.headroomPort}";
+            #OPENAI_BASE_URL = "http://localhost:${builtins.toString agentCfg.headroomPort}/v1";
+          };
+          overrideStrategy = "asDropin";
+          path = config.systemd.services."hermes@".path ++ [ agentCfg.package ];
+          serviceConfig = {
+            BindPaths = [
+              "/dev/kvm"
+              sharedStatePath
             ]
-            ++ optional (cfg.mainAgent != name) "hermes@${cfg.mainAgent}.service";
-            bindsTo = [
-              "network-online.target"
-            ]
-            ++ optional (cfg.mainAgent != name) "hermes@${cfg.mainAgent}.service";
-            environment = {
-              HERMES_PROFILE_NAME = agentCfg.fullName;
-              WEBHOOK_ENABLED = if cfg.mainAgent == name then "true" else "false";
-              #ANTHROPIC_BASE_URL = "http://localhost:${builtins.toString agentCfg.headroomPort}";
-              #OPENAI_BASE_URL = "http://localhost:${builtins.toString agentCfg.headroomPort}/v1";
-            };
-            overrideStrategy = "asDropin";
-            path = config.systemd.services."hermes@".path ++ [ agentCfg.package ];
-            serviceConfig = {
-              BindPaths = [
-                "/dev/kvm"
-                sharedStatePath
-              ]
-              ++ builtins.map ({ name, ... }: "%S/${name}") (
-                builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames
-              );
-              ExecStart = lib.getExe (
-                pkgs.writeShellApplication {
-                  name = "hermes-agent-exec-start";
-                  text = ''
-                    cd ~/
-                    headroom proxy \
-                      --port ${builtins.toString agentCfg.headroomPort} \
-                      --intercept-tool-results \
-                      --memory \
-                      --learn \
-                      --code-graph &
+            ++ map ({ name, ... }: "%S/${name}") (
+              builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames
+            );
+            ExecStart = lib.getExe (
+              pkgs.writeShellApplication {
+                name = "hermes-agent-exec-start";
+                text = ''
+                  cd ~/
+                  headroom proxy \
+                    --port ${toString agentCfg.headroomPort} \
+                    --intercept-tool-results \
+                    --memory \
+                    --learn \
+                    --code-graph &
+                  ${
+                    concatStringsSep " " (
+                      [
+                        "hermes"
+                        "gateway"
+                      ]
+                      ++ agentCfg.extraArgs
+                    )
+                  } &
+                  ${lib.optionalString (cfg.mainAgent == name) ''
                     ${
-                      concatStringsSep " " (
-                        [
-                          "hermes"
-                          "gateway"
-                        ]
-                        ++ agentCfg.extraArgs
-                      )
+                      concatStringsSep " " [
+                        "hermes"
+                        "dashboard"
+                      ]
                     } &
-                    ${lib.optionalString (cfg.mainAgent == name) ''
-                      ${
-                        concatStringsSep " " [
-                          "hermes"
-                          "dashboard"
-                        ]
-                      } &
-                    ''}
-                    wait -n
-                  '';
-                }
-              );
-            };
-            wantedBy = [ "multi-user.target" ];
-          };
-          "hermes-pf@${name}" = {
-            overrideStrategy = "asDropin";
-            wantedBy = [ "multi-user.target" ];
-          };
-        };
-        tmpfiles.rules =
-          let
-            config = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
-              lib.recursiveUpdate agentCfg.settings {
-                kanban = {
-                  agent_profile_name = agentCfg.fullName;
-                  dispatch_profiles = [ agentCfg.fullName ];
-                };
+                  ''}
+                  wait -n
+                '';
               }
             );
-            mnemosyneConfig = (pkgs.formats.yaml { }).generate
-              "${agentStateId}-mnemosyne-config.yaml"
-              (agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { });
-          in
-          [
-            "d %S/private 0700 - - - -"
-            "d %S/private/${agentStateId} 2700 - - - -"
-            "L+ ${agentStatePath} - - - - private/${agentStateId}"
-            "d ${hermesAgentStatePath} 2700 - - - -"
-            "f ${hermesAgentStatePath}/.managed 0600 - - - -"
-            "d ${hermesAgentStatePath}/cron 2700 - - - -"
-            "d ${hermesAgentStatePath}/cron/output 2700 - - - -"
-            "d ${hermesAgentStatePath}/logs 2700 - - - -"
-            "d ${hermesAgentStatePath}/memories 2700 - - - -"
-            "d ${hermesAgentStatePath}/sessions 2700 - - - -"
-            "d ${hermesAgentStatePath}/skills 2700 - - - -"
-            "d ${hermesAgentStatePath}/skills/software-development 2700 - - - -"
-            #"L+ ${hermesAgentStatePath}/skills/software-development/agent-delivery-governance - - - - ${./../../../skills/software-development/agent-delivery-governance}"
-            "f ${hermesAgentStatePath}/.env 0600 - - - -"
-            "L+ ${hermesAgentStatePath}/config.yaml - - - - ${config}"
-            "d ${hermesAgentStatePath}/mnemosyne 2700 - - - -"
-            "L+ ${hermesAgentStatePath}/mnemosyne/config.yaml - - - - ${mnemosyneConfig}"
-            "L+ ${hermesAgentStatePath}/profiles - - - - ${
-              pkgs.linkFarm "hermes-${name}-profiles" (
-                builtins.map ({ name, fullName, ... }: {
-                  name = fullName;
-                  path = "/var/lib/${name}/.hermes";
-                }) (builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames)
-              )
-            }"
-            "d ${hermesAgentStatePath}/plugins 2700 - - - -"
-          ]
-          ++ map (
-            plugin:
-            "L+ ${hermesAgentStatePath}/plugins/nix-managed-${getName plugin} - - - - ${plugin}"
-          ) agentCfg.extraPlugins;
+          };
+          wantedBy = [ "multi-user.target" ];
+        };
+        "hermes-pf@${name}" = {
+          overrideStrategy = "asDropin";
+          wantedBy = [ "multi-user.target" ];
+        };
       };
+      tmpfiles.rules =
+        let
+          config = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
+            lib.recursiveUpdate agentCfg.settings {
+              kanban = {
+                agent_profile_name = agentCfg.fullName;
+                dispatch_profiles = [ agentCfg.fullName ];
+              };
+            }
+          );
+          mnemosyneConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-mnemosyne-config.yaml" (
+            agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { }
+          );
+        in
+        [
+          "d %S/private 0700 - - - -"
+          "d %S/private/${agentStateId} 2700 - - - -"
+          "L+ ${agentStatePath} - - - - private/${agentStateId}"
+          "d ${hermesAgentStatePath} 2700 - - - -"
+          "f ${hermesAgentStatePath}/.managed 0600 - - - -"
+          "d ${hermesAgentStatePath}/cron 2700 - - - -"
+          "d ${hermesAgentStatePath}/cron/output 2700 - - - -"
+          "d ${hermesAgentStatePath}/logs 2700 - - - -"
+          "d ${hermesAgentStatePath}/memories 2700 - - - -"
+          "d ${hermesAgentStatePath}/sessions 2700 - - - -"
+          "d ${hermesAgentStatePath}/skills 2700 - - - -"
+          "d ${hermesAgentStatePath}/skills/software-development 2700 - - - -"
+          #"L+ ${hermesAgentStatePath}/skills/software-development/agent-delivery-governance - - - - ${./../../../skills/software-development/agent-delivery-governance}"
+          "f ${hermesAgentStatePath}/.env 0600 - - - -"
+          "L+ ${hermesAgentStatePath}/config.yaml - - - - ${config}"
+          "d ${hermesAgentStatePath}/mnemosyne 2700 - - - -"
+          "L+ ${hermesAgentStatePath}/mnemosyne/config.yaml - - - - ${mnemosyneConfig}"
+          "L+ ${hermesAgentStatePath}/profiles - - - - ${
+            pkgs.linkFarm "hermes-${name}-profiles" (
+              map ({ name, fullName, ... }: {
+                name = fullName;
+                path = "/var/lib/${name}/.hermes";
+              }) (builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames)
+            )
+          }"
+          "d ${hermesAgentStatePath}/plugins 2700 - - - -"
+        ]
+        ++ map (
+          plugin: "L+ ${hermesAgentStatePath}/plugins/nix-managed-${getName plugin} - - - - ${plugin}"
+        ) agentCfg.extraPlugins;
+    };
 in
 {
   options.services.hermes-specialised-agent = {
@@ -659,9 +655,7 @@ in
       }
     ];
 
-    nix.settings.allowed-users = map (name: "hermes-${name}") (
-      builtins.attrNames cfg.agents
-    );
+    nix.settings.allowed-users = map (name: "hermes-${name}") (builtins.attrNames cfg.agents);
 
     systemd = mkMerge (
       (mapAttrsToList (mkAgent cfg.agents agentFullNames) cfg.agents)
