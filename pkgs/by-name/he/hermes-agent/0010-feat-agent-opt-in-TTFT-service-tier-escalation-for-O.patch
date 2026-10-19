@@ -1,0 +1,2321 @@
+From 25d33fcb0724b397b996cf095b79e65fdefabde4 Mon Sep 17 00:00:00 2001
+From: Artemonim <Artemonim@yandex.ru>
+Date: Sun, 6 Sep 2026 20:18:47 +0300
+Subject: [PATCH 10/23] feat(agent): opt-in TTFT service-tier escalation for
+ OpenRouter
+
+Second commit of the #100711 service-tier split (may be dropped independently
+if tiers without the control loop are preferred).
+
+agent.service_tier_escalation (default off): streaming time-to-first-token
+ladder flex -> default -> priority. consecutive_slow_requests slow successful
+streams climb one rung for the rest of the turn; the next user prompt resets
+to the configured base tier. Applied as the last step of
+effective_request_overrides without mutating canonical agent.service_tier /
+request_overrides; a wire-tier snapshot keeps outer retries of the same
+logical request on the attempt's original tier. Fallback/restore rebases the
+ladder onto the new model's base tier (rungs carry over); switch_model resets.
+
+Hard-gated off for cron, batch, subagents, background tasks and pinned
+sessions. Default-off path is hook-free on the streaming hot path. Codex and
+non-streaming requests produce no observation (documented).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ agent/agent_init.py                         |   10 +
+ agent/agent_runtime_helpers.py              |   16 +
+ agent/chat_completion_helpers.py            |   46 +-
+ agent/conversation_loop.py                  |   45 +
+ agent/fast_mode.py                          |   10 +
+ agent/service_tier_escalation.py            |  474 ++++++++
+ agent/turn_api_call.py                      |   30 +
+ agent/turn_empty_response.py                |    4 +
+ agent/turn_final_response.py                |    2 +
+ agent/turn_tool_validation.py               |    6 +
+ agent/turn_truncation.py                    |    4 +
+ cli-config.yaml.example                     |   16 +
+ cron/scheduler.py                           |    6 +-
+ gateway/run_config_loaders.py               |   12 +
+ gateway/run_turn.py                         |    1 +
+ hermes_cli/cli_commands_mixin.py            |    1 +
+ hermes_cli/config_defaults.py               |    7 +
+ hermes_constants.py                         |  120 ++
+ tests/agent/test_service_tier_escalation.py | 1112 +++++++++++++++++++
+ tui_gateway/methods_prompt.py               |    6 +-
+ website/docs/user-guide/configuration.md    |   16 +
+ 21 files changed, 1940 insertions(+), 4 deletions(-)
+ create mode 100644 agent/service_tier_escalation.py
+ create mode 100644 tests/agent/test_service_tier_escalation.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 9454c5b2ac..46176a3c10 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2423,6 +2423,8 @@ def init_agent(
+     # * Surfaces that apply a session /fast set this True after construction. Default-off so
+     # delegated children never inherit a parent session pin.
+     agent._service_tier_session_pinned = False
++    # * Batch / background constructors set this True so an enabled config cannot climb.
++    agent._block_service_tier_escalation = False
+     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
+     agent._force_ascii_payload = False
+     # Routes that rejected image content / named reasoning keys; build_api_request strips those from wire copies only.
+@@ -2451,6 +2453,14 @@ def init_agent(
+     except Exception:
+         _agent_cfg = {}
+ 
++    from agent.service_tier_escalation import bind_service_tier_escalation
++
++    _esc_raw = service_tier_escalation
++    if _esc_raw is None and isinstance(_agent_cfg, dict):
++        _agent_section = _agent_cfg.get("agent")
++        _esc_raw = _agent_section if isinstance(_agent_section, dict) else None
++    bind_service_tier_escalation(agent, _esc_raw)
++
+     _apply_display_config(agent, _agent_cfg, platform)
+     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
+     _apply_agent_section(agent, _agent_cfg)
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 15cd862855..da08997550 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -1486,6 +1486,16 @@ def restore_primary_runtime(agent) -> bool:
+                     f"✅ Primary model restored: {agent.model} via {agent.provider}; "
+                     f"fallback {previous_model} via {previous_provider} is no longer active."
+                 )
++        try:
++            from agent.fast_mode import logical_service_tier
++            from agent.service_tier_escalation import rebase_escalation_runtime
++
++            rebase_escalation_runtime(agent, logical_service_tier(agent))
++        except Exception:
++            logger.debug(
++                "restore_primary_runtime: service-tier escalation rebase failed",
++                exc_info=True,
++            )
+         return True
+     except Exception as e:
+         logger.warning("Failed to restore primary runtime: %s", e)
+@@ -2510,6 +2520,12 @@ def switch_model(
+         )
+     except Exception as _reasoning_err:
+         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
++    try:
++        from agent.service_tier_escalation import reset_escalation_for_model_switch
++
++        reset_escalation_for_model_switch(agent)
++    except Exception:
++        logger.debug("switch_model: service_tier_escalation reset failed", exc_info=True)
+     # Invalidate the cached system prompt so it rebuilds next turn.
+     agent._cached_system_prompt = None
+     # Publish the destination capability map only after every runtime setup above has succeeded.
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index e35a0e90c1..243e944837 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1541,6 +1541,34 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list |
+     return builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
+ 
+ 
++def _apply_effective_overrides_to_summary_kwargs(agent, summary_kwargs: dict) -> None:
++    """Copy main-loop request overrides onto the iteration-limit summary call.
++
++    There is no separate ``auxiliary.summary`` tier. The summary is still
++    part of the same turn, so it must carry the effective ``service_tier``
++    (including a TTFT climb) the conversation loop uses.
++
++    Chat-completions only. ``anthropic_messages`` does not put
++    ``service_tier`` on the wire (main loop maps overrides to ``fast_mode``
++    only); its summary ``_ant_kw`` is built the same way.
++    """
++    try:
++        overrides = effective_request_overrides(agent)
++    except Exception:
++        return
++    if not overrides:
++        return
++    extra_override = overrides.get("extra_body")
++    if isinstance(extra_override, dict):
++        merged = dict(summary_kwargs.get("extra_body") or {})
++        merged.update(extra_override)
++        if merged:
++            summary_kwargs["extra_body"] = merged
++    for key, value in overrides.items():
++        if key != "extra_body":
++            summary_kwargs[key] = value
++
++
+ def _model_dump_safe(obj):
+     """``model_dump(warnings=False)`` (avoids pydantic serializer UserWarnings on
+     generic-union SDK models), falling back for shims that reject the kwarg."""
+@@ -2513,7 +2541,11 @@ def _with_stream_emitters(agent, run):
+ def _stream_codex_passthrough(agent, api_kwargs: dict, on_first_delta):
+     """Codex streams internally via _run_codex_stream (reached through
+     _interruptible_api_call); park ``on_first_delta`` on the agent so it can pick
+-    it up, and bracket the call with the stream start/end emitters."""
++    it up, and bracket the call with the stream start/end emitters.
++
++    TTFT escalation does not time this path (matching the streaming
++    ``_StreamingCall`` / ``mark_ttft_send`` hook, which is chat-completions only).
++    """
+     agent._codex_on_first_delta = on_first_delta
+     try:
+         return _with_stream_emitters(agent, lambda: agent._interruptible_api_call(api_kwargs))
+@@ -2819,6 +2851,12 @@ class _StreamingCall(StreamingWaitMonitor):
+         )
+ 
+     def _fire_first_delta(self):
++        mark = self._mark_ttft_first_delta
++        if mark is not None:
++            try:
++                mark(self.agent)
++            except Exception:
++                pass
+         if not self.first_delta_fired["done"] and self.on_first_delta:
+             self.first_delta_fired["done"] = True
+             self._quiet(self.on_first_delta)
+@@ -3196,6 +3234,12 @@ class _StreamingCall(StreamingWaitMonitor):
+                 _flush_pending_stream_text()
+                 for tc_delta in delta_tool_calls:
+                     name = tool_calls.feed(tc_delta)
++                    mark = self._mark_ttft_first_delta
++                    if mark is not None:
++                        try:
++                            mark(self.agent)
++                        except Exception:
++                            pass
+                     if name is not None:
+                         self._emit_tool_started(name)
+                         # Lets the stub-builder warn if streaming dies before the args
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 411134b41a..1fd6139f38 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -72,6 +72,34 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
+ _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+ 
+ 
++def _escalation_hooks_wanted(agent: Any) -> bool:
++    """Cheap default-off gate for TTFT escalation turn hooks.
++
++    Reads the already-bound state only — no module import. When the config
++    is off (the default) this is one getattr.
++    """
++    state = getattr(agent, "_service_tier_escalation", None)
++    return bool(state is not None and getattr(state, "enabled", False))
++
++
++def _try_accept_logical_request(agent: Any) -> None:
++    """Commit a parked TTFT when the outer loop accepts this logical request.
++
++    Used on inject-and-continue paths (history mutated; next API call is a
++    new logical request) as well as the successful tool-call / content
++    accept sites. Outer-loop pure retries must not call this — they keep
++    ``wire_locked`` so the pre-attempt tier stays on the wire.
++    """
++    if not _escalation_hooks_wanted(agent):
++        return
++    try:
++        from agent.service_tier_escalation import accept_logical_request
++
++        accept_logical_request(agent)
++    except Exception:
++        logger.warning("service-tier escalation accept_logical_request failed", exc_info=True)
++
++
+ # One-time wrap-up notice appended when a wall-clock run budget (--run-budget) crosses 80%.
+ RUN_BUDGET_WRAPUP_NOTICE = (
+     "[SYSTEM NOTICE — run time budget nearly exhausted] Run time budget nearly exhausted. "
+@@ -1500,6 +1528,16 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
+     Returns a turn result dict when a phase ends the turn, else None once the loop is left
+     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+     while s.retry_count < s.max_retries:
++        if _escalation_hooks_wanted(agent):
++            try:
++                from agent.service_tier_escalation import begin_logical_request
++
++                begin_logical_request(agent)
++            except Exception:
++                logger.warning(
++                    "service-tier escalation begin_logical_request failed",
++                    exc_info=True,
++                )
+         _ng = _run_phase(nous_rate_limit_guard, agent, s)
+         if _ng.action == "return":
+             return _ng.result
+@@ -1581,6 +1619,13 @@ def _run_conversation_turn(
+     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
+     agent._last_compression_attempt_in_place = None
+     begin_fast_mode_turn(agent, conversation_history)
++    if _escalation_hooks_wanted(agent):
++        try:
++            from agent.service_tier_escalation import begin_escalation_turn
++
++            begin_escalation_turn(agent)
++        except Exception:
++            logger.warning("service-tier escalation begin_escalation_turn failed", exc_info=True)
+ 
+     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
+     # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
+diff --git a/agent/fast_mode.py b/agent/fast_mode.py
+index ed474f7e97..906024ecac 100644
+--- a/agent/fast_mode.py
++++ b/agent/fast_mode.py
+@@ -111,6 +111,16 @@ def begin_turn(agent: Any, conversation_history: Any) -> None:
+     agent._fast_until = time.monotonic() + max(window, 0.0)
+ 
+ 
++def _apply_escalation_overlay(agent: Any, overrides: dict[str, Any]) -> dict[str, Any]:
++    """Last-step TTFT ladder overlay. No-op when escalation is disabled or gated."""
++    try:
++        from agent.service_tier_escalation import apply_escalation_to_overrides
++
++        return apply_escalation_to_overrides(agent, overrides)
++    except Exception:
++        return overrides
++
++
+ def effective_request_overrides(agent: Any) -> dict[str, Any]:
+     """``agent.request_overrides`` plus the fast override while the window is open, minus
+     ``speed`` for a model this session learned has no fast capacity."""
+diff --git a/agent/service_tier_escalation.py b/agent/service_tier_escalation.py
+new file mode 100644
+index 0000000000..4668749d3b
+--- /dev/null
++++ b/agent/service_tier_escalation.py
+@@ -0,0 +1,474 @@
++"""Per-turn OpenRouter service-tier escalation based on streaming TTFT.
++
++Turn-local state lives on ``agent._service_tier_escalation``. Canonical
++``agent.service_tier`` and ``agent.request_overrides`` are the baseline and
++are never mutated by this module. The wire overlay is the last step of
++``agent.fast_mode.effective_request_overrides``; the ladder base is A1's
++request-time ``logical_service_tier`` (session pin > per-model > global).
++
++Accepted limitations (do not "fix"): non-streaming fallback produces no
++observation; Codex passthrough parks ``on_first_delta`` and is not timed;
++length-continuation and compression/redirect restarts drop the in-flight
++sample (conservative under-escalation, self-heals on the next accepted
++response). State is per-agent, never copied to children/aux, never persisted.
++"""
++
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Callable
++
++from hermes_constants import (
++    DEFAULT_SERVICE_TIER_ESCALATION,
++    SERVICE_TIER_BOUNDED_VALUES,
++    ServiceTierEscalationConfig,
++    parse_service_tier,
++    resolve_service_tier_escalation_config,
++)
++
++logger = logging.getLogger("run_agent")
++
++# * Ladder: flex → default (omit field) → priority. No in-turn downgrade.
++_TIER_LADDER: tuple[str | None, ...] = ("flex", None, "priority")
++
++# * Surfaces that must not escalate even if a caller passes enabled config.
++_DISABLED_PLATFORMS = frozenset({"cron", "subagent"})
++
++# * Distinguishes ``begin_turn()`` (keep current base) from ``begin_turn(None)``
++# (explicit default / omit-on-wire baseline after a model switch).
++_KEEP_BASE_TIER = object()
++_WIRE_TIERS = frozenset({"flex", "priority"})
++
++
++def _ladder_tier(value) -> str | None:
++    """Map a stored preference onto the TTFT ladder (flex / default / priority).
++
++    ``auto`` / ``cold`` are bounded windows, not wire rungs — they sit at default.
++    """
++    parsed = parse_service_tier(value)
++    return parsed if parsed in _WIRE_TIERS else None
++
++
++def _logical_base_tier(agent: Any):
++    """Configured base for this request: A1 ``logical_service_tier``, else constructor."""
++    try:
++        from agent.fast_mode import logical_service_tier
++
++        return logical_service_tier(agent)
++    except Exception:
++        return parse_service_tier(getattr(agent, "service_tier", None))
++
++
++class TtftObservation:
++    """Request-local TTFT sample. Not stored on the agent across calls."""
++
++    def __init__(self, clock: Callable[[], float] | None = None) -> None:
++        self.clock = clock or time.monotonic
++        self.t_send: float | None = None
++        self.t_first: float | None = None
++        self.open_count = 0
++
++    def mark_send(self) -> None:
++        self.open_count += 1
++        if self.t_send is None:
++            self.t_send = self.clock()
++
++    def mark_first_delta(self) -> None:
++        if self.t_first is None:
++            self.t_first = self.clock()
++
++    def ttft_seconds(self) -> float | None:
++        if self.t_send is None or self.t_first is None:
++            return None
++        return max(0.0, self.t_first - self.t_send)
++
++    def was_retried(self) -> bool:
++        return self.open_count > 1
++
++
++class ServiceTierEscalationState:
++    """Turn-scoped ladder, streak, and current effective tier."""
++
++    def __init__(
++        self,
++        config: ServiceTierEscalationConfig | None = None,
++        base_tier: str | None = None,
++    ) -> None:
++        self.config = config or DEFAULT_SERVICE_TIER_ESCALATION
++        self.base_tier = _ladder_tier(base_tier)
++        self.effective_tier: str | None = self.base_tier
++        self.streak = 0
++        # * Rungs climbed from base this turn. Stored separately so a cap at
++        # priority does not forget the height when failover rebases.
++        self.climbed_rungs = 0
++        self.last_ttft_seconds: float | None = None
++        # * Pre-attempt wire snapshot: outer-retry of one logical request
++        # must not pick up a tier climbed from a not-yet-accepted sample.
++        self.wire_locked = False
++        self.wire_tier: str | None = self.base_tier
++        self.pending_ttft: float | None = None
++
++    @property
++    def enabled(self) -> bool:
++        return bool(self.config.enabled)
++
++    def begin_turn(self, base_tier: Any = _KEEP_BASE_TIER) -> None:
++        """Reset streak and adopt *base_tier* when the caller passes one.
++
++        Omitted *base_tier* keeps the current baseline. Explicit ``None``
++        is the default/normal rung (omit ``service_tier`` on the wire).
++        """
++        if base_tier is not _KEEP_BASE_TIER:
++            self.base_tier = _ladder_tier(base_tier)
++        self.effective_tier = self.base_tier
++        self.streak = 0
++        self.climbed_rungs = 0
++        self.last_ttft_seconds = None
++        self.wire_locked = False
++        self.wire_tier = self.base_tier
++        self.pending_ttft = None
++
++    def reset_for_model_switch(self, base_tier: str | None = None) -> None:
++        """Drop turn state after ``switch_model``; adopt the new model's base."""
++        self.begin_turn(base_tier)
++
++    def note_non_observation(self) -> None:
++        """Retry / error / interrupt / non-streaming: drop streak, keep tier."""
++        self.streak = 0
++        self.pending_ttft = None
++
++    def observe_ttft(self, seconds: float, *, model: str = "") -> None:
++        """Record a successful streaming TTFT and maybe climb one ladder step."""
++        if not self.enabled:
++            return
++        try:
++            ttft = float(seconds)
++        except (TypeError, ValueError):
++            self.streak = 0
++            return
++        self.last_ttft_seconds = ttft
++        if ttft <= self.config.ttft_threshold_seconds:
++            self.streak = 0
++            return
++        self.streak += 1
++        if self.streak < self.config.consecutive_slow_requests:
++            return
++        previous = self.effective_tier
++        nxt = _next_tier(previous)
++        self.streak = 0
++        if nxt == previous:
++            return
++        self.effective_tier = nxt
++        self.climbed_rungs = _climbed_rungs(self.base_tier, self.effective_tier)
++        logger.info(
++            "service_tier_escalation: model=%s %s → %s (streak_trigger=%s last_ttft=%.3fs)",
++            model or "-",
++            _tier_label(previous),
++            _tier_label(nxt),
++            self.config.consecutive_slow_requests,
++            ttft,
++        )
++
++
++def _tier_label(tier: str | None) -> str:
++    return "default" if tier is None else str(tier)
++
++
++def _next_tier(current: str | None) -> str | None:
++    try:
++        idx = _TIER_LADDER.index(current)
++    except ValueError:
++        return current
++    if idx >= len(_TIER_LADDER) - 1:
++        return _TIER_LADDER[-1]
++    return _TIER_LADDER[idx + 1]
++
++
++def _rung_index(tier: str | None) -> int:
++    parsed = _ladder_tier(tier)
++    try:
++        return _TIER_LADDER.index(parsed)
++    except ValueError:
++        return _TIER_LADDER.index(None)
++
++
++def _climbed_rungs(base_tier: str | None, effective_tier: str | None) -> int:
++    return max(0, _rung_index(effective_tier) - _rung_index(base_tier))
++
++
++def _climb_from(base_tier: str | None, rungs: int) -> str | None:
++    """Walk *rungs* steps up from *base_tier*, capped at priority."""
++    base = _ladder_tier(base_tier)
++    try:
++        steps = int(rungs)
++    except (TypeError, ValueError):
++        steps = 0
++    if steps <= 0:
++        return base
++    idx = min(_rung_index(base) + steps, len(_TIER_LADDER) - 1)
++    return _TIER_LADDER[idx]
++
++
++def _openrouter_service_tier_route(agent: Any) -> bool:
++    """Same OpenRouter predicate used when overlaying ``service_tier`` on the wire."""
++    try:
++        from hermes_cli.models import _is_openrouter_service_tier_route
++
++        return bool(
++            _is_openrouter_service_tier_route(
++                getattr(agent, "provider", None),
++                getattr(agent, "base_url", None),
++            )
++        )
++    except Exception:
++        return False
++
++
++def _surface_blocks_escalation(agent: Any) -> bool:
++    platform = str(getattr(agent, "platform", None) or "").strip().lower()
++    if platform in _DISABLED_PLATFORMS:
++        return True
++    if getattr(agent, "_persist_disabled", False):
++        return True
++    if int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
++        return True
++    if getattr(agent, "is_subagent", False):
++        return True
++    # * Hard gate for batch_runner and gateway/CLI/TUI background tasks: even
++    # an accidentally-enabled config must not climb the ladder.
++    if getattr(agent, "_block_service_tier_escalation", False):
++        return True
++    return False
++
++
++def escalation_is_active(agent: Any) -> bool:
++    """True when this agent may climb the ladder and overlay request kwargs."""
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState) or not state.enabled:
++        return False
++    if getattr(agent, "_service_tier_session_pinned", False):
++        return False
++    if _surface_blocks_escalation(agent):
++        return False
++    return True
++
++
++def bind_service_tier_escalation(agent: Any, raw_config: Any = None) -> ServiceTierEscalationState:
++    """Attach turn-local escalation state. ``None`` / invalid → disabled."""
++    if isinstance(raw_config, ServiceTierEscalationConfig):
++        config = raw_config
++    elif isinstance(raw_config, dict) and (
++        "enabled" in raw_config
++        or "ttft_threshold_seconds" in raw_config
++        or "consecutive_slow_requests" in raw_config
++    ) and "service_tier_escalation" not in raw_config:
++        config = resolve_service_tier_escalation_config(
++            {"service_tier_escalation": raw_config},
++        )
++    else:
++        config = resolve_service_tier_escalation_config(
++            raw_config if isinstance(raw_config, dict) else {},
++        )
++    state = ServiceTierEscalationState(
++        config=config,
++        base_tier=_logical_base_tier(agent),
++    )
++    agent._service_tier_escalation = state
++    return state
++
++
++def begin_escalation_turn(agent: Any) -> None:
++    """Entry of ``run_conversation``: always reset to the request-time base tier."""
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState):
++        return
++    state.begin_turn(_logical_base_tier(agent))
++
++
++def reset_escalation_for_model_switch(agent: Any) -> None:
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState):
++        return
++    state.reset_for_model_switch(_logical_base_tier(agent))
++
++
++def rebase_escalation_runtime(agent: Any, new_base_tier: str | None) -> None:
++    """Re-anchor the TTFT ladder on a fallback/restore model's base tier.
++
++    Preserves climbed rungs and the slow-streak. Recalculates ``effective_tier``
++    and ``wire_tier`` as ``climb(new_base, rungs)`` capped at priority.
++    Unlocks the wire snapshot so the next logical request pins the rebased
++    wire — a failover is a new model, not an outer-retry of the old one.
++    Does not reset the ladder (unlike ``begin_turn`` / ``switch_model``).
++    On this branch *new_base_tier* is A1 ``logical_service_tier`` (no resync).
++    """
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState):
++        return
++    stored = getattr(state, "climbed_rungs", 0)
++    try:
++        stored_rungs = int(stored)
++    except (TypeError, ValueError):
++        stored_rungs = 0
++    rungs = max(stored_rungs, _climbed_rungs(state.base_tier, state.effective_tier))
++    new_base = _ladder_tier(new_base_tier)
++    state.base_tier = new_base
++    state.climbed_rungs = rungs
++    state.effective_tier = _climb_from(new_base, rungs)
++    state.wire_tier = state.effective_tier
++    state.wire_locked = False
++    state.pending_ttft = None
++
++
++def note_non_observation(agent: Any) -> None:
++    state = getattr(agent, "_service_tier_escalation", None)
++    if isinstance(state, ServiceTierEscalationState):
++        state.note_non_observation()
++
++
++def begin_request_ttft(
++    agent: Any,
++    clock: Callable[[], float] | None = None,
++) -> TtftObservation:
++    obs = TtftObservation(clock=clock)
++    stack = getattr(agent, "_ttft_obs_stack", None)
++    if not isinstance(stack, list):
++        stack = []
++        agent._ttft_obs_stack = stack
++    stack.append(obs)
++    return obs
++
++
++def end_request_ttft(agent: Any, obs: TtftObservation) -> None:
++    stack = getattr(agent, "_ttft_obs_stack", None)
++    if isinstance(stack, list) and stack and stack[-1] is obs:
++        stack.pop()
++
++
++def _current_ttft_obs(agent: Any) -> TtftObservation | None:
++    stack = getattr(agent, "_ttft_obs_stack", None)
++    if isinstance(stack, list) and stack:
++        top = stack[-1]
++        if isinstance(top, TtftObservation):
++            return top
++    return None
++
++
++def mark_ttft_send(agent: Any) -> None:
++    obs = _current_ttft_obs(agent)
++    if obs is not None:
++        obs.mark_send()
++
++
++def mark_ttft_first_delta(agent: Any) -> None:
++    obs = _current_ttft_obs(agent)
++    if obs is not None:
++        obs.mark_first_delta()
++
++
++def finish_request_ttft(
++    agent: Any,
++    obs: TtftObservation,
++    *,
++    interrupted: bool = False,
++) -> None:
++    """Park a TTFT sample until the outer loop accepts this logical request.
++
++    Inner stream retries (``open_count > 1``), interrupts, and missing
++    samples are non-observations. Outer-loop retries must call
++    ``begin_logical_request`` again so the parked sample is dropped
++    without climbing the ladder.
++    """
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState):
++        return
++    # * Non-OpenRouter samples must not park pending or climb the ladder;
++    # a later OpenRouter failover in the same turn would inherit them.
++    if not _openrouter_service_tier_route(agent):
++        return
++    if not escalation_is_active(agent):
++        note_non_observation(agent)
++        return
++    if interrupted or obs.was_retried():
++        note_non_observation(agent)
++        return
++    ttft = obs.ttft_seconds()
++    if ttft is None:
++        note_non_observation(agent)
++        return
++    state.pending_ttft = ttft
++
++
++def begin_logical_request(agent: Any) -> None:
++    """Pin wire-tier for this logical request; drop a parked sample on retry.
++
++    First call locks ``wire_tier`` to the current effective tier. Further
++    calls while still locked are outer-retries of the same request: the
++    parked observation is discarded and the locked tier stays on the wire.
++    """
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState):
++        return
++    if state.wire_locked:
++        state.note_non_observation()
++        return
++    state.wire_tier = state.effective_tier
++    state.wire_locked = True
++    state.pending_ttft = None
++
++
++def accept_logical_request(agent: Any) -> None:
++    """Commit a parked TTFT after the outer loop accepts the response.
++
++    Unlocks the wire snapshot so the next tool-loop iteration overlays
++    the (possibly climbed) effective tier.
++    """
++    state = getattr(agent, "_service_tier_escalation", None)
++    if not isinstance(state, ServiceTierEscalationState):
++        return
++    pending = state.pending_ttft
++    state.pending_ttft = None
++    state.wire_locked = False
++    if pending is None or not escalation_is_active(agent):
++        return
++    state.observe_ttft(pending, model=str(getattr(agent, "model", "") or ""))
++
++
++def apply_escalation_to_overrides(agent: Any, overrides: dict) -> dict:
++    """Last-step overlay: OpenRouter ``service_tier`` only; default omits the key."""
++    if not escalation_is_active(agent):
++        return overrides
++    state: ServiceTierEscalationState = agent._service_tier_escalation
++    if not _openrouter_service_tier_route(agent):
++        return overrides
++
++    target = state.wire_tier if state.wire_locked else state.effective_tier
++    # * auto/cold windows own the per-request field until the ladder climbs.
++    if target is None and _logical_base_tier(agent) in SERVICE_TIER_BOUNDED_VALUES:
++        return overrides
++    present = parse_service_tier(overrides.get("service_tier"))
++    if target is None and "service_tier" not in overrides and "speed" not in overrides:
++        return overrides
++    if target is not None and present == target:
++        if state.effective_tier != state.base_tier:
++            logger.debug(
++                "service_tier_escalation applying %s to request (model=%s)",
++                _tier_label(target),
++                getattr(agent, "model", None),
++            )
++        return overrides
++
++    if target in ("flex", "priority"):
++        overrides["service_tier"] = target
++        overrides.pop("speed", None)
++    else:
++        overrides.pop("service_tier", None)
++        overrides.pop("speed", None)
++    if state.effective_tier != state.base_tier:
++        logger.debug(
++            "service_tier_escalation applying %s to request (model=%s)",
++            _tier_label(target),
++            getattr(agent, "model", None),
++        )
++    return overrides
+diff --git a/agent/turn_api_call.py b/agent/turn_api_call.py
+index ef08530846..3f8d24d955 100644
+--- a/agent/turn_api_call.py
++++ b/agent/turn_api_call.py
+@@ -92,9 +92,39 @@ def perform_api_call(
+                 sanitize_harmony_tokens=agent._is_codex_backend(),
+             )
+         if _use_streaming:
++            from agent.service_tier_escalation import escalation_is_active
++
++            if escalation_is_active(agent):
++                from agent.service_tier_escalation import (
++                    begin_request_ttft,
++                    end_request_ttft,
++                    finish_request_ttft,
++                    note_non_observation,
++                )
++
++                obs = begin_request_ttft(agent)
++                try:
++                    result = agent._interruptible_streaming_api_call(
++                        next_api_kwargs, on_first_delta=_stop_spinner
++                    )
++                    finish_request_ttft(
++                        agent,
++                        obs,
++                        interrupted=bool(getattr(agent, "_interrupt_requested", False)),
++                    )
++                    return result
++                except Exception:
++                    note_non_observation(agent)
++                    raise
++                finally:
++                    end_request_ttft(agent, obs)
+             return agent._interruptible_streaming_api_call(
+                 next_api_kwargs, on_first_delta=_stop_spinner
+             )
++        from agent.service_tier_escalation import escalation_is_active, note_non_observation
++
++        if escalation_is_active(agent):
++            note_non_observation(agent)
+         from agent import relay_llm
+ 
+         return relay_llm.execute(
+diff --git a/agent/turn_empty_response.py b/agent/turn_empty_response.py
+index 7a76d297cc..2696f86fd7 100644
+--- a/agent/turn_empty_response.py
++++ b/agent/turn_empty_response.py
+@@ -219,6 +219,8 @@ def recover_empty_response(
+         append_message(messages, {
+             "role": "user", "content": _EMPTY_TOOL_RESPONSE_NUDGE, "_empty_recovery_synthetic": True
+         })
++        from agent.conversation_loop import _try_accept_logical_request
++        _try_accept_logical_request(agent)
+         return _verdict("continue")
+ 
+     # Thinking-only prefill: append the reasoning as-is and continue so the model sees
+@@ -242,6 +244,8 @@ def recover_empty_response(
+         interim_msg["_thinking_prefill"] = True
+         append_message(messages, interim_msg)
+         agent._session_messages = messages
++        from agent.conversation_loop import _try_accept_logical_request
++        _try_accept_logical_request(agent)
+         return _verdict("continue")
+ 
+     # Empty-response retries: truly empty replies AND reasoning-only replies after
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index 8b0c9b1493..6c84e6ec07 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -149,6 +149,8 @@ def finish_text_response(
+ 
+     agent._empty_content_retries = 0
+     agent._thinking_prefill_retries = 0
++    from agent.conversation_loop import _try_accept_logical_request
++    _try_accept_logical_request(agent)
+     # Surface the one-shot fallback switch notice before dropping the retry buffer so a
+     # provider/model switch stays visible on success.
+     agent._emit_pending_fallback_notice()
+diff --git a/agent/turn_tool_validation.py b/agent/turn_tool_validation.py
+index be3c21df39..d594716e06 100644
+--- a/agent/turn_tool_validation.py
++++ b/agent/turn_tool_validation.py
+@@ -150,6 +150,8 @@ def validate_tool_calls(
+                 else "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
+             ),
+         )
++        from agent.conversation_loop import _try_accept_logical_request
++        _try_accept_logical_request(agent)
+         return _verdict("continue")
+     # Reset retry counter on successful tool call validation
+     agent._invalid_tool_retries = 0
+@@ -229,8 +231,12 @@ def validate_tool_calls(
+             )
+ 
+         _append_tool_error_results(messages, tool_calls, _json_error_result)
++        from agent.conversation_loop import _try_accept_logical_request
++        _try_accept_logical_request(agent)
+         return _verdict("continue")
+ 
+     # Reset retry counter on successful JSON validation
+     agent._invalid_json_retries = 0
++    from agent.conversation_loop import _try_accept_logical_request
++    _try_accept_logical_request(agent)
+     return _verdict("ok")
+diff --git a/agent/turn_truncation.py b/agent/turn_truncation.py
+index 190bff1fcc..0fab226bb8 100644
+--- a/agent/turn_truncation.py
++++ b/agent/turn_truncation.py
+@@ -584,6 +584,7 @@ def continue_codex_incomplete(
+ 
+     agent._codex_incomplete_retries += 1
+     n = agent._codex_incomplete_retries
++    _codex_history_mutated = False
+ 
+     interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+     interim_has_content = bool((interim_msg.get("content") or "").strip())
+@@ -626,6 +627,7 @@ def continue_codex_incomplete(
+         else:
+             append_message(messages, interim_msg)
+             agent._emit_interim_assistant_message(interim_msg)
++            _codex_history_mutated = True
+ 
+     if reasoning_only and streak >= 3:
+         if agent._try_activate_fallback(reason=FailoverReason.incomplete_response):
+@@ -685,6 +687,8 @@ def continue_codex_incomplete(
+             f"↻ model returned reasoning with no final answer — asking it to continue ({n}/3)"
+         )
+         agent._session_messages = messages
++        if _codex_history_mutated:
++            _try_accept_logical_request(agent)
+         return None
+ 
+     agent._codex_incomplete_retries = 0
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 585b7a1f35..57517862e7 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -1340,6 +1340,22 @@ agent:
+   #   "anthropic/claude-opus-4.6": "priority"
+   service_tier_overrides: {}
+ 
++  # Opt-in per-turn OpenRouter service-tier climb on slow streaming TTFT.
++  # consecutive_slow_requests slow successes climb one rung (flex -> default ->
++  # priority) for the REST of that turn; the next user prompt resets to the
++  # configured base. Never mutates agent.service_tier / request_overrides.
++  # Hard-off for cron, batch, subagents, background tasks, and /fast pins.
++  # Non-streaming calls, length-continuation, and compression/redirect restarts
++  # produce no observation (conservative under-escalation).
++  # service_tier_escalation:
++  #   enabled: true                    # default: false (opt-in)
++  #   ttft_threshold_seconds: 8.0
++  #   consecutive_slow_requests: 1
++  service_tier_escalation:
++    enabled: false
++    ttft_threshold_seconds: 8.0
++    consecutive_slow_requests: 1
++
+   # Custom personalities (use with /personality command).
+   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,
+   # pirate, shakespeare, surfer, noir, uwu, philosopher, hype) are always
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 1a3bdb1ee2..62fbd2e83d 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2465,7 +2465,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+     runtime = setup.runtime
+     pr = _cfg.get("provider_routing") or {}
+-    return AIAgent(
++    agent = AIAgent(
+         model=setup.model,
+         api_key=runtime.get("api_key"),
+         base_url=runtime.get("base_url"),
+@@ -2497,6 +2497,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+         session_id=session_id,
+         session_db=session_db,
+     )
++    # * Same explicit block as batch_runner and /bg: platform="cron" is not
++    # the only gate if an enabled config is bound from disk.
++    agent._block_service_tier_escalation = True
++    return agent
+ 
+ 
+ class _FireAudit:
+diff --git a/gateway/run_config_loaders.py b/gateway/run_config_loaders.py
+index bf33fcafd4..191c4ed1c8 100644
+--- a/gateway/run_config_loaders.py
++++ b/gateway/run_config_loaders.py
+@@ -238,6 +238,18 @@ class GatewayConfigLoadersMixin:
+ 
+         return _parse_service_tier_config(cls._cfg_str("agent", "service_tier"))
+ 
++    @classmethod
++    def _load_service_tier_escalation(cls):
++        """``agent.service_tier_escalation``; missing/invalid → disabled defaults."""
++        from gateway.run import _load_gateway_runtime_config
++        from hermes_constants import resolve_service_tier_escalation_config
++
++        cfg = _load_gateway_runtime_config() or {}
++        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else {}
++        return resolve_service_tier_escalation_config(
++            agent_cfg if isinstance(agent_cfg, dict) else {},
++        )
++
+     @staticmethod
+     def _load_show_reasoning() -> bool:
+         """``display.show_reasoning`` toggle."""
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index c16449eac3..efbb304563 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -2484,6 +2484,7 @@ class GatewayTurnMixin:
+                     # See #60955.
+                     fallback_model=self._refresh_fallback_model(),
+                 )
++                agent._block_service_tier_escalation = True
+                 try:
+                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
+                 finally:
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index 635e6a8b45..7a5de83ebd 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -1704,6 +1704,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
+                     service_tier=self.service_tier,
+                     request_overrides=turn_route.get("request_overrides"),
+                     **{kw: getattr(self, attr) for kw, attr in _BG_PROVIDER_KWARGS.items()})
++                bg_agent._block_service_tier_escalation = True
+                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
+                 bg_agent._print_fn = lambda *_a, **_kw: None
+ 
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 2be70ff695..47f88facf5 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -156,6 +156,13 @@ DEFAULT_CONFIG = {
+         "service_tier": "",
+         # Per-model overlay: {"<model-id>": "flex"|"priority"|...}. Request-time; spelling-tolerant.
+         "service_tier_overrides": {},
++        # Opt-in per-turn OpenRouter service-tier climb on slow TTFT.
++        # Off by default. Does not persist; resets at each user turn.
++        "service_tier_escalation": {
++            "enabled": False,
++            "ttft_threshold_seconds": 8.0,
++            "consecutive_slow_requests": 1,
++        },
+         "fast_auto_seconds": 60,
+         # Responses API final-answer length (`text.verbosity`): "" = not sent (provider default),
+         # or low | medium | high. Responses-family transports only; chat_completions never sends it.
+diff --git a/hermes_constants.py b/hermes_constants.py
+index 73cf79f5d3..45587e018f 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -4,6 +4,7 @@ Import-safe, stdlib-only — importable from anywhere without circular-import ri
+ """
+ 
+ import contextlib
++import math
+ import os
+ import re
+ import shutil
+@@ -12,6 +13,7 @@ import sys
+ from collections.abc import MutableMapping
+ from contextvars import ContextVar, Token
+ from pathlib import Path
++from typing import NamedTuple
+ 
+ _profile_fallback_warned: bool = False
+ _UNSET = object()
+@@ -1058,6 +1060,124 @@ def parse_service_tier(value) -> str | None:
+     return _SERVICE_TIER_ALIASES.get(normalized)
+ 
+ 
++class ServiceTierEscalationConfig(NamedTuple):
++    """Validated ``agent.service_tier_escalation`` settings (opt-in TTFT ladder)."""
++
++    enabled: bool = False
++    ttft_threshold_seconds: float = 8.0
++    consecutive_slow_requests: int = 1
++
++
++DEFAULT_SERVICE_TIER_ESCALATION = ServiceTierEscalationConfig()
++
++
++def resolve_service_tier_escalation_config(agent_cfg) -> ServiceTierEscalationConfig:
++    """Parse ``agent.service_tier_escalation`` with safe defaults.
++
++    Invalid values log a warning and fall back to the matching default
++    (disabled / 8.0s / 1). Missing or non-dict sections return the
++    disabled default without raising.
++    """
++    defaults = DEFAULT_SERVICE_TIER_ESCALATION
++    if not isinstance(agent_cfg, dict):
++        return defaults
++    raw = agent_cfg.get("service_tier_escalation")
++    if raw is None:
++        return defaults
++    if not isinstance(raw, dict):
++        import logging
++        logging.getLogger(__name__).warning(
++            "Invalid agent.service_tier_escalation (expected mapping), "
++            "using disabled defaults",
++        )
++        return defaults
++
++    enabled, enabled_ok = _coerce_escalation_enabled(raw.get("enabled", False))
++    if not enabled_ok:
++        import logging
++        logging.getLogger(__name__).warning(
++            "Invalid agent.service_tier_escalation.enabled %r, defaulting to false",
++            raw.get("enabled"),
++        )
++
++    threshold, threshold_ok = _coerce_escalation_threshold(
++        raw.get("ttft_threshold_seconds", defaults.ttft_threshold_seconds),
++    )
++    if not threshold_ok:
++        import logging
++        logging.getLogger(__name__).warning(
++            "Invalid agent.service_tier_escalation.ttft_threshold_seconds %r, "
++            "defaulting to %s",
++            raw.get("ttft_threshold_seconds"),
++            defaults.ttft_threshold_seconds,
++        )
++
++    consecutive, consecutive_ok = _coerce_escalation_consecutive(
++        raw.get("consecutive_slow_requests", defaults.consecutive_slow_requests),
++    )
++    if not consecutive_ok:
++        import logging
++        logging.getLogger(__name__).warning(
++            "Invalid agent.service_tier_escalation.consecutive_slow_requests %r, "
++            "defaulting to %s",
++            raw.get("consecutive_slow_requests"),
++            defaults.consecutive_slow_requests,
++        )
++
++    return ServiceTierEscalationConfig(
++        enabled=enabled,
++        ttft_threshold_seconds=threshold,
++        consecutive_slow_requests=consecutive,
++    )
++
++
++def _coerce_escalation_enabled(value) -> tuple[bool, bool]:
++    """Return ``(enabled, valid)``. Invalid → ``(False, False)``."""
++    if isinstance(value, bool):
++        return value, True
++    if isinstance(value, (int, float)) and value in (0, 1):
++        return bool(value), True
++    if isinstance(value, str):
++        normalized = value.strip().lower()
++        if normalized in {"true", "yes", "on", "1"}:
++            return True, True
++        if normalized in {"false", "no", "off", "0", ""}:
++            return False, True
++    if value is None:
++        return False, True
++    return False, False
++
++
++def _coerce_escalation_threshold(value) -> tuple[float, bool]:
++    """Return ``(seconds, valid)``. Must be a finite number ``> 0``."""
++    # * bool is a subclass of int; float(True) == 1.0 must not count as valid.
++    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
++        return DEFAULT_SERVICE_TIER_ESCALATION.ttft_threshold_seconds, False
++    try:
++        parsed = float(value)
++    except (TypeError, ValueError, OverflowError):
++        return DEFAULT_SERVICE_TIER_ESCALATION.ttft_threshold_seconds, False
++    if not math.isfinite(parsed) or parsed <= 0:
++        return DEFAULT_SERVICE_TIER_ESCALATION.ttft_threshold_seconds, False
++    return parsed, True
++
++
++def _coerce_escalation_consecutive(value) -> tuple[int, bool]:
++    """Return ``(count, valid)``. Must be an integer ``>= 1``."""
++    if isinstance(value, bool):
++        return DEFAULT_SERVICE_TIER_ESCALATION.consecutive_slow_requests, False
++    try:
++        parsed_float = float(value)
++    except (TypeError, ValueError, OverflowError):
++        return DEFAULT_SERVICE_TIER_ESCALATION.consecutive_slow_requests, False
++    if not math.isfinite(parsed_float) or parsed_float != int(parsed_float):
++        return DEFAULT_SERVICE_TIER_ESCALATION.consecutive_slow_requests, False
++    parsed = int(parsed_float)
++    if parsed < 1:
++        return DEFAULT_SERVICE_TIER_ESCALATION.consecutive_slow_requests, False
++    return parsed, True
++
++
+ def service_tier_status_label(tier: str | None) -> str:
+     """Map a canonical ``service_tier`` to the ``/fast`` status word."""
+     if tier == "priority":
+diff --git a/tests/agent/test_service_tier_escalation.py b/tests/agent/test_service_tier_escalation.py
+new file mode 100644
+index 0000000000..87ec178997
+--- /dev/null
++++ b/tests/agent/test_service_tier_escalation.py
+@@ -0,0 +1,1112 @@
++"""Per-turn OpenRouter service-tier escalation on streaming TTFT."""
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from agent.fast_mode import effective_request_overrides as _effective_request_overrides
++from agent.service_tier_escalation import (
++    ServiceTierEscalationState,
++    TtftObservation,
++    accept_logical_request,
++    apply_escalation_to_overrides,
++    begin_escalation_turn,
++    begin_logical_request,
++    begin_request_ttft,
++    bind_service_tier_escalation,
++    end_request_ttft,
++    finish_request_ttft,
++    note_non_observation,
++    rebase_escalation_runtime,
++    reset_escalation_for_model_switch,
++)
++from hermes_constants import ServiceTierEscalationConfig
++
++
++def _enabled_cfg(threshold=8.0, consecutive=1):
++    return {
++        "enabled": True,
++        "ttft_threshold_seconds": threshold,
++        "consecutive_slow_requests": consecutive,
++    }
++
++
++def _agent(**kwargs):
++    agent = SimpleNamespace(
++        service_tier=kwargs.get("service_tier", "flex"),
++        request_overrides=dict(kwargs.get("request_overrides", {})),
++        model=kwargs.get("model", "google/gemini-flash"),
++        provider=kwargs.get("provider", "openrouter"),
++        base_url=kwargs.get("base_url", "https://openrouter.ai/api/v1"),
++        _service_tier_session_pinned=kwargs.get("pinned", False),
++        platform=kwargs.get("platform", "cli"),
++        _persist_disabled=kwargs.get("persist_disabled", False),
++        _delegate_depth=kwargs.get("delegate_depth", 0),
++        is_subagent=kwargs.get("is_subagent", False),
++        _interrupt_requested=False,
++        _block_service_tier_escalation=kwargs.get("block_escalation", False),
++    )
++    bind_service_tier_escalation(agent, kwargs.get("escalation", _enabled_cfg()))
++    return agent
++
++
++def _slow_obs():
++    obs = TtftObservation(clock=lambda: 0.0)
++    obs.t_send = 0.0
++    obs.t_first = 20.0
++    obs.open_count = 1
++    return obs
++
++
++def _validation_agent():
++    """Minimal agent for ``validate_tool_calls`` production-home tests."""
++    agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=1))
++    agent.valid_tool_names = {"web_search"}
++    agent._uniquify_tool_call_ids = lambda tcs: tcs
++    agent._repair_tool_call = lambda name: None
++    agent._invalid_tool_retries = 0
++    agent._invalid_json_retries = 0
++    agent._buffer_vprint = lambda *_a, **_k: None
++    agent._vprint = lambda *_a, **_k: None
++    agent.log_prefix = ""
++    agent.quiet_mode = True
++    agent._flush_status_buffer = lambda: None
++    agent._persist_session = lambda *_a, **_k: None
++    agent._cleanup_task_resources = lambda *_a, **_k: None
++    agent._build_assistant_message = (
++        lambda msg, _fr: {"role": "assistant", "content": getattr(msg, "content", ""), "tool_calls": msg.tool_calls}
++    )
++    return agent
++
++
++class TestServiceTierEscalationStateMachine:
++    def test_ladder_flex_default_priority_and_cap(self):
++        state = ServiceTierEscalationState(
++            ServiceTierEscalationConfig(enabled=True, ttft_threshold_seconds=8.0, consecutive_slow_requests=1),
++            base_tier="flex",
++        )
++        state.observe_ttft(9.0, model="m")
++        assert state.effective_tier is None
++        state.observe_ttft(9.0, model="m")
++        assert state.effective_tier == "priority"
++        state.observe_ttft(9.0, model="m")
++        assert state.effective_tier == "priority"
++
++    def test_fast_response_resets_streak_keeps_tier(self):
++        state = ServiceTierEscalationState(
++            ServiceTierEscalationConfig(enabled=True, ttft_threshold_seconds=8.0, consecutive_slow_requests=2),
++            base_tier="flex",
++        )
++        state.observe_ttft(9.0, model="m")
++        assert state.streak == 1
++        assert state.effective_tier == "flex"
++        state.observe_ttft(1.0, model="m")
++        assert state.streak == 0
++        assert state.effective_tier == "flex"
++
++    def test_escalates_only_after_n_consecutive_slow(self):
++        state = ServiceTierEscalationState(
++            ServiceTierEscalationConfig(enabled=True, ttft_threshold_seconds=8.0, consecutive_slow_requests=2),
++            base_tier="flex",
++        )
++        state.observe_ttft(9.0, model="m")
++        assert state.effective_tier == "flex"
++        state.observe_ttft(9.0, model="m")
++        assert state.effective_tier is None
++        assert state.streak == 0
++
++    def test_begin_turn_resets_to_base(self):
++        agent = _agent(service_tier="flex")
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        assert agent._service_tier_escalation.effective_tier is None
++        begin_escalation_turn(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.streak == 0
++
++    def test_pin_disables_finish_observation(self):
++        agent = _agent(service_tier="flex", pinned=True)
++        obs = TtftObservation(clock=lambda: 0.0)
++        obs.t_send = 0.0
++        obs.t_first = 20.0
++        obs.open_count = 1
++        finish_request_ttft(agent, obs)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.streak == 0
++
++    def test_non_streaming_resets_streak_keeps_tier(self):
++        agent = _agent(service_tier="flex")
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        assert agent._service_tier_escalation.effective_tier is None
++        agent._service_tier_escalation.streak = 4
++        note_non_observation(agent)
++        assert agent._service_tier_escalation.effective_tier is None
++        assert agent._service_tier_escalation.streak == 0
++
++    def test_switch_model_resets_and_adopts_new_base(self):
++        agent = _agent(service_tier="flex")
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        agent.service_tier = "priority"
++        reset_escalation_for_model_switch(agent)
++        assert agent._service_tier_escalation.base_tier == "priority"
++        assert agent._service_tier_escalation.effective_tier == "priority"
++        assert agent._service_tier_escalation.streak == 0
++
++    def test_base_priority_is_noop(self):
++        state = ServiceTierEscalationState(
++            ServiceTierEscalationConfig(enabled=True),
++            base_tier="priority",
++        )
++        state.observe_ttft(30.0, model="m")
++        assert state.effective_tier == "priority"
++
++
++class TestServiceTierEscalationApply:
++    def test_next_request_carries_escalated_tier_and_baseline_untouched(self):
++        agent = _agent(service_tier="flex", request_overrides={"keep": 1})
++        canonical_overrides = dict(agent.request_overrides)
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        applied = _effective_request_overrides(agent)
++        assert "service_tier" not in applied
++        assert applied.get("keep") == 1
++        assert agent.service_tier == "flex"
++        assert agent.request_overrides == canonical_overrides
++
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        applied = _effective_request_overrides(agent)
++        assert applied["service_tier"] == "priority"
++        assert agent.service_tier == "flex"
++        assert agent.request_overrides == canonical_overrides
++
++    def test_flex_to_default_removes_override_key(self):
++        agent = _agent(
++            service_tier="flex",
++            request_overrides={"service_tier": "flex"},
++        )
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        applied = _effective_request_overrides(agent)
++        assert "service_tier" not in applied
++        assert "speed" not in applied
++        assert agent.request_overrides == {"service_tier": "flex"}
++
++    def test_non_openrouter_is_not_overlaid(self):
++        agent = _agent(
++            service_tier="flex",
++            provider="openai",
++            base_url="https://api.openai.com/v1",
++        )
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        applied = apply_escalation_to_overrides(agent, {"service_tier": "flex"})
++        assert applied == {"service_tier": "flex"}
++
++
++class TestServiceTierEscalationIsolation:
++    def test_cron_platform_does_not_escalate(self):
++        agent = _agent(platform="cron", service_tier="flex")
++        obs = TtftObservation(clock=lambda: 0.0)
++        obs.t_send = 0.0
++        obs.t_first = 20.0
++        obs.open_count = 1
++        finish_request_ttft(agent, obs)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        applied = _effective_request_overrides(agent)
++        assert applied.get("service_tier") == "flex"
++
++    def test_subagent_platform_does_not_escalate(self):
++        agent = _agent(platform="subagent", service_tier="flex")
++        obs = TtftObservation(clock=lambda: 0.0)
++        obs.t_send = 0.0
++        obs.t_first = 20.0
++        obs.open_count = 1
++        finish_request_ttft(agent, obs)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++    def test_background_review_persist_disabled_does_not_escalate(self):
++        agent = _agent(persist_disabled=True, service_tier="flex")
++        obs = TtftObservation(clock=lambda: 0.0)
++        obs.t_send = 0.0
++        obs.t_first = 20.0
++        obs.open_count = 1
++        finish_request_ttft(agent, obs)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++    def test_subagent_depth_does_not_escalate(self):
++        agent = _agent(delegate_depth=1, service_tier="flex")
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++    def test_is_subagent_flag_does_not_escalate(self):
++        agent = _agent(is_subagent=True, service_tier="flex")
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++    def test_unconfigured_agent_is_disabled(self):
++        agent = SimpleNamespace(
++            service_tier="flex",
++            platform="cli",
++            _service_tier_session_pinned=False,
++            _persist_disabled=False,
++            _delegate_depth=0,
++            is_subagent=False,
++        )
++        bind_service_tier_escalation(agent, None)
++        assert agent._service_tier_escalation.enabled is False
++
++
++class TestTtftObservationClock:
++    def test_injected_clock_without_sleep(self):
++        ticks = iter([10.0, 19.5])
++        obs = TtftObservation(clock=lambda: next(ticks))
++        obs.mark_send()
++        obs.mark_first_delta()
++        assert obs.ttft_seconds() == 9.5
++        assert obs.was_retried() is False
++
++    def test_retry_open_count(self):
++        obs = TtftObservation(clock=lambda: 1.0)
++        obs.mark_send()
++        obs.mark_send()
++        assert obs.was_retried() is True
++
++    def test_stack_is_request_local(self):
++        agent = _agent()
++        first = begin_request_ttft(agent, clock=lambda: 1.0)
++        second = begin_request_ttft(agent, clock=lambda: 2.0)
++        assert agent._ttft_obs_stack[-1] is second
++        end_request_ttft(agent, second)
++        assert agent._ttft_obs_stack[-1] is first
++        end_request_ttft(agent, first)
++        assert agent._ttft_obs_stack == []
++
++
++class TestServiceTierEscalationLoaders:
++    def test_cli_defaults_include_disabled_section(self):
++        import cli as cli_mod
++        from hermes_constants import resolve_service_tier_escalation_config
++
++        cfg = resolve_service_tier_escalation_config(
++            cli_mod.load_cli_config().get("agent") or {},
++        )
++        assert cfg.enabled is False
++        assert cfg.ttft_threshold_seconds == 8.0
++        assert cfg.consecutive_slow_requests == 1
++
++    def test_gateway_loader_reads_section(self, monkeypatch):
++        import gateway.run as gateway_run
++
++        monkeypatch.setattr(
++            gateway_run,
++            "_load_gateway_runtime_config",
++            lambda: {
++                "agent": {
++                    "service_tier_escalation": {
++                        "enabled": True,
++                        "ttft_threshold_seconds": 2.5,
++                        "consecutive_slow_requests": 4,
++                    },
++                },
++            },
++        )
++        cfg = gateway_run.GatewayRunner._load_service_tier_escalation()
++        assert cfg.enabled is True
++        assert cfg.ttft_threshold_seconds == 2.5
++        assert cfg.consecutive_slow_requests == 4
++
++    def test_gateway_loader_defaults_disabled(self, monkeypatch):
++        import gateway.run as gateway_run
++
++        monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
++        cfg = gateway_run.GatewayRunner._load_service_tier_escalation()
++        assert cfg.enabled is False
++
++    def test_tui_loader_reads_section(self, monkeypatch):
++        import tui_gateway.server as server
++
++        monkeypatch.setattr(
++            server,
++            "_load_cfg",
++            lambda: {
++                "agent": {
++                    "service_tier_escalation": {
++                        "enabled": True,
++                        "ttft_threshold_seconds": 1.25,
++                        "consecutive_slow_requests": 2,
++                    },
++                },
++            },
++        )
++        cfg = server._load_service_tier_escalation()
++        assert cfg.enabled is True
++        assert cfg.ttft_threshold_seconds == 1.25
++        assert cfg.consecutive_slow_requests == 2
++
++    def test_tui_loader_defaults_disabled(self, monkeypatch):
++        import tui_gateway.server as server
++
++        monkeypatch.setattr(server, "_load_cfg", lambda: {})
++        cfg = server._load_service_tier_escalation()
++        assert cfg.enabled is False
++
++
++class TestSwitchModelResetsEscalation:
++    def test_real_switch_model_resets_ladder(self, monkeypatch):
++        from agent.agent_runtime_helpers import switch_model
++
++        agent = MagicMock()
++        agent.model = "openai/gpt-5"
++        agent.provider = "openrouter"
++        agent.base_url = "https://openrouter.ai/api/v1"
++        agent.api_mode = "chat_completions"
++        agent.api_key = "test-key"
++        agent._client_kwargs = {
++            "api_key": "test-key",
++            "base_url": "https://openrouter.ai/api/v1",
++        }
++        agent._use_prompt_caching = False
++        agent._use_native_cache_layout = False
++        agent.reasoning_config = None
++        agent.service_tier = "flex"
++        agent._service_tier_session_pinned = False
++        agent._provider_routing_config = {}
++        agent.providers_allowed = None
++        agent.providers_ignored = None
++        agent.providers_order = None
++        agent.provider_sort = None
++        agent.provider_require_parameters = False
++        agent.provider_data_collection = None
++        agent._fallback_activated = False
++        agent._fallback_index = 0
++        agent._fallback_chain = []
++        agent._fallback_model = None
++        agent._config_context_length = None
++        agent._transport_cache = {}
++        agent.context_compressor = None
++        agent._cached_system_prompt = None
++        agent._anthropic_api_key = ""
++        agent._anthropic_base_url = None
++        agent._is_anthropic_oauth = False
++        agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
++        agent._ensure_lmstudio_runtime_loaded = MagicMock(return_value=None)
++        agent._lmstudio_load_was_unverified = MagicMock(return_value=False)
++        agent._effective_lmstudio_context_length = MagicMock(return_value=None)
++        agent.requested_provider = "openrouter"
++        bind_service_tier_escalation(agent, _enabled_cfg())
++        agent._service_tier_escalation.observe_ttft(20.0, model="m")
++        assert agent._service_tier_escalation.effective_tier is None
++
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config",
++            lambda: {"agent": {"service_tier": "priority"}, "provider_routing": {}},
++        )
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config_readonly",
++            lambda: {"agent": {"service_tier": "priority"}, "provider_routing": {}},
++        )
++        agent._block_service_tier_escalation = False
++        agent._persist_disabled = False
++        agent.is_subagent = False
++        agent.platform = "cli"
++        agent._delegate_depth = 0
++        switch_model(
++            agent,
++            new_model="openai/gpt-5",
++            new_provider="openrouter",
++            base_url="https://openrouter.ai/api/v1",
++            api_mode="chat_completions",
++        )
++        assert agent._service_tier_escalation.streak == 0
++        # * Base is A1 request-time logical_service_tier (config overlay), not constructor.
++        assert agent._service_tier_escalation.effective_tier == "priority"
++
++
++class TestOuterRetryHoldsPreAttemptTier:
++    def test_slow_ttft_outer_retry_stays_on_base_until_accept(self):
++        agent = _agent(service_tier="flex")
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.pending_ttft == 20.0
++        retry_overrides = _effective_request_overrides(agent)
++        assert retry_overrides.get("service_tier") == "flex"
++
++        begin_logical_request(agent)
++        assert agent._service_tier_escalation.pending_ttft is None
++        assert agent._service_tier_escalation.streak == 0
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert _effective_request_overrides(agent).get("service_tier") == "flex"
++
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier is None
++        assert agent._service_tier_escalation.wire_locked is False
++
++        begin_logical_request(agent)
++        next_overrides = _effective_request_overrides(agent)
++        assert "service_tier" not in next_overrides
++
++    def test_observation_commits_once_per_logical_request(self):
++        agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=1))
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier is None
++        assert agent._service_tier_escalation.streak == 0
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier is None
++
++    def test_internal_stream_retry_is_not_an_observation(self):
++        agent = _agent(service_tier="flex")
++        begin_logical_request(agent)
++        obs = _slow_obs()
++        obs.open_count = 2
++        finish_request_ttft(agent, obs)
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.pending_ttft is None
++
++
++class TestHardGatedSurfaces:
++    def test_batch_like_agent_does_not_escalate_with_enabled_config(self):
++        agent = _agent(service_tier="flex", block_escalation=True)
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.enabled is True
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert _effective_request_overrides(agent).get("service_tier") == "flex"
++
++    def test_gateway_background_agent_does_not_escalate_with_enabled_config(self):
++        agent = _agent(
++            service_tier="flex",
++            platform="telegram",
++            block_escalation=True,
++        )
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.enabled is True
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++
++class TestInjectAndContinueUnlocksWire:
++    """Outer-loop inject-and-continue must accept so the next call is not a retry."""
++
++    def test_inject_accept_updates_wire_snapshot_and_allows_later_climb(self):
++        agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=1))
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        # * Invalid tool name / invalid-JSON-after-retry inject the response
++        # into history and continue — that is a new logical request.
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.wire_locked is False
++        assert agent._service_tier_escalation.effective_tier is None
++        assert agent._service_tier_escalation.pending_ttft is None
++
++        begin_logical_request(agent)
++        assert agent._service_tier_escalation.wire_locked is True
++        assert agent._service_tier_escalation.wire_tier is None
++        assert "service_tier" not in _effective_request_overrides(agent)
++
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "priority"
++        begin_logical_request(agent)
++        assert _effective_request_overrides(agent).get("service_tier") == "priority"
++
++    def test_inject_accept_commits_streak_so_next_logical_request_can_escalate(self):
++        agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=2))
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.streak == 1
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier is None
++        assert agent._service_tier_escalation.wire_locked is False
++
++    def test_skipping_accept_makes_next_begin_a_retry_and_blocks_climb(self):
++        agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=2))
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        # * Bug class: inject-and-continue without accept leaves wire_locked.
++        begin_logical_request(agent)
++        assert agent._service_tier_escalation.pending_ttft is None
++        assert agent._service_tier_escalation.streak == 0
++        assert agent._service_tier_escalation.wire_tier == "flex"
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.streak == 1
++
++    def test_loop_wrapper_accept_is_idempotent_without_pending(self):
++        from agent.conversation_loop import _try_accept_logical_request
++
++        agent = _agent(service_tier="flex")
++        begin_logical_request(agent)
++        _try_accept_logical_request(agent)
++        _try_accept_logical_request(agent)
++        assert agent._service_tier_escalation.wire_locked is False
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.pending_ttft is None
++
++    def test_invalid_json_retry_keeps_wire_locked_until_inject(self):
++        """Production ``validate_tool_calls`` retry must not accept."""
++        from agent.turn_tool_validation import validate_tool_calls
++
++        agent = _validation_agent()
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        tc = SimpleNamespace(
++            function=SimpleNamespace(name="web_search", arguments="{not json}"),
++            id="c1",
++        )
++        assistant = SimpleNamespace(tool_calls=[tc], content="")
++        first = validate_tool_calls(
++            agent, assistant, "tool_calls",
++            messages=[], conversation_history=[], api_call_count=1,
++            effective_task_id="t1",
++        )
++        assert first.action == "continue"
++        assert agent._invalid_json_retries == 1
++        assert agent._service_tier_escalation.wire_locked is True
++
++        second = validate_tool_calls(
++            agent, assistant, "tool_calls",
++            messages=[], conversation_history=[], api_call_count=2,
++            effective_task_id="t1",
++        )
++        assert second.action == "continue"
++        assert agent._invalid_json_retries == 2
++        assert agent._service_tier_escalation.wire_locked is True
++
++        messages = []
++        injected = validate_tool_calls(
++            agent, assistant, "tool_calls",
++            messages=messages, conversation_history=[], api_call_count=3,
++            effective_task_id="t1",
++        )
++        assert injected.action == "continue"
++        assert messages, "inject path must mutate history"
++        assert agent._service_tier_escalation.wire_locked is False
++
++    def test_invalid_tool_name_inject_accepts_logical_request(self):
++        """Unknown-tool inject mutates history — dest dest site ~7878."""
++        from agent.turn_tool_validation import validate_tool_calls
++
++        agent = _validation_agent()
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        tc = SimpleNamespace(
++            function=SimpleNamespace(name="not_a_real_tool", arguments="{}"),
++            id="c1",
++        )
++        assistant = SimpleNamespace(tool_calls=[tc], content="")
++        messages = []
++        verdict = validate_tool_calls(
++            agent, assistant, "tool_calls",
++            messages=messages, conversation_history=[], api_call_count=1,
++            effective_task_id="t1",
++        )
++        assert verdict.action == "continue"
++        assert messages, "invalid-name inject must mutate history"
++        assert agent._service_tier_escalation.wire_locked is False
++
++    def test_ok_tool_validation_accepts_logical_request(self):
++        from agent.turn_tool_validation import validate_tool_calls
++
++        agent = _validation_agent()
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        tc = SimpleNamespace(
++            function=SimpleNamespace(name="web_search", arguments="{}"),
++            id="c1",
++        )
++        assistant = SimpleNamespace(tool_calls=[tc], content="")
++        verdict = validate_tool_calls(
++            agent, assistant, "tool_calls",
++            messages=[], conversation_history=[], api_call_count=1,
++            effective_task_id="t1",
++        )
++        assert verdict.action == "ok"
++        assert agent._service_tier_escalation.wire_locked is False
++
++    def test_codex_incomplete_accepts_only_on_history_mutation(self):
++        from agent.turn_truncation import continue_codex_incomplete
++
++        def _codex_agent():
++            agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=1))
++            agent._codex_incomplete_retries = 0
++            agent.quiet_mode = True
++            agent.log_prefix = ""
++            agent._vprint = lambda *_a, **_k: None
++            agent._emit_wait_notice = lambda *_a, **_k: None
++            agent._emit_interim_assistant_message = lambda *_a, **_k: None
++            agent._interim_assistant_visible_text = (
++                lambda msg: (msg.get("content") or "") if isinstance(msg, dict) else ""
++            )
++            agent._build_assistant_message = lambda msg, fr: {
++                "role": "assistant",
++                "content": getattr(msg, "content", "") or "",
++                "finish_reason": fr,
++                "reasoning": getattr(msg, "reasoning", "") or "",
++            }
++            agent._persist_session = lambda *_a, **_k: None
++            return agent
++
++        mutated = _codex_agent()
++        begin_logical_request(mutated)
++        finish_request_ttft(mutated, _slow_obs())
++        messages = [{"role": "user", "content": "hi"}]
++        result = continue_codex_incomplete(
++            mutated,
++            SimpleNamespace(content="partial thought", reasoning=""),
++            "incomplete",
++            messages=messages,
++            conversation_history=[],
++            api_call_count=1,
++        )
++        assert result is None
++        assert any(m.get("role") == "assistant" for m in messages)
++        assert mutated._service_tier_escalation.wire_locked is False
++
++        locked = _codex_agent()
++        begin_logical_request(locked)
++        finish_request_ttft(locked, _slow_obs())
++        dup_messages = [
++            {"role": "user", "content": "hi"},
++            {"role": "assistant", "content": "same", "finish_reason": "incomplete"},
++        ]
++        result = continue_codex_incomplete(
++            locked,
++            SimpleNamespace(content="same", reasoning=""),
++            "incomplete",
++            messages=dup_messages,
++            conversation_history=[],
++            api_call_count=1,
++        )
++        assert result is None
++        assert locked._service_tier_escalation.wire_locked is True
++
++
++class TestModelSwitchClearsDefaultBase:
++    def test_flex_to_normal_omits_service_tier_then_escalates_from_none(self):
++        agent = _agent(service_tier="flex")
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        agent.service_tier = None
++        reset_escalation_for_model_switch(agent)
++        assert agent._service_tier_escalation.base_tier is None
++        assert agent._service_tier_escalation.effective_tier is None
++        applied = apply_escalation_to_overrides(agent, {})
++        assert "service_tier" not in applied
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        applied = apply_escalation_to_overrides(agent, {})
++        assert applied.get("service_tier") == "priority"
++        agent.service_tier = "flex"
++        reset_escalation_for_model_switch(agent)
++        assert agent._service_tier_escalation.base_tier == "flex"
++        assert agent._service_tier_escalation.effective_tier == "flex"
++
++    def test_begin_turn_explicit_none_clears_stale_flex_base(self):
++        agent = _agent(service_tier="flex")
++        agent.service_tier = None
++        begin_escalation_turn(agent)
++        assert agent._service_tier_escalation.base_tier is None
++        assert "service_tier" not in apply_escalation_to_overrides(agent, {})
++
++
++class TestNonOpenRouterObservation:
++    def test_slow_non_openrouter_stream_does_not_mutate_state(self):
++        agent = _agent(
++            service_tier="flex",
++            provider="openai",
++            base_url="https://api.openai.com/v1",
++        )
++        state = agent._service_tier_escalation
++        state.streak = 1
++        finish_request_ttft(agent, _slow_obs())
++        assert state.pending_ttft is None
++        assert state.streak == 1
++        assert state.effective_tier == "flex"
++        accept_logical_request(agent)
++        assert state.effective_tier == "flex"
++        assert state.streak == 1
++        assert state.pending_ttft is None
++
++
++class TestRebaseEscalationRuntime:
++    def test_rungs_and_streak_transfer_with_priority_cap(self):
++        agent = _agent(service_tier="flex")
++        state = agent._service_tier_escalation
++        state.observe_ttft(12.0, model="m")
++        assert state.effective_tier is None
++        assert state.climbed_rungs == 1
++        state.streak = 2
++        begin_logical_request(agent)
++        assert state.wire_locked is True
++        assert state.wire_tier is None
++
++        rebase_escalation_runtime(agent, "priority")
++        assert state.base_tier == "priority"
++        assert state.effective_tier == "priority"
++        assert state.climbed_rungs == 1
++        assert state.streak == 2
++        assert state.wire_locked is False
++        assert state.wire_tier == "priority"
++        assert _effective_request_overrides(agent).get("service_tier") == "priority"
++
++        rebase_escalation_runtime(agent, "flex")
++        assert state.base_tier == "flex"
++        assert state.effective_tier is None
++        assert state.climbed_rungs == 1
++        assert state.streak == 2
++        assert "service_tier" not in _effective_request_overrides(agent)
++
++    def test_none_base_rungs_zero_omits_wire_tier(self):
++        agent = _agent(service_tier="flex")
++        state = agent._service_tier_escalation
++        rebase_escalation_runtime(agent, None)
++        assert state.base_tier is None
++        assert state.effective_tier is None
++        assert state.climbed_rungs == 0
++        applied = apply_escalation_to_overrides(agent, {"service_tier": "flex"})
++        assert "service_tier" not in applied
++        assert "speed" not in applied
++
++    def test_none_base_with_rungs_climbs_to_priority(self):
++        agent = _agent(service_tier="flex")
++        state = agent._service_tier_escalation
++        state.observe_ttft(12.0, model="m")
++        assert state.climbed_rungs == 1
++        rebase_escalation_runtime(agent, None)
++        assert state.base_tier is None
++        assert state.effective_tier == "priority"
++        assert state.climbed_rungs == 1
++        applied = apply_escalation_to_overrides(agent, {})
++        assert applied.get("service_tier") == "priority"
++
++    def test_two_rungs_cap_at_priority_then_restore_keeps_height(self):
++        agent = _agent(service_tier="flex")
++        state = agent._service_tier_escalation
++        state.observe_ttft(12.0, model="m")
++        state.observe_ttft(12.0, model="m")
++        assert state.effective_tier == "priority"
++        assert state.climbed_rungs == 2
++        rebase_escalation_runtime(agent, None)
++        assert state.effective_tier == "priority"
++        assert state.climbed_rungs == 2
++        rebase_escalation_runtime(agent, "flex")
++        assert state.effective_tier == "priority"
++        assert state.climbed_rungs == 2
++
++
++class TestBoundedAutoColdWindows:
++    def test_auto_is_default_ladder_rung_and_keeps_window_overrides(self):
++        agent = _agent(service_tier="auto")
++        assert agent._service_tier_escalation.base_tier is None
++        applied = apply_escalation_to_overrides(
++            agent, {"service_tier": "priority"}
++        )
++        assert applied.get("service_tier") == "priority"
++
++    def test_auto_mode_escalation_can_still_climb_to_priority(self):
++        agent = _agent(service_tier="auto")
++        agent._service_tier_escalation.observe_ttft(12.0, model="m")
++        assert agent._service_tier_escalation.effective_tier == "priority"
++        applied = apply_escalation_to_overrides(agent, {})
++        assert applied.get("service_tier") == "priority"
++
++
++class TestDefaultOffByteIdentity:
++    def test_disabled_escalation_matches_unbound_overrides(self):
++        """Default OFF must not add keys or mutate canonical request_overrides."""
++        unbound = SimpleNamespace(
++            service_tier="flex",
++            request_overrides={"keep": 1, "extra_body": {"x": 1}},
++            model="google/gemini-flash",
++            provider="openrouter",
++            base_url="https://openrouter.ai/api/v1",
++            api_mode="chat_completions",
++            _service_tier_session_pinned=False,
++            platform="cli",
++            _persist_disabled=False,
++            _delegate_depth=0,
++            is_subagent=False,
++        )
++        left = _effective_request_overrides(unbound)
++        bind_service_tier_escalation(unbound, {"enabled": False})
++        right = _effective_request_overrides(unbound)
++        assert left == right
++        assert unbound.request_overrides == {"keep": 1, "extra_body": {"x": 1}}
++        assert "ttft" not in right
++        assert set(right) <= {"keep", "extra_body", "service_tier", "speed"}
++
++    def test_enabled_false_does_not_climb_on_slow_ttft(self):
++        agent = _agent(service_tier="flex", escalation={"enabled": False})
++        begin_logical_request(agent)
++        finish_request_ttft(agent, _slow_obs())
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert _effective_request_overrides(agent).get("service_tier") == "flex"
++
++
++class TestEscalationConfigResolver:
++    def test_missing_section_is_disabled(self):
++        from hermes_constants import resolve_service_tier_escalation_config
++
++        cfg = resolve_service_tier_escalation_config({})
++        assert cfg.enabled is False
++        assert cfg.ttft_threshold_seconds == 8.0
++        assert cfg.consecutive_slow_requests == 1
++
++    def test_valid_section_is_parsed(self):
++        from hermes_constants import resolve_service_tier_escalation_config
++
++        cfg = resolve_service_tier_escalation_config(
++            {
++                "service_tier_escalation": {
++                    "enabled": True,
++                    "ttft_threshold_seconds": 2.5,
++                    "consecutive_slow_requests": 3,
++                }
++            }
++        )
++        assert cfg.enabled is True
++        assert cfg.ttft_threshold_seconds == 2.5
++        assert cfg.consecutive_slow_requests == 3
++
++    def test_invalid_values_fall_back_and_warn(self, caplog):
++        import logging
++
++        from hermes_constants import resolve_service_tier_escalation_config
++
++        with caplog.at_level(logging.WARNING):
++            cfg = resolve_service_tier_escalation_config(
++                {
++                    "service_tier_escalation": {
++                        "enabled": "maybe",
++                        "ttft_threshold_seconds": -1,
++                        "consecutive_slow_requests": 0,
++                    }
++                }
++            )
++        assert cfg.enabled is False
++        assert cfg.ttft_threshold_seconds == 8.0
++        assert cfg.consecutive_slow_requests == 1
++        assert "service_tier_escalation" in caplog.text
++
++
++class TestNonStreamingNoObservation:
++    def test_missing_first_delta_is_not_an_observation(self):
++        agent = _agent(service_tier="flex")
++        begin_logical_request(agent)
++        obs = TtftObservation(clock=lambda: 0.0)
++        obs.t_send = 0.0
++        obs.open_count = 1
++        finish_request_ttft(agent, obs)
++        accept_logical_request(agent)
++        assert agent._service_tier_escalation.effective_tier == "flex"
++        assert agent._service_tier_escalation.pending_ttft is None
++        assert agent._service_tier_escalation.streak == 0
++
++
++def _write_enabled_escalation_config():
++    """Put ``agent.service_tier_escalation.enabled: true`` in the isolated home."""
++    from hermes_constants import get_hermes_home
++
++    home = get_hermes_home()
++    (home / "config.yaml").write_text(
++        "agent:\n"
++        "  service_tier_escalation:\n"
++        "    enabled: true\n"
++        "    ttft_threshold_seconds: 8.0\n"
++        "    consecutive_slow_requests: 1\n"
++        "model:\n"
++        "  default: google/gemini-flash\n",
++        encoding="utf-8",
++    )
++    from hermes_cli import config as cfg_mod
++
++    invalidate = getattr(cfg_mod, "_invalidate_load_config_cache", None)
++    if callable(invalidate):
++        invalidate()
++
++
++class TestConstructionGates:
++    """Real constructors stay inactive even when config enables the ladder."""
++
++    def test_cron_scheduler_construction_blocks_escalation(self):
++        from agent.service_tier_escalation import escalation_is_active
++        from cron.scheduler import _CronAgentSetup, _construct_cron_agent
++        from run_agent import AIAgent
++
++        _write_enabled_escalation_config()
++        setup = _CronAgentSetup(
++            model="google/gemini-flash",
++            runtime={
++                "api_key": "k",
++                "base_url": "https://openrouter.ai/api/v1",
++                "provider": "openrouter",
++                "requested_provider": "openrouter",
++                "api_mode": "chat_completions",
++                "request_overrides": {},
++            },
++            max_iterations=2,
++        )
++        agent = _construct_cron_agent(
++            AIAgent,
++            {"id": "job-gate", "enabled_toolsets": ["file"]},
++            {"agent": {"service_tier_escalation": {"enabled": True}}},
++            setup,
++            workdir=None,
++            session_id="cron-gate",
++            session_db=None,
++        )
++        try:
++            assert agent.platform == "cron"
++            assert agent._block_service_tier_escalation is True
++            assert agent._service_tier_escalation.enabled is True
++            assert escalation_is_active(agent) is False
++        finally:
++            agent.close()
++
++    def test_batch_runner_construction_blocks_escalation(self, monkeypatch):
++        from agent.service_tier_escalation import escalation_is_active
++        import batch_runner
++
++        _write_enabled_escalation_config()
++        captured = {}
++        real_agent = batch_runner.AIAgent
++
++        def _capturing_agent(*args, **kwargs):
++            agent = real_agent(*args, **kwargs)
++            captured["agent"] = agent
++
++            def _fake_run(*_a, **_k):
++                return {
++                    "messages": [],
++                    "completed": True,
++                    "partial": False,
++                    "api_calls": 0,
++                }
++
++            agent.run_conversation = _fake_run
++            return agent
++
++        monkeypatch.setattr(batch_runner, "AIAgent", _capturing_agent)
++        batch_runner._process_single_prompt(
++            0,
++            {"prompt": "hi"},
++            1,
++            {
++                "model": "google/gemini-flash",
++                "max_iterations": 2,
++                "distribution": "minimal",
++                "verbose": False,
++                "api_key": "k",
++                "base_url": "https://openrouter.ai/api/v1",
++            },
++        )
++        agent = captured["agent"]
++        try:
++            assert agent._block_service_tier_escalation is True
++            assert escalation_is_active(agent) is False
++        finally:
++            agent.close()
++
++    def test_delegate_child_construction_blocks_escalation(self, monkeypatch):
++        from agent.service_tier_escalation import escalation_is_active
++        from run_agent import AIAgent
++        from tools import delegate_tool as dt
++        import tools.delegate_tool_config as dtc
++
++        _write_enabled_escalation_config()
++        monkeypatch.setattr(dt, "_load_config", lambda: {})
++        monkeypatch.setattr(dtc, "_load_config", lambda: {})
++        kw = dict(
++            api_key="k",
++            base_url="https://openrouter.ai/api/v1",
++            provider="openrouter",
++            api_mode="chat_completions",
++            model="google/gemini-flash",
++            platform="cli",
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++            save_trajectories=False,
++            enabled_toolsets=["file"],
++        )
++        parent = AIAgent(session_id="p-gate", **kw)
++        child = None
++        try:
++            assert parent._service_tier_escalation.enabled is True
++            assert escalation_is_active(parent) is True
++            child = dt._build_child_agent(
++                task_index=0,
++                goal="goal",
++                context=None,
++                toolsets=["file"],
++                model=None,
++                max_iterations=4,
++                task_count=1,
++                parent_agent=parent,
++            )
++            assert child.platform == "subagent"
++            assert child._delegate_depth > 0
++            assert child._service_tier_escalation.enabled is True
++            assert escalation_is_active(child) is False
++        finally:
++            if child is not None:
++                child.close()
++            parent.close()
++
++
++class TestEscalationHookHardening:
++    def test_accept_hook_skips_when_disabled(self):
++        from agent.conversation_loop import _try_accept_logical_request
++
++        agent = _agent(escalation={"enabled": False})
++        with patch("agent.service_tier_escalation.accept_logical_request") as accept:
++            _try_accept_logical_request(agent)
++        accept.assert_not_called()
++
++    def test_accept_hook_logs_failure_without_raising(self, caplog):
++        import logging
++
++        from agent.conversation_loop import _try_accept_logical_request
++
++        agent = _agent()
++        with patch(
++            "agent.service_tier_escalation.accept_logical_request",
++            side_effect=RuntimeError("boom"),
++        ):
++            with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
++                _try_accept_logical_request(agent)
++        assert "accept_logical_request failed" in caplog.text
++        assert "boom" in caplog.text
++
++    def test_streaming_call_skips_marks_when_stack_empty(self):
++        from agent.chat_completion_helpers import _StreamingCall
++
++        agent = _agent(escalation={"enabled": False})
++        call = _StreamingCall(agent, {}, None)
++        assert call._mark_ttft_send is None
++        assert call._mark_ttft_first_delta is None
++        with patch("agent.service_tier_escalation.mark_ttft_first_delta") as mark:
++            call._fire_first_delta()
++        mark.assert_not_called()
++
++    def test_streaming_call_binds_marks_when_obs_stacked(self):
++        from agent.chat_completion_helpers import _StreamingCall
++
++        agent = _agent()
++        obs = begin_request_ttft(agent, clock=lambda: 1.0)
++        call = _StreamingCall(agent, {}, None)
++        assert call._mark_ttft_send is not None
++        assert call._mark_ttft_first_delta is not None
++        call._fire_first_delta()
++        assert obs.t_first == 1.0
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index f4b0b80c94..9e3a581b79 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -1182,9 +1182,11 @@ def _(rid, params: dict) -> dict:
+         result = AIAgent(
+             **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
+             **_preview_restart_callbacks(parent, task_id),
+-        ).run_conversation(
++        )
++        result._block_service_tier_escalation = True
++        outcome = result.run_conversation(
+             user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
+-        return _final_response_text(result)
++        return _final_response_text(outcome)
+ 
+     def cleanup():
+         with contextlib.suppress(Exception):
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index f8b703054f..34f4a07721 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -2002,6 +2002,22 @@ providers:
+ 
+ Differences from `agent.service_tier`: the tier is always on for that provider (no `auto`/`cold` window), `/fast` does not toggle it, and Hermes does not validate the value — the gateway decides what it accepts and what it bills.
+ 
++#### Per-turn tier escalation (opt-in)
++
++`agent.service_tier_escalation` lets a turn that starts on a cheaper OpenRouter tier climb when the provider is slow. While streaming, Hermes measures time-to-first-token (TTFT) on each main-conversation request; when TTFT exceeds `ttft_threshold_seconds` on `consecutive_slow_requests` successful streams in a row, the agent climbs one tier (flex → default → priority) for the **rest of that turn**. The next user message starts again at the configured base (session pin > per-model overlay > global). Escalation overlays the wire tier at request time and never mutates canonical `agent.service_tier` / `request_overrides`.
++
++```yaml
++agent:
++  service_tier_escalation:
++    enabled: true                  # default: false
++    ttft_threshold_seconds: 8.0
++    consecutive_slow_requests: 1   # raise for a softer trigger
++```
++
++Escalation never fires while a session `/fast` pin is active, and never applies to cron jobs, batch runs, subagents, or background tasks (CLI `/bg`, gateway `/bg`, TUI background). Provider errors are not escalation input. Retried or interrupted requests don't count as slow observations, and a retry of the same logical request always runs on the tier that attempt started with. Provider fallback rebases the ladder onto the new model's base tier while keeping climbed rungs and the slow-streak.
++
++Known limitations (conservative under-escalation; do not treat as bugs): the non-streaming fallback path produces no observation; Codex streaming is not timed; length-continuation and compression/redirect restarts drop the in-flight sample. Escalation state is per-agent, never copied to delegated children, and never persisted to SessionDB. Escalations are logged at INFO (`agent.log`). The setting is picked up when an agent is constructed (new CLI/TUI session, new gateway agent). Cached gateway agents keep the construction-time value.
++
+ ## Tool-Use Enforcement
+ 
+ Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.
+-- 
+2.54.0
+

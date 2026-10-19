@@ -1,0 +1,290 @@
+From ef34d17dda0da237f2581e428ae418102e5e2d99 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Fri, 16 Oct 2026 16:33:11 +0000
+Subject: [PATCH 14/23] fix(tui): validate fast tier before worker writes
+
+---
+ .../test_service_tier_request_overrides.py    | 112 +++++++++++++++++-
+ tui_gateway/methods_slash.py                  |  42 ++++++-
+ tui_gateway/methods_tools.py                  |   7 ++
+ 3 files changed, 149 insertions(+), 12 deletions(-)
+
+diff --git a/tests/tui_gateway/test_service_tier_request_overrides.py b/tests/tui_gateway/test_service_tier_request_overrides.py
+index f22562c7c6..da4cfff76a 100644
+--- a/tests/tui_gateway/test_service_tier_request_overrides.py
++++ b/tests/tui_gateway/test_service_tier_request_overrides.py
+@@ -315,12 +315,13 @@ def test_typed_fast_flex_sets_static_tier_and_preserves_extra_body():
+     assert agent.request_overrides == {"extra_body": {"tenant": "custom"}, "service_tier": "flex"}
+ 
+ 
+-def _slash_exec(monkeypatch, *, agent, command, output):
++def _slash_exec(monkeypatch, *, agent, command, output="", worker_run=None):
+     from tui_gateway import server
+ 
+     class _Worker:
+         def run(self, _command):
+-            return output
++            session["worker_calls"].append(_command)
++            return worker_run(_command) if worker_run else output
+ 
+     session = {
+         "agent": agent,
+@@ -329,6 +330,7 @@ def _slash_exec(monkeypatch, *, agent, command, output):
+         "history": [],
+         "profile_home": None,
+         "create_service_tier_override": "priority",
++        "worker_calls": [],
+     }
+     server._sessions["fast-session"] = session
+     monkeypatch.setattr(server, "_session_home_scope", lambda *_args, **_kwargs: nullcontext())
+@@ -367,7 +369,8 @@ def test_slash_exec_entitled_ultrafast_mirrors_exact_tier(monkeypatch, word):
+ 
+     response, session, persisted = _slash_exec(monkeypatch, agent=agent, command=f"/fast {word}", output="set")
+ 
+-    assert response["result"]["output"] == "set"
++    assert "ultrafast" in response["result"]["output"]
++    assert session["worker_calls"] == []
+     assert agent.service_tier == "ultrafast"
+     assert agent.request_overrides == {"other": "keep", "service_tier": "ultrafast"}
+     assert session["create_service_tier_override"] == "ultrafast"
+@@ -400,6 +403,7 @@ def test_slash_exec_refusal_keeps_existing_tier_state(monkeypatch, command, mode
+         monkeypatch, agent=agent, command=command, output="not available for this model/account/route")
+ 
+     assert "not available" in response["result"]["output"]
++    assert session["worker_calls"] == []
+     assert agent.service_tier == "priority"
+     assert agent.request_overrides == {"service_tier": "priority", "other": "keep"}
+     assert session["create_service_tier_override"] == session_pin
+@@ -448,10 +452,11 @@ def test_slash_fast_normal_pins_wire_and_resume_over_per_model_tier(monkeypatch,
+         _service_tier_session_pinned=False,
+     )
+ 
+-    response, _session, persisted = _slash_exec(
++    response, session, persisted = _slash_exec(
+         monkeypatch, agent=agent, command="/fast normal --session", output="(._.) /fast set to NORMAL")
+ 
+-    assert response["result"]["output"].startswith("(._.)")
++    assert response["result"]["output"] == "Fast mode set to normal."
++    assert session["worker_calls"] == []
+     assert agent._service_tier_session_pinned is True
+     assert fast_mode.effective_request_overrides(agent) == {}
+     runtime = server._runtime_model_config(agent)
+@@ -521,7 +526,8 @@ def test_slash_fast_real_refusal_text_does_not_mutate_global_or_session(
+     response, session, persisted = _slash_exec(
+         monkeypatch, agent=agent, command=command, output=output)
+ 
+-    assert response["result"]["output"] == output
++    assert "not available" in response["result"]["output"]
++    assert session["worker_calls"] == []
+     assert writes == []
+     assert agent.service_tier == "priority"
+     assert agent.request_overrides == {"service_tier": "priority", "extra_body": {"keep": 1}}
+@@ -530,6 +536,100 @@ def test_slash_fast_real_refusal_text_does_not_mutate_global_or_session(
+     assert not persisted
+ 
+ 
++@pytest.mark.parametrize("mode", ["auto", "cold"])
++def test_slash_exec_rejects_bounded_modes_on_unsupported_route_without_worker_or_mutation(
++        monkeypatch, mode):
++    agent = SimpleNamespace(
++        model="Qwen3.8-27B", provider="llamacpp", base_url="http://localhost:8080/v1",
++        api_key="token", service_tier="priority", request_overrides={"service_tier": "priority"},
++    )
++    writes = []
++    monkeypatch.setattr(server, "_write_config_key", lambda *args: writes.append(args))
++
++    response, session, persisted = _slash_exec(
++        monkeypatch, agent=agent, command=f"/fast {mode} --global")
++
++    assert "not available" in response["result"]["output"]
++    assert session["worker_calls"] == []
++    assert writes == []
++    assert agent.service_tier == "priority"
++    assert agent.request_overrides == {"service_tier": "priority"}
++    assert session["create_service_tier_override"] == "priority"
++    assert not persisted
++
++
++@pytest.mark.parametrize("mode", ["auto", "cold"])
++def test_slash_exec_accepts_bounded_modes_on_supported_route(mode, monkeypatch):
++    agent = SimpleNamespace(
++        model="gpt-4.1", provider="openrouter", base_url="https://openrouter.ai/api/v1",
++        api_key="token", service_tier="priority", request_overrides={"service_tier": "priority"},
++    )
++
++    response, session, persisted = _slash_exec(monkeypatch, agent=agent, command=f"/fast {mode}")
++
++    assert mode in response["result"]["output"]
++    assert session["worker_calls"] == []
++    assert agent.service_tier == mode
++    assert not agent.request_overrides
++    assert session["create_service_tier_override"] == mode
++    assert persisted
++
++
++def test_slash_exec_uses_live_route_before_worker_can_write_profile_config(monkeypatch, tmp_path):
++    import yaml
++    from tui_gateway.slash_worker import _run as run_slash_worker
++    from hermes_cli.cli_fast_mode_mixin import handle_fast_command
++
++    home = _configure_profile_route(monkeypatch, tmp_path, "openai-api", None)
++    worker_cli = SimpleNamespace(
++        _fast_command_available=lambda: True,
++        agent=SimpleNamespace(model="gpt-5.4"), model="gpt-5.4", provider="openai",
++        base_url="https://api.openai.com/v1", service_tier="priority",
++        process_command=lambda command: handle_fast_command(worker_cli, command),
++    )
++
++    def worker_fast(command):
++        return run_slash_worker(worker_cli, command)
++
++    worker_fast("/fast flex --global")
++    worker_config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
++    assert worker_config["agent"]["service_tier"] == "flex"
++    worker_config["agent"]["service_tier"] = "priority"
++    atomic_config_write(home / "config.yaml", worker_config)
++
++    agent = SimpleNamespace(
++        model="gpt-5.4", provider="openai", base_url="https://proxy.example/v1", api_key="token",
++        service_tier="priority", request_overrides={"service_tier": "priority"},
++    )
++    response, session, persisted = _slash_exec(
++        monkeypatch, agent=agent, command="/fast flex --global", worker_run=worker_fast)
++
++    config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
++    assert "not available" in response["result"]["output"]
++    assert session["worker_calls"] == []
++    assert config["agent"]["service_tier"] == "priority"
++    assert agent.service_tier == "priority"
++    assert not persisted
++
++
++def test_slash_exec_global_fast_updates_config_on_live_eligible_route(monkeypatch, tmp_path):
++    import yaml
++
++    home = _configure_profile_route(monkeypatch, tmp_path, "openai-api", None)
++    agent = SimpleNamespace(
++        model="gpt-5.4", provider="openai", base_url="https://api.openai.com/v1", api_key="token",
++        service_tier="priority", request_overrides={"service_tier": "priority"},
++    )
++
++    response, session, _persisted = _slash_exec(
++        monkeypatch, agent=agent, command="/fast flex --global")
++
++    config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
++    assert "flex" in response["result"]["output"]
++    assert session["worker_calls"] == []
++    assert config["agent"]["service_tier"] == "flex"
++
++
+ def test_config_set_flex_is_session_scoped_and_preserves_custom_body(monkeypatch):
+     from tui_gateway import server
+ 
+diff --git a/tui_gateway/methods_slash.py b/tui_gateway/methods_slash.py
+index 686f15086e..9bdf61d398 100644
+--- a/tui_gateway/methods_slash.py
++++ b/tui_gateway/methods_slash.py
+@@ -418,15 +418,15 @@ _FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None
+                "ultrafast": "ultrafast", "ultra": "ultrafast", "flex": "flex"}
+ 
+ 
+-def _mirror_fast(sid, session, agent, arg) -> None:
++def _mirror_fast(sid, session, agent, arg) -> bool:
+     tokens = arg.lower().split()
+     from hermes_cli.cli_commands_mixin import _split_scope_flags
+     mode, global_scope = _split_scope_flags(arg)
+     if (not tokens or any(token not in (*_FAST_TIERS, "--global", "--session") for token in tokens)
+             or len([token for token in tokens if token not in ("--global", "--session")]) != 1):
+-        return
++        return False
+     if mode not in _FAST_TIERS:
+-        return
++        return False
+     tier = _FAST_TIERS[mode]
+     if agent is not None:
+         model = getattr(agent, "model", None)
+@@ -438,7 +438,7 @@ def _mirror_fast(sid, session, agent, arg) -> None:
+             session.get("model_override"), session.get("provider_override"))
+         provider, base_url, api_key = (runtime.get(k) for k in ("provider", "base_url", "api_key"))
+     if not model:
+-        return
++        return False
+     from agent.fast_mode import STATIC_TIERS
+     resolved = None
+     if tier in STATIC_TIERS:
+@@ -453,7 +453,17 @@ def _mirror_fast(sid, session, agent, arg) -> None:
+             logger.debug("fast-tier override resolution failed", exc_info=True)
+             resolved = None
+         if resolved is None:
+-            return
++            return False
++    elif tier in {"auto", "cold"}:
++        # Bounded modes only operate on a route that supports fast mode; unlike a
++        # static tier they leave per-request tier selection to agent.fast_mode.
++        from hermes_cli.models import resolve_service_tier_overrides
++        try:
++            if resolve_service_tier_overrides(model, "priority", provider=provider, base_url=base_url) is None:
++                return False
++        except Exception:
++            logger.debug("fast-mode route resolution failed", exc_info=True)
++            return False
+ 
+     saved = False
+     if global_scope:
+@@ -477,6 +487,25 @@ def _mirror_fast(sid, session, agent, arg) -> None:
+         set_framework_baked_tier_keys(agent, resolved)
+         _persist_live_session_runtime(session)
+         _emit("session.info", sid, _session_info(agent, session))
++    return True
++
++
++def apply_fast_slash(sid: str, session: dict, arg: str) -> str | None:
++    """Apply valid /fast settings at the live authority before a worker can write config."""
++    tokens = arg.lower().split()
++    from hermes_cli.cli_commands_mixin import _split_scope_flags
++    mode, _global_scope = _split_scope_flags(arg)
++    modes = [token for token in tokens if token not in ("--global", "--session")]
++    if (not tokens or any(token not in (*_FAST_TIERS, "--global", "--session") for token in tokens)
++            or len(modes) != 1 or mode not in _FAST_TIERS):
++        return None
++    with _session_profile_runtime_scope(session):
++        if _session_uses_compute_host(session):
++            return _compute_host_slash(sid, session, "fast", f"/fast {arg}")[1]
++        accepted = _mirror_fast(sid, session, session.get("agent"), arg)
++    if not accepted:
++        return "(._.) /fast is not available for this model or route/account."
++    return f"Fast mode set to {_FAST_TIERS[mode] or 'normal'}."
+ 
+ 
+ def _mirror_reload_mcp(sid, session, agent, arg) -> None:
+@@ -548,7 +577,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str, output: st
+         # Mirrors run OFF-turn (slash.exec RPC pool / compute-host control reader): bind the session's
+         # profile scope or /model's credential read raises UnscopedSecretError under multiplex (#122655).
+         with _session_profile_runtime_scope(session):
+-            return mirror(sid, session, agent, arg) or ""
++            result = mirror(sid, session, agent, arg)
++            return "" if name == "fast" else result or ""
+     except CompressionBusy as e:  # a turn won the race after the unlocked running check above
+         return str(e)
+     except Exception as e:
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index e850c4ae34..ee03b6d15f 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1129,6 +1129,13 @@ def _(rid, params: dict) -> dict:
+     live_output = _live_slash_command_output(sid, session, base, arg)
+     if live_output is not None:
+         return _ok(rid, {"output": live_output or "(no output)"})
++    if base == "fast":
++        # The CLI worker has its own profile route and can persist /fast before
++        # the live session mirror runs. Apply valid settings against the live
++        # agent first so a stale worker route cannot change the profile default.
++        output = apply_fast_slash(sid, session, arg)
++        if output is not None:
++            return _ok(rid, {"output": output or "(no output)"})
+     if base in _WORKER_BLOCKED_COMMANDS and _is_snapshot_restore(arg):
+         return _err(rid, 4018, "snapshot restore mutates live config/state; use command.dispatch for /snapshot restore")
+     # Pending-input built-ins route straight to command.dispatch (some clients fail the
+-- 
+2.54.0
+

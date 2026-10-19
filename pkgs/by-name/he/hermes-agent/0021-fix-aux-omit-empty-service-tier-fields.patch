@@ -1,0 +1,55 @@
+From 83f1edcff08c1805cbd66a98ad9c55fa4b6d97df Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Sat, 17 Oct 2026 03:29:01 +0000
+Subject: [PATCH 21/23] fix(aux): omit empty service tier fields
+
+---
+ hermes_cli/models_service_tiers.py         |  6 ++++++
+ tests/agent/test_auxiliary_service_tier.py | 14 ++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/hermes_cli/models_service_tiers.py b/hermes_cli/models_service_tiers.py
+index 5db67a811b..6c4a97457d 100644
+--- a/hermes_cli/models_service_tiers.py
++++ b/hermes_cli/models_service_tiers.py
+@@ -81,6 +81,12 @@ def apply_aux_service_tier_overrides(
+             tier, configured = resolve_service_tier_source(agent_cfg, model)
+         except Exception:
+             logger.debug("Could not resolve agent service tier for auxiliary request", exc_info=True)
++    if had_dict_extra and "service_tier" in extra and extra_tier in (None, ""):
++        extra.pop("service_tier")
++        if extra:
++            merged["extra_body"] = extra
++        else:
++            merged.pop("extra_body", None)
+     if not configured:
+         return merged
+ 
+diff --git a/tests/agent/test_auxiliary_service_tier.py b/tests/agent/test_auxiliary_service_tier.py
+index b9d933c40a..48929c2f69 100644
+--- a/tests/agent/test_auxiliary_service_tier.py
++++ b/tests/agent/test_auxiliary_service_tier.py
+@@ -50,6 +50,20 @@ def test_agent_tier_applies_without_auxiliary_task_name(monkeypatch):
+     assert kwargs["service_tier"] == "priority"
+ 
+ 
++@pytest.mark.parametrize("empty_tier", [None, ""])
++def test_empty_extra_body_tier_is_omitted_without_mutating_input(monkeypatch, empty_tier):
++    from agent.auxiliary_client import _build_call_kwargs
++
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
++    body = {"service_tier": empty_tier, "keep": True}
++    kwargs = _build_call_kwargs(
++        provider="openai", model="gpt-5.4", messages=[{"role": "user", "content": "hi"}],
++        extra_body=body, base_url="https://api.openai.com/v1", task="compression",
++    )
++    assert kwargs["extra_body"] == {"keep": True}
++    assert body == {"service_tier": empty_tier, "keep": True}
++
++
+ def test_fallback_request_resolves_tier_for_its_actual_model(monkeypatch):
+     from agent import auxiliary_client as aux
+ 
+-- 
+2.54.0
+

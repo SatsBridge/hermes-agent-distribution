@@ -1,0 +1,533 @@
+From f173efc8da89230834369ee49be5d5a5b3eaf85b Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Fri, 16 Oct 2026 09:14:23 +0000
+Subject: [PATCH 02/23] fix(kanban): scope claims to uid and refresh crash
+ grace
+
+Scope claim locality to host:uid:pid, translating the matching uid_map extent. Foreign and legacy claims are not liveness-probed or signalled as local; preserve TTL-based reclamation without termination. Crash grace follows the active task_runs start while tasks.started_at remains the first-start metric.
+
+Rollout: drain dispatchers/workers and upgrade every process sharing the DB together; mixed versions are unsafe. Legacy host:pid claims are treated as foreign and reclaimed only after TTL without signalling, so a surviving worker can overlap after expiry. Rollback requires draining the new version before restoring all DB users to the old version. UID maps are parent-relative, not a universal host identity.
+---
+ hermes_cli/kanban_db.py                       |  35 +---
+ hermes_cli/kanban_db_dispatch.py              |  27 ++-
+ hermes_cli/kanban_db_identity.py              |  52 +++++
+ .../gateway/test_kanban_reconcile_orphans.py  |   2 +-
+ .../test_kanban_core_functionality.py         |   6 +-
+ tests/hermes_cli/test_kanban_db.py            |  12 +-
+ .../test_kanban_foreign_uid_sweep.py          | 188 ++++++++++++++++++
+ .../test_kanban_reclaim_claim_lock_guard.py   |   4 +-
+ .../test_kanban_worker_exit_trailer.py        |   2 +-
+ 9 files changed, 271 insertions(+), 57 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_identity.py
+ create mode 100644 tests/hermes_cli/test_kanban_foreign_uid_sweep.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 36d5736f73..b3de076c49 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1018,21 +1018,6 @@ def _new_task_id() -> str:
+     return "t_" + secrets.token_hex(4)
+ 
+ 
+-def _claimer_id() -> str:
+-    """Return a ``host:pid`` string that identifies this claimer."""
+-    import socket
+-    try:
+-        host = socket.gethostname() or "unknown"
+-    except Exception:
+-        host = "unknown"
+-    return f"{host}:{os.getpid()}"
+-
+-
+-def _host_prefix() -> str:
+-    """``"<host>:"`` prefix shared by every claim lock issued from this host."""
+-    return f"{_claimer_id().split(':', 1)[0]}:"
+-
+-
+ # --- Task creation / mutation ---
+ 
+ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+@@ -2643,20 +2628,6 @@ class LiveClaimError(ValueError):
+         )
+ 
+ 
+-def _claim_is_live(trow) -> bool:
+-    """True when a ``running`` task's claim still protects a run: the worker process
+-    it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
+-    or a library/CLI claim that never spawned one, has no run to protect. TTL expiry
+-    is deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the
+-    claim of a live worker, so the process is the liveness authority here too."""
+-    return bool(
+-        trow["status"] == "running"
+-        and trow["claim_lock"] is not None
+-        and trow["worker_pid"]
+-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
+-    )
+-
+-
+ def complete_task(
+     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
+     summary: Optional[str] = None, metadata: Optional[dict] = None,
+@@ -4435,6 +4406,12 @@ from hermes_cli.kanban_db_workspace import (
+     _managed_scratch_path_info,
+     _scratch_workspace,
+ )
++from hermes_cli.kanban_db_identity import (
++    _claim_is_live,
++    _claimer_id,
++    _effective_uid,
++    _host_prefix,
++)
+ from hermes_cli.kanban_db_dispatch import (
+     DEFAULT_FAILURE_LIMIT,
+     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 1e6a9ca5d6..bb9d1677a7 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -846,15 +846,7 @@ def detect_stale_running(
+ 
+ 
+ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+-    """Requeue ``running`` cards with broken claim bookkeeping; returns their ids.
+-
+-    A task ``running`` with NULL ``claim_lock``/``claim_expires`` (crash
+-    mid-claim, manual SQL, DB restore) is a zombie forever: ``release_stale_claims``
+-    needs ``claim_expires``, ``detect_crashed_workers`` needs a host-local lock +
+-    pid, ``detect_stale_running`` is off by default. Orphans go back to ``ready``
+-    with a comment, leaked run closed, ``reconciled`` event; a row with a live
+-    host-local PID is deferred so no duplicate spawns beside it.
+-    """
++    """Requeue orphaned running tasks without probing foreign/legacy PIDs."""
+     now = int(time.time())
+     reconciled: list[str] = []
+     rows = conn.execute(
+@@ -865,6 +857,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+     for row in rows:
+         tid = row["id"]
+         pid = row["worker_pid"]
++        lock = row["claim_lock"] or ""
++        if pid and lock and not lock.startswith(_kb._host_prefix()):  # Foreign/legacy PIDs are not probeable here.
++            continue
+         if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+             # Never requeue beside a live process. Retry next tick.
+             _kb._log.debug(
+@@ -1151,18 +1146,20 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+     sweep = _CrashSweep()
+     with _kb.write_txn(conn):
+         rows = conn.execute(
+-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+-            "FROM tasks "
+-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
++            "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, t.started_at, "
++            "       r.started_at AS run_started_at, t.assignee "
++            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
++            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+         ).fetchall()
+         host_prefix = _kb._host_prefix()
+         for row in rows:
+             lock = row["claim_lock"] or ""
+             if not lock.startswith(host_prefix):
+                 continue
+-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
+-            # before its PID is visible on /proc.
+-            started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
++            # Grace uses the active run; tasks.started_at remains first-start metrics.
++            started_at = _kb._to_epoch(_kb._row_get(row, "run_started_at"))
++            if started_at is None:
++                started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
+             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
+                 continue
+             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+diff --git a/hermes_cli/kanban_db_identity.py b/hermes_cli/kanban_db_identity.py
+new file mode 100644
+index 0000000000..8831511891
+--- /dev/null
++++ b/hermes_cli/kanban_db_identity.py
+@@ -0,0 +1,52 @@
++"""Claim identity and liveness boundaries for the Kanban database."""
++
++from __future__ import annotations
++
++import os
++import socket
++
++
++def _effective_uid() -> int:
++    """Translate this UID through the matching uid_map extent when available.
++
++    Nested namespace maps are parent-relative, not proof of a universal host UID.
++    """
++    uid = os.getuid() if hasattr(os, "getuid") else 0
++    try:
++        with open("/proc/self/uid_map", encoding="utf-8") as fh:
++            for line in fh:
++                try:
++                    inner, outer, count = (int(x) for x in line.split()[:3])
++                except (ValueError, TypeError):
++                    continue
++                if count > 0 and inner <= uid < inner + count:
++                    return outer + (uid - inner)
++    except OSError:
++        pass
++    return uid
++
++
++def _claimer_id() -> str:
++    """Return ``host:uid:pid`` so claim locality is scoped to one mapped UID."""
++    try:
++        host = socket.gethostname() or "unknown"
++    except Exception:
++        host = "unknown"
++    return f"{host}:{_effective_uid()}:{os.getpid()}"
++
++
++def _host_prefix() -> str:
++    """Prefix shared by claims this mapped UID may probe and signal."""
++    return _claimer_id().rsplit(":", 1)[0] + ":"
++
++
++def _claim_is_live(trow) -> bool:
++    """Protect live local workers; keep foreign/legacy claims without probing."""
++    from hermes_cli import kanban_db as _kb
++
++    lock = trow["claim_lock"]
++    if trow["status"] != "running" or not lock or not trow["worker_pid"]:
++        return False
++    if not lock.startswith(_kb._host_prefix()):
++        return True
++    return _kb._worker_alive(trow["worker_pid"], trow["worker_started_at"])
+diff --git a/tests/gateway/test_kanban_reconcile_orphans.py b/tests/gateway/test_kanban_reconcile_orphans.py
+index a252b0925c..4d694e2d28 100644
+--- a/tests/gateway/test_kanban_reconcile_orphans.py
++++ b/tests/gateway/test_kanban_reconcile_orphans.py
+@@ -83,7 +83,7 @@ class TestReconcileOrphanedRunning:
+     def test_null_claim_expires_orphan_requeued(self, conn):
+         """running + claim_lock set but claim_expires NULL is also invisible
+         to release_stale_claims — reconciliation must catch it."""
+-        host = kb._claimer_id().split(":", 1)[0]
++        host = kb._claimer_id().rsplit(":", 1)[0]
+         tid = kb.create_task(conn, title="half-claim", assignee="w")
+         _orphan_running(conn, tid, claim_lock=f"{host}:dead")
+ 
+diff --git a/tests/hermes_cli/test_kanban_core_functionality.py b/tests/hermes_cli/test_kanban_core_functionality.py
+index 4fd7c0db0c..646abcd200 100644
+--- a/tests/hermes_cli/test_kanban_core_functionality.py
++++ b/tests/hermes_cli/test_kanban_core_functionality.py
+@@ -1125,7 +1125,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
+     try:
+         t = kb.create_task(conn, title="stuck", assignee="broken")
+         # Simulate a live claim (not expired).
+-        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
++        lock = f"{_kb._claimer_id().rsplit(':', 1)[0]}:{secrets.token_hex(8)}"
+         future = int(time.time()) + 3600
+         killed: list[int] = []
+         state = {"alive": True}
+@@ -1208,7 +1208,7 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
+     """
+     import hermes_cli.kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+-    host_prefix = _kb._claimer_id().split(":", 1)[0]
++    host_prefix = _kb._claimer_id().rsplit(":", 1)[0]
+     claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+     assert claimed is not None, "task was not claimable for the next attempt"
+     _kbd._set_worker_pid(conn, tid, fake_pid)
+@@ -1381,7 +1381,7 @@ def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
+         log_path = kb.worker_log_path(tid, board=board)
+         log_path.parent.mkdir(parents=True, exist_ok=True)
+         log_path.write_text(_WORKER_LOG_TAIL)
+-        host_prefix = kb._claimer_id().split(":", 1)[0]
++        host_prefix = kb._claimer_id().rsplit(":", 1)[0]
+         assert kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
+         kbd._set_worker_pid(conn, tid, 991101)
+         kbd._record_worker_exit(991101, 0)
+diff --git a/tests/hermes_cli/test_kanban_db.py b/tests/hermes_cli/test_kanban_db.py
+index 22217ebc41..c157516635 100644
+--- a/tests/hermes_cli/test_kanban_db.py
++++ b/tests/hermes_cli/test_kanban_db.py
+@@ -220,7 +220,7 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
+ 
+     with kbc.connect() as conn:
+         t = kb.create_task(conn, title="x", assignee="a")
+-        host = _kb._claimer_id().split(":", 1)[0]
++        host = _kb._claimer_id().rsplit(":", 1)[0]
+         kb.claim_task(conn, t, claimer=f"{host}:worker")
+         kbd._set_worker_pid(conn, t, 12345)
+         old_expires = int(time.time()) - 3600
+@@ -253,7 +253,7 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
+     claim -> reclaim -> claim forever."""
+     with kbc.connect() as conn:
+         t = kb.create_task(conn, title="never spawned", assignee="a")
+-        host = kb._claimer_id().split(":", 1)[0]
++        host = kb._claimer_id().rsplit(":", 1)[0]
+         for expected in (1, 2):
+             kb.claim_task(conn, t, claimer=f"{host}:worker")
+             # No _set_worker_pid: the claimer never spawned a worker.
+@@ -282,7 +282,7 @@ def test_stale_claim_extend_live_worker_does_not_count_failure(
+ 
+     with kbc.connect() as conn:
+         t = kb.create_task(conn, title="live worker", assignee="a")
+-        host = _kb._claimer_id().split(":", 1)[0]
++        host = _kb._claimer_id().rsplit(":", 1)[0]
+         kb.claim_task(conn, t, claimer=f"{host}:worker")
+         kbd._set_worker_pid(conn, t, 12345)
+         old_expires = int(time.time()) - 3600
+@@ -334,7 +334,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
+     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+ 
+     with kbc.connect() as conn:
+-        host = _kb._claimer_id().split(":", 1)[0]
++        host = _kb._claimer_id().rsplit(":", 1)[0]
+         tid = kb.create_task(conn, title="rl", assignee="a")
+ 
+         # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
+@@ -397,7 +397,7 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
+     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+ 
+     with kbc.connect() as conn:
+-        host = _kb._claimer_id().split(":", 1)[0]
++        host = _kb._claimer_id().rsplit(":", 1)[0]
+         tid = kb.create_task(conn, title="terminal", assignee="a", max_retries=5)
+         claimed = kb.claim_task(conn, tid, claimer=f"{host}:w0")
+         if lane == "review":
+@@ -2040,7 +2040,7 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
+ 
+     with kbc.connect() as conn:
+         t = kb.create_task(conn, title="x", assignee="a")
+-        host = kb._claimer_id().split(":", 1)[0]
++        host = kb._claimer_id().rsplit(":", 1)[0]
+         kb.claim_task(conn, t, claimer=f"{host}:worker")
+         # A verified spawn: an uncaptured fingerprint would (correctly) refuse the signal.
+         monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
+diff --git a/tests/hermes_cli/test_kanban_foreign_uid_sweep.py b/tests/hermes_cli/test_kanban_foreign_uid_sweep.py
+new file mode 100644
+index 0000000000..a700b7fe22
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_foreign_uid_sweep.py
+@@ -0,0 +1,188 @@
++"""Claim locality and per-attempt crash-grace regressions."""
++
++from __future__ import annotations
++
++import subprocess
++import sys
++import time
++from pathlib import Path
++from unittest.mock import mock_open, patch
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    db_path = kb.kanban_db_path(board="default")
++    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
++    kb.init_db()
++    return home
++
++
++@pytest.fixture
++def conn(kanban_home):
++    with kbc.connect() as c:
++        yield c
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _foreign_uid_lock() -> str:
++    host, uid, _pid = kb._claimer_id().rsplit(":", 2)
++    return f"{host}:{int(uid) + 1}:4242"
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("legacy", [False, True], ids=["foreign-uid", "legacy-host-pid"])
++def test_nonlocal_claim_is_not_crash_swept_or_probed(conn, monkeypatch, legacy):
++    tid = kb.create_task(conn, title="foreign", assignee="w")
++    host, _uid, _pid = kb._claimer_id().rsplit(":", 2)
++    lock = f"{host}:4242" if legacy else _foreign_uid_lock()
++    kb.claim_task(conn, tid, claimer=lock)
++    conn.execute("UPDATE tasks SET worker_pid=4242 WHERE id=?", (tid,))
++
++    def unexpected_probe(*_args, **_kwargs):
++        raise AssertionError("nonlocal worker must not be liveness-probed")
++
++    monkeypatch.setattr(kbd, "_worker_alive", unexpected_probe)
++    assert kbd.detect_crashed_workers(conn) == []
++    row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row["status"] == "running"
++    assert row["claim_lock"] == lock
++
++
++@pytest.mark.platforms("posix")
++def test_same_uid_dead_worker_is_crash_swept(conn):
++    tid = kb.create_task(conn, title="local", assignee="w")
++    kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    kbd._set_worker_pid(conn, tid, _dead_pid())
++
++    assert kbd.detect_crashed_workers(conn) == [tid]
++    row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row["status"] != "running"
++    assert row["claim_lock"] is None
++
++
++def test_foreign_orphan_is_not_liveness_probed(conn, monkeypatch):
++    tid = kb.create_task(conn, title="foreign orphan", assignee="w")
++    lock = _foreign_uid_lock()
++    kb.claim_task(conn, tid, claimer=lock)
++    conn.execute("UPDATE tasks SET worker_pid=4242, claim_expires=NULL WHERE id=?", (tid,))
++
++    def unexpected_probe(*_args, **_kwargs):
++        raise AssertionError("foreign orphan must not be liveness-probed")
++
++    monkeypatch.setattr(kbd, "_worker_alive", unexpected_probe)
++    assert kbd.reconcile_orphaned_running(conn) == []
++    assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
++
++
++def test_foreign_worker_termination_does_not_probe_or_signal(monkeypatch):
++    def unexpected_probe(*_args, **_kwargs):
++        raise AssertionError("foreign worker must not be probed")
++
++    monkeypatch.setattr(kb, "_pid_alive", unexpected_probe)
++    signals = []
++    result = kbd._terminate_reclaimed_worker(
++        4242, _foreign_uid_lock(), signal_fn=lambda *args: signals.append(args),
++    )
++    assert result["host_local"] is False
++    assert result["termination_attempted"] is False
++    assert signals == []
++
++
++def test_foreign_expired_claim_still_uses_ttl_without_signalling(conn, monkeypatch):
++    tid = kb.create_task(conn, title="foreign ttl", assignee="w")
++    lock = _foreign_uid_lock()
++    kb.claim_task(conn, tid, claimer=lock)
++    conn.execute("UPDATE tasks SET worker_pid=4242, claim_expires=1 WHERE id=?", (tid,))
++
++    def unexpected_probe(*_args, **_kwargs):
++        raise AssertionError("foreign worker must not be liveness-probed")
++
++    monkeypatch.setattr(kbd, "_worker_alive", unexpected_probe)
++    signals = []
++    assert kb.release_stale_claims(conn, signal_fn=lambda *args: signals.append(args)) == 1
++    row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row["status"] == "ready"
++    assert row["claim_lock"] is None
++    assert signals == []
++
++
++def test_foreign_claim_protects_manual_completion_without_pid_probe(monkeypatch):
++    def unexpected_probe(*_args, **_kwargs):
++        raise AssertionError("foreign worker must not be liveness-probed")
++
++    monkeypatch.setattr(kb, "_worker_alive", unexpected_probe)
++    assert kb._claim_is_live({
++        "status": "running",
++        "claim_lock": _foreign_uid_lock(),
++        "worker_pid": 4242,
++        "worker_started_at": None,
++    })
++
++
++@pytest.mark.platforms("posix")
++def test_reclaim_respawn_gets_fresh_crash_grace(conn, monkeypatch):
++    tid = kb.create_task(conn, title="grace", assignee="w")
++    kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    conn.execute("UPDATE tasks SET started_at=1 WHERE id=?", (tid,))
++    conn.execute("UPDATE task_runs SET started_at=1 WHERE task_id=?", (tid,))
++    kbd._set_worker_pid(conn, tid, _dead_pid())
++    assert kbd.detect_crashed_workers(conn) == [tid]
++
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "3600")
++    kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    task_start = conn.execute("SELECT started_at FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++    run_start = conn.execute(
++        "SELECT started_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,),
++    ).fetchone()[0]
++    assert task_start == 1
++    assert abs(time.time() - run_start) < 60
++    kbd._set_worker_pid(conn, tid, _dead_pid())
++
++    assert kbd.detect_crashed_workers(conn) == []
++    assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
++
++    conn.execute(
++        "UPDATE task_runs SET started_at=1 WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
++        (tid,),
++    )
++    assert kbd.detect_crashed_workers(conn) == [tid]
++
++
++def test_effective_uid_matches_the_extent_containing_uid():
++    with patch("os.getuid", return_value=1000, create=True), patch(
++        "builtins.open", mock_open(read_data="0 100000 1\n1000 200000 1\n"),
++    ):
++        assert kb._effective_uid() == 200000
++
++
++def test_effective_uid_translates_offset_inside_extent():
++    with patch("os.getuid", return_value=1005, create=True), patch(
++        "builtins.open", mock_open(read_data="0 500000 100\n1000 700000 100\n"),
++    ):
++        assert kb._effective_uid() == 700005
++
++
++def test_effective_uid_preserves_identity_map_and_unreadable_fallback():
++    with patch("os.getuid", return_value=1000, create=True), patch(
++        "builtins.open", mock_open(read_data="0 0 4294967295\n"),
++    ):
++        assert kb._effective_uid() == 1000
++    with patch("os.getuid", return_value=1000, create=True), patch("builtins.open", side_effect=OSError):
++        assert kb._effective_uid() == 1000
+diff --git a/tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py b/tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py
+index 3037a6cb1f..8424a48736 100644
+--- a/tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py
++++ b/tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py
+@@ -48,7 +48,7 @@ def conn(kanban_home):
+ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
+     """A reset carrying an OLD worker's claim_lock must NOT clobber a task
+     that has since been re-claimed by a new worker."""
+-    host = kb._claimer_id().split(":", 1)[0]
++    host = kb._claimer_id().rsplit(":", 1)[0]
+     tid = kb.create_task(conn, title="desync", assignee="w")
+ 
+     # Worker A claims, then dies.
+@@ -95,7 +95,7 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
+ def test_genuine_crash_still_reclaims(conn):
+     """When the claim_lock still matches the dead worker, the crash reclaim
+     fires normally — the guard must not break the legitimate path."""
+-    host = kb._claimer_id().split(":", 1)[0]
++    host = kb._claimer_id().rsplit(":", 1)[0]
+     tid = kb.create_task(conn, title="legit", assignee="w")
+     kb.claim_task(conn, tid, claimer=f"{host}:A")
+     dead = subprocess.Popen(["true"])
+diff --git a/tests/hermes_cli/test_kanban_worker_exit_trailer.py b/tests/hermes_cli/test_kanban_worker_exit_trailer.py
+index 85a86b1857..8c47b067fe 100644
+--- a/tests/hermes_cli/test_kanban_worker_exit_trailer.py
++++ b/tests/hermes_cli/test_kanban_worker_exit_trailer.py
+@@ -35,7 +35,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+ 
+ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
+     """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
+-    host = kb._claimer_id().split(":", 1)[0]
++    host = kb._claimer_id().rsplit(":", 1)[0]
+     kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
+     conn.execute(
+         "UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?",
+-- 
+2.54.0
+

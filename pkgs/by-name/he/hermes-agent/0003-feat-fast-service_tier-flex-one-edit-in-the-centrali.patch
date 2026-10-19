@@ -1,0 +1,450 @@
+From cabb2bc7c49e7628016100523a71ba568c37e225 Mon Sep 17 00:00:00 2001
+From: justinh20 <justin.hanke@gmail.com>
+Date: Wed, 30 Sep 2026 08:21:29 -0400
+Subject: [PATCH 03/23] =?UTF-8?q?feat(fast):=20service=5Ftier=20flex=20?=
+ =?UTF-8?q?=E2=80=94=20one=20edit=20in=20the=20centralized=20tier=20table?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds flex (~50% cost saving on latency-tolerant workloads; OpenAI
+https://platform.openai.com/docs/guides/flex-processing, Gemini
+https://ai.google.dev/gemini-api/docs/flex-inference) as a static tier:
+one entry in agent.fast_mode's SERVICE_TIER_WORDS / STATIC_TIERS
+(#128307's chokepoint — every surface parses through it), plus an
+explicit flex branch in resolve_fast_mode_overrides next to ultrafast:
+{"service_tier": "flex"} on OpenAI and tier-eligible Gemini models, None
+on Anthropic (no flex equivalent — speed is a go-faster knob; mapping
+flex onto it would silently bill MORE for a setting chosen to cost less)
+and on Grok (xAI publishes no flex tier). The route gate is unchanged:
+aggregator routes never receive first-party tier params, and two-level
+aggregator ids stay tier-ineligible so /fast never confirms a tier it
+cannot send. Gemini tier eligibility (2.5+, both tier docs' floor) joins
+model_supports_fast_mode.
+
+Closes #12700.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ agent/fast_mode.py                         |   7 +-
+ hermes_cli/models.py                       |  45 ++++-
+ tests/gateway/test_fast_command.py         |  58 ++++++
+ tests/hermes_cli/test_fast_command.py      |   6 +
+ tests/hermes_cli/test_service_tier_flex.py | 202 +++++++++++++++++++++
+ 5 files changed, 313 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_service_tier_flex.py
+
+diff --git a/agent/fast_mode.py b/agent/fast_mode.py
+index 006a17e914..efcf03857f 100644
+--- a/agent/fast_mode.py
++++ b/agent/fast_mode.py
+@@ -21,8 +21,9 @@ DEFAULT_WINDOW_SECONDS = 60
+ # capacity for the model (https://platform.claude.com/docs/en/build-with-claude/fast-mode).
+ _FAST_LIMIT_HEADERS = ("anthropic-fast-input-tokens-limit", "anthropic-fast-output-tokens-limit")
+ #: Tiers sent on every request of the session (OpenAI ``service_tier`` values; ``priority`` also
+-#: selects Anthropic/xAI fast mode). Ultrafast is OpenAI-only and gated per model.
+-STATIC_TIERS = frozenset({"priority", "ultrafast"})
++#: selects Anthropic/xAI fast mode). Ultrafast is OpenAI-only and gated per model; flex is the
++#: cheaper latency-tolerant tier on OpenAI and tier-eligible Gemini models.
++STATIC_TIERS = frozenset({"priority", "ultrafast", "flex"})
+ # Codex app-server names for wire tiers it accepts (turn/start.serviceTier); a tier missing here is not sent.
+ CODEX_TIER_WORDS: dict[str, str] = {"priority": "fast"}
+ NORMAL_TIER_WORDS = frozenset({"", "normal", "default", "standard", "off", "none"})
+@@ -30,7 +31,7 @@ NORMAL_TIER_WORDS = frozenset({"", "normal", "default", "standard", "off", "none
+ # on CLI / gateway / TUI) parses through, so a new tier is one edit.
+ SERVICE_TIER_WORDS: dict[str, str] = {
+     "fast": "priority", "priority": "priority", "on": "priority",
+-    "ultrafast": "ultrafast", "ultra": "ultrafast", "auto": "auto", "cold": "cold",
++    "ultrafast": "ultrafast", "ultra": "ultrafast", "flex": "flex", "auto": "auto", "cold": "cold",
+ }
+ # Typed /fast shorthands -> canonical /fast word (pickers always send the canonical value).
+ FAST_ARG_ALIASES: dict[str, str] = {"ultra": "ultrafast"}
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 5b900144ae..6a02a40a36 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1220,7 +1220,9 @@ def provider_label(provider: Optional[str]) -> str:
+ 
+ def _is_openai_fast_model(model_id: Optional[str]) -> bool:
+     """OpenAI flagship eligible for Priority Processing. Codex-series excluded — the Codex Responses
+-    API doesn't accept ``service_tier``."""
++    API doesn't accept ``service_tier``. Two-level aggregator ids (``openrouter/openai/gpt-4.1``)
++    deliberately do NOT match: the route gate keeps tier params off aggregator routes anyway, so
++    matching them would only expose a ``/fast`` toggle that confirms and then sends nothing."""
+     base = _strip_vendor_prefix(str(model_id or "")).split(":")[0]
+     return bool(base) and "codex" not in base and base.startswith(tuple(_OPENAI_FAST_MODE_PREFIXES))
+ 
+@@ -1231,6 +1233,32 @@ def _strip_vendor_prefix(model_id: str) -> str:
+     return raw.split("/", 1)[1] if "/" in raw else raw
+ 
+ 
++def _is_google_service_tier_model(model_id: Optional[str]) -> bool:
++    """Return True if the model accepts Gemini's ``service_tier`` request field.
++
++    Gemini exposes both tiers on ``generateContent`` as a top-level body field:
++    ``flex`` (https://ai.google.dev/gemini-api/docs/flex-inference) and
++    ``priority``
++    (https://ai.google.dev/gemini-api/docs/generate-content/priority-inference).
++    Both docs list the same ``gemini-2.5+`` family, so match ``gemini-*`` by
++    pattern rather than pinning a version list that goes stale each release.
++    """
++    # Two-level aggregator ids ('openrouter/google/gemini-x') deliberately do
++    # NOT match — same reasoning as the OpenAI check. Gemma/Lyria are also not
++    # matched: service tiers apply to Gemini only.
++    base = _strip_vendor_prefix(str(model_id or "")).split(":")[0]
++    match = re.match(r"gemini-(\d+)(?:\.(\d+))?", base)
++    if not match:
++        return False
++    # Both tier docs list gemini-2.5 and newer. Gemini's native REST rejects
++    # the entire request on an unexpected body field, so sending service_tier
++    # to 1.5/2.0 would hard-fail every call for a globally-configured tier —
++    # gate on version rather than matching gemini-* broadly.
++    major = int(match.group(1))
++    minor = int(match.group(2) or 0)
++    return (major, minor) >= (2, 5)
++
++
+ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
+     """Return whether Hermes should expose the /fast toggle for this model."""
+     from agent.model_metadata import is_grok_46_family
+@@ -1238,7 +1266,8 @@ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
+     return (
+         _is_anthropic_fast_model(model_id)
+         or _is_openai_fast_model(model_id)
+-        or is_grok_46_family(str(model_id or "")))
++        or is_grok_46_family(str(model_id or ""))
++        or _is_google_service_tier_model(model_id))
+ 
+ 
+ def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
+@@ -1260,6 +1289,8 @@ def _fast_mode_route_supported(
+         allowed = {"anthropic": "api.anthropic.com"}
+     elif is_grok_46_family(str(model_id or "")):
+         allowed = {"xai": "api.x.ai"}
++    elif _is_google_service_tier_model(model_id):
++        allowed = {"gemini": "generativelanguage.googleapis.com"}
+     else:
+         allowed = {
+             "openai": "api.openai.com",
+@@ -1288,6 +1319,10 @@ def resolve_fast_mode_overrides(
+     ``{"service_tier": "priority"}`` (OpenAI / xAI Priority Processing) — or None if unsupported.
+     ``tier="ultrafast"`` asks for OpenAI Ultrafast instead: ``{"service_tier": "ultrafast"}`` on an
+     Ultrafast model, None elsewhere (never a silent downgrade to a different paid tier).
++    ``tier="flex"`` asks for the cheaper Flex tier: ``{"service_tier": "flex"}`` on OpenAI and
++    tier-eligible Gemini models (a top-level ``generateContent`` field there), None on Anthropic
++    (no flex equivalent — ``speed`` is a go-faster knob, so mapping flex onto it would silently
++    bill MORE for a setting chosen to cost less) and on Grok (xAI publishes no flex tier).
+     With ``provider``/``base_url`` the route is gated too (``_fast_mode_route_supported``) so proxies
+     never see the params. Single fast-mode gate for ``/fast`` and ``agent.fast_mode`` windows."""
+     if not model_supports_fast_mode(model_id):
+@@ -1296,6 +1331,12 @@ def resolve_fast_mode_overrides(
+         return None
+     if tier == "ultrafast":
+         return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
++    if tier == "flex":
++        from agent.model_metadata import is_grok_46_family
++
++        if _is_anthropic_fast_model(model_id) or is_grok_46_family(str(model_id or "")):
++            return None
++        return {"service_tier": "flex"}
+     return {"speed": "fast"} if _is_anthropic_fast_model(model_id) else {"service_tier": "priority"}
+ 
+ 
+diff --git a/tests/gateway/test_fast_command.py b/tests/gateway/test_fast_command.py
+index 4de79ba31d..e881f734ab 100644
+--- a/tests/gateway/test_fast_command.py
++++ b/tests/gateway/test_fast_command.py
+@@ -238,3 +238,61 @@ async def test_fast_override_lands_under_the_recovered_telegram_topic_key(monkey
+     assert "FAST" in response
+     assert runner._resolve_session_service_tier(session_key=turn_key) == "priority"
+     assert raw_key not in runner._session_service_tier_overrides
++
++
++def test_load_service_tier_accepts_flex(monkeypatch):
++    """agent.service_tier: flex must survive config load, not be dropped as unknown."""
++    monkeypatch.setattr(
++        gateway_run,
++        "_load_gateway_config",
++        lambda: {"agent": {"service_tier": "flex"}},
++    )
++
++    assert gateway_run.GatewayRunner._load_service_tier() == "flex"
++
++
++def test_turn_route_injects_flex_without_changing_runtime():
++    runner = _make_runner()
++    runner._service_tier = "flex"
++    runtime_kwargs = {
++        "api_key": "***",
++        "base_url": "https://api.openai.com/v1",
++        "provider": "openai",
++        "api_mode": "chat_completions",
++        "command": None,
++        "args": [],
++        "credential_pool": None,
++    }
++
++    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
++        runner, "hi", "gpt-4.1", runtime_kwargs
++    )
++
++    assert route["runtime"]["provider"] == "openai"
++    assert route["request_overrides"] == {"service_tier": "flex"}
++
++
++def test_turn_route_gates_flex_off_aggregator_routes():
++    """First-party tier params never ride aggregator routes: OpenRouter strips
++    ``service_tier`` (charging nothing) or 400s on it, so the route gate
++    (``_fast_mode_route_supported``) drops the override instead of pinning it."""
++    runner = _make_runner()
++    runner._service_tier = "flex"
++    runtime_kwargs = {
++        "api_key": "***",
++        "base_url": "https://openrouter.ai/api/v1",
++        "provider": "openrouter",
++        "api_mode": "chat_completions",
++        "command": None,
++        "args": [],
++        "credential_pool": None,
++    }
++
++    # A tier-eligible model id, so it is specifically the ROUTE gate doing the
++    # dropping here — not model eligibility.
++    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
++        runner, "hi", "gpt-4.1", runtime_kwargs
++    )
++
++    assert route["runtime"]["provider"] == "openrouter"
++    assert not route["request_overrides"]
+diff --git a/tests/hermes_cli/test_fast_command.py b/tests/hermes_cli/test_fast_command.py
+index 4bf1b75390..9fa2510ebe 100644
+--- a/tests/hermes_cli/test_fast_command.py
++++ b/tests/hermes_cli/test_fast_command.py
+@@ -104,6 +104,9 @@ class TestPriorityProcessingModels(unittest.TestCase):
+         assert model_supports_fast_mode("grok-4.5") is False
+         assert resolve_fast_mode_overrides("grok-4.6") == {"service_tier": "priority"}
+ 
++
++
++
+ class TestFastModeRouting(unittest.TestCase):
+     def test_fast_command_exposed_for_model_even_when_provider_is_auto(self):
+         cli_mod = _import_cli()
+@@ -299,3 +302,6 @@ class TestAnthropicFastModeAdapter(unittest.TestCase):
+         assert kwargs.get("extra_body", {}).get("speed") is None
+         assert "speed" not in kwargs
+         assert "extra_headers" not in kwargs
++
++
++
+diff --git a/tests/hermes_cli/test_service_tier_flex.py b/tests/hermes_cli/test_service_tier_flex.py
+new file mode 100644
+index 0000000000..29ed414e39
+--- /dev/null
++++ b/tests/hermes_cli/test_service_tier_flex.py
+@@ -0,0 +1,202 @@
++"""Flex service-tier coverage for the classic CLI surface (PR #37059).
++
++Kept in its own file (not appended to test_fast_command.py) so routine upstream
++growth of that file cannot conflict with these tests.
++"""
++
++import unittest
++
++
++def _import_cli():
++    import hermes_cli.config as config_mod
++
++    if not hasattr(config_mod, "save_env_value_secure"):
++        config_mod.save_env_value_secure = lambda key, value: {
++            "success": True,
++            "stored_as": key,
++            "validated": False,
++        }
++
++    import cli as cli_mod
++
++    return cli_mod
++
++
++class TestParseServiceTierFlex(unittest.TestCase):
++    def _parse(self, raw):
++        cli_mod = _import_cli()
++        return cli_mod._parse_service_tier_config(raw)
++
++    def test_flex_is_accepted(self):
++        """agent.service_tier: flex was rejected as unknown and silently dropped."""
++        self.assertEqual(self._parse("flex"), "flex")
++        self.assertEqual(self._parse("  FLEX  "), "flex")
++
++    def test_normal_and_unknown_still_disable(self):
++        for raw in ["", "normal", "off", "standard", "bogus"]:
++            self.assertIsNone(self._parse(raw), f"{raw!r} should not enable a tier")
++
++
++class TestTwoLevelModelPaths(unittest.TestCase):
++    """Aggregators route models as ``aggregator/vendor/model`` — deliberately NOT eligible.
++
++    The route gate keeps tier params off aggregator routes regardless, so matching
++    two-level ids would only expose a ``/fast`` toggle on the CLI/gateway (which check
++    the model alone) that confirms FAST and then sends nothing. A single vendor prefix
++    (``openai/gpt-4.1``) still matches — that is the first-party form.
++    """
++
++    def test_aggregator_two_level_ids_are_not_eligible(self):
++        from hermes_cli.models import model_supports_fast_mode
++
++        assert not model_supports_fast_mode("openrouter/openai/gpt-4.1")
++
++    def test_single_vendor_prefix_still_matches(self):
++        from hermes_cli.models import model_supports_fast_mode
++
++        assert model_supports_fast_mode("openai/gpt-4.1")
++
++
++class TestGoogleServiceTier(unittest.TestCase):
++    """Gemini accepts a top-level ``service_tier`` on generateContent.
++
++    See https://ai.google.dev/gemini-api/docs/flex-inference (flex) and
++    https://ai.google.dev/gemini-api/docs/generate-content/priority-inference
++    (priority).
++    """
++
++    def test_gemini_models_detected(self):
++        from hermes_cli.models import _is_google_service_tier_model
++
++        for model in [
++            "gemini-3.6-flash",
++            "gemini-3.5-flash-lite",
++            "gemini-2.5-pro",
++            "google/gemini-3.5-flash",
++        ]:
++            assert _is_google_service_tier_model(model), f"{model} should be tier-eligible"
++
++    def test_non_gemini_models_not_detected(self):
++        from hermes_cli.models import _is_google_service_tier_model
++
++        # Two-level aggregator ids are deliberately ineligible (route-gated anyway;
++        # matching them would only expose a lying /fast toggle).
++        for model in [
++            "gpt-5.4", "claude-opus-4-6",
++            "openrouter/openai/gpt-4.1", "openrouter/google/gemini-3.5-flash",
++        ]:
++            assert not _is_google_service_tier_model(model), f"{model} must not be tier-eligible"
++
++
++class TestFlexTier(unittest.TestCase):
++    """``agent.service_tier: flex`` must survive all the way to the override dict."""
++
++    def test_openai_flex_override(self):
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides("gpt-5.4", tier="flex") == {"service_tier": "flex"}
++
++    def test_gemini_flex_override(self):
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides(
++            "google/gemini-3.5-flash", tier="flex"
++        ) == {"service_tier": "flex"}
++
++    def test_gemini_priority_override(self):
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides("gemini-3.6-flash", tier="priority") == {
++            "service_tier": "priority"
++        }
++
++    def test_anthropic_flex_returns_none(self):
++        """Anthropic has no flex equivalent — speed=fast is a priority-only knob."""
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides("claude-opus-4-8", tier="flex") is None
++
++    def test_anthropic_priority_still_returns_speed(self):
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides("claude-opus-4-8", tier="priority") == {
++            "speed": "fast"
++        }
++
++    def test_default_tier_is_priority(self):
++        """Existing callers pass no tier and must keep priority semantics."""
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides("gpt-5.4") == {"service_tier": "priority"}
++        assert resolve_fast_mode_overrides("claude-opus-4-8") == {"speed": "fast"}
++
++
++
++class TestConfigDefault(unittest.TestCase):
++    def test_default_config_has_service_tier(self):
++        from hermes_cli.config import DEFAULT_CONFIG
++
++        agent = DEFAULT_CONFIG.get("agent", {})
++        self.assertIn("service_tier", agent)
++        self.assertEqual(agent["service_tier"], "")
++
++
++class TestGeminiVersionGate(unittest.TestCase):
++    """Google lists service tiers for gemini-2.5+ only.
++
++    Gemini's native REST rejects the whole request on unexpected body fields,
++    so sending ``service_tier`` to gemini-1.5/2.0 would hard-fail every call
++    for a user who set ``flex`` globally.
++    """
++
++    def test_supported_versions_detected(self):
++        from hermes_cli.models import _is_google_service_tier_model
++
++        for model in [
++            "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
++            "gemini-3-flash-preview", "gemini-3.1-pro-preview",
++            "gemini-3.5-flash", "gemini-3.6-flash",
++            "google/gemini-3.5-flash",
++        ]:
++            assert _is_google_service_tier_model(model), f"{model} should be eligible"
++
++    def test_pre_2_5_models_excluded(self):
++        from hermes_cli.models import _is_google_service_tier_model
++
++        for model in [
++            "gemini-1.5-pro", "gemini-1.5-flash",
++            "gemini-2.0-flash", "google/gemini-2.0-flash-lite",
++        ]:
++            assert not _is_google_service_tier_model(model), f"{model} predates tiers"
++
++    def test_non_gemini_google_models_excluded(self):
++        from hermes_cli.models import _is_google_service_tier_model
++
++        for model in ["gemma-3-27b", "google/gemma-2-9b", "lyria-2"]:
++            assert not _is_google_service_tier_model(model), f"{model} is not Gemini"
++
++
++class TestTierWhitelist(unittest.TestCase):
++    """Only documented tier values may reach a provider.
++
++    Since #128307 the invariant lives at the parse layer: every surface goes
++    through ``agent.fast_mode.parse_service_tier`` (one word table), so an
++    unnormalized word like ``fast`` never reaches the resolver as a tier.
++    """
++
++    def test_parser_normalizes_every_word(self):
++        from agent.fast_mode import SERVICE_TIER_WORDS, parse_service_tier
++
++        assert parse_service_tier("fast") == "priority"
++        assert parse_service_tier("flex") == "flex"
++        assert parse_service_tier("bogus") is None
++        # flex is a static per-request tier alongside priority/ultrafast.
++        from agent.fast_mode import STATIC_TIERS
++
++        assert "flex" in STATIC_TIERS and "flex" in SERVICE_TIER_WORDS.values()
++
++    def test_documented_tiers_still_pass(self):
++        from hermes_cli.models import resolve_fast_mode_overrides
++
++        assert resolve_fast_mode_overrides("gpt-5.4", tier="priority") == {"service_tier": "priority"}
++        assert resolve_fast_mode_overrides("gpt-5.4", tier="flex") == {"service_tier": "flex"}
+-- 
+2.54.0
+

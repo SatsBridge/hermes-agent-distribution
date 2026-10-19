@@ -1,0 +1,1282 @@
+From 2af0503a288607b0900cce348aec570335a5b430 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Fri, 16 Oct 2026 16:05:32 +0000
+Subject: [PATCH 12/23] fix(service-tier): preserve route and session
+ compatibility
+
+---
+ agent/agent_init.py                           |  9 +--
+ agent/auxiliary_client.py                     |  7 ++
+ agent/background_review.py                    |  4 +
+ agent/chat_completion_helpers.py              | 16 +++-
+ agent/curator.py                              |  3 +-
+ agent/fast_mode.py                            | 42 ++++++----
+ agent/service_tier_escalation.py              | 34 ++++----
+ agent/turn_truncation.py                      |  2 +-
+ batch_runner.py                               |  1 +
+ gateway/run_turn.py                           | 11 +--
+ gateway/slash_commands_model.py               |  8 +-
+ hermes_cli/cli_agent_setup_mixin.py           | 13 +--
+ hermes_cli/cli_fast_mode_mixin.py             |  8 +-
+ hermes_cli/cli_single_query.py                |  1 +
+ hermes_cli/commands.py                        |  6 +-
+ hermes_cli/models.py                          | 53 ++++++++-----
+ hermes_constants.py                           |  6 +-
+ tests/agent/test_fast_mode_auto.py            |  7 +-
+ tests/agent/test_openai_ultrafast.py          | 10 ++-
+ tests/agent/test_service_tier_escalation.py   |  7 +-
+ tests/gateway/test_fast_command.py            | 35 ++++----
+ tests/hermes_cli/test_fast_command.py         |  3 +
+ tests/test_per_model_service_tier.py          | 31 +++++---
+ tests/tui_gateway/test_fast_session_scope.py  |  4 +-
+ .../test_service_tier_request_overrides.py    | 79 ++++++++++++++++---
+ tools/delegate_tool_config.py                 |  2 +-
+ tui_gateway/agent_callbacks.py                | 23 +++++-
+ tui_gateway/methods_config_set.py             |  9 ++-
+ tui_gateway/methods_prompt.py                 |  6 +-
+ tui_gateway/methods_slash.py                  | 12 +--
+ tui_gateway/methods_tools.py                  |  2 +-
+ tui_gateway/server.py                         | 27 ++++---
+ website/docs/user-guide/configuration.md      | 12 +--
+ 33 files changed, 316 insertions(+), 177 deletions(-)
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index f1dbda57c4..dcb5577516 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2419,6 +2419,8 @@ def init_agent(
+     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
+     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+     agent.request_overrides = dict(request_overrides or {})
++    from agent.fast_mode import parse_service_tier, set_framework_baked_tier_keys
++
+     agent.service_tier = parse_service_tier(getattr(agent, "service_tier", None))
+     # * Surfaces that apply a session /fast set this True after construction. Default-off so
+     # delegated children never inherit a parent session pin.
+@@ -2426,8 +2428,6 @@ def init_agent(
+     # * Constructor does not write service_tier/speed into request_overrides;
+     # pre-existing keys on that dict stay unmarked raw user overrides.
+     # Surfaces that bake (/fast, gateway merge, TUI set) mark after construction.
+-    from agent.fast_mode import set_framework_baked_tier_keys
+-
+     set_framework_baked_tier_keys(agent, None)
+     # * Batch / background constructors set this True so an enabled config cannot climb.
+     agent._block_service_tier_escalation = False
+@@ -2461,10 +2461,7 @@ def init_agent(
+ 
+     from agent.service_tier_escalation import bind_service_tier_escalation
+ 
+-    _esc_raw = service_tier_escalation
+-    if _esc_raw is None and isinstance(_agent_cfg, dict):
+-        _agent_section = _agent_cfg.get("agent")
+-        _esc_raw = _agent_section if isinstance(_agent_section, dict) else None
++    _esc_raw = _agent_cfg.get("agent") if isinstance(_agent_cfg, dict) else None
+     bind_service_tier_escalation(agent, _esc_raw)
+ 
+     _apply_display_config(agent, _agent_cfg, platform)
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index fbbd9ec0af..930f191092 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -6804,6 +6804,13 @@ def _build_call_kwargs(
+     if "response_format" in merged_extra:
+         from agent.auxiliary_structured_output import without_unsupported_response_format
+         merged_extra = without_unsupported_response_format(merged_extra, provider_norm, effective_base, model, task)
++    if merged_extra:
++        from hermes_cli.models import apply_aux_service_tier_overrides
++
++        lifted = apply_aux_service_tier_overrides(
++            {"extra_body": merged_extra}, None, model=model, provider=provider, base_url=effective_base, task=task)
++        kwargs.update({key: lifted[key] for key in ("service_tier", "speed") if key in lifted})
++        merged_extra = lifted.get("extra_body") or {}
+     if merged_extra:
+         kwargs["extra_body"] = merged_extra
+     # Anthropic Messages adapters take reasoning via a private kwarg that plain OpenAI SDK clients
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 8345023ffa..1a2c1fd61b 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -999,6 +999,10 @@ def build_cache_parity_fork(
+     if not _routed and write_origin == "background_review":
+         _warn_ignored_reasoning_effort(agent, task_cfg)
+     review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
++    from hermes_cli.models import bind_aux_slot_service_tier
++
++    bind_aux_slot_service_tier(review_agent, _rt.get("_aux_slot"))
++    review_agent._block_service_tier_escalation = True
+     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
+     # Fork-turn log tag: the fork shares the parent's session_id (and model on the
+     # same-model path), so its turn-start/turn-exit log lines are otherwise
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 243e944837..73d20fcecd 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1555,6 +1555,7 @@ def _apply_effective_overrides_to_summary_kwargs(agent, summary_kwargs: dict) ->
+     try:
+         overrides = effective_request_overrides(agent)
+     except Exception:
++        logger.debug("could not resolve service-tier overrides for summary request", exc_info=True)
+         return
+     if not overrides:
+         return
+@@ -2764,6 +2765,14 @@ class _StreamingCall(StreamingWaitMonitor):
+         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
+         # The route ``api_kwargs`` was assembled for; a retry must not replay it on another one.
+         self._request_route = self._live_route()
++        # Bind TTFT hooks only for an active observation; default-off performs no clock reads.
++        if getattr(agent, "_ttft_obs_stack", None):
++            from agent.service_tier_escalation import mark_ttft_first_delta, mark_ttft_send
++
++            self._mark_ttft_send = mark_ttft_send
++            self._mark_ttft_first_delta = mark_ttft_first_delta
++        else:
++            self._mark_ttft_send = self._mark_ttft_first_delta = None
+ 
+     # ── shared small helpers ────────────────────────────────────────────
+ 
+@@ -2856,7 +2865,7 @@ class _StreamingCall(StreamingWaitMonitor):
+             try:
+                 mark(self.agent)
+             except Exception:
+-                pass
++                logger.debug("TTFT first-delta observation failed", exc_info=True)
+         if not self.first_delta_fired["done"] and self.on_first_delta:
+             self.first_delta_fired["done"] = True
+             self._quiet(self.on_first_delta)
+@@ -2994,6 +3003,9 @@ class _StreamingCall(StreamingWaitMonitor):
+         # #93650: as above — the streaming path carries the same bulk
+         # messages/tools payload and pays the same client-side walk.
+         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
++        if self._mark_ttft_send is not None:
++            with contextlib.suppress(Exception):
++                self._mark_ttft_send(self.agent)
+         return request_client.chat.completions.create(**stream_kwargs)
+ 
+     def _chat_stream_created(self, raw_stream: Any) -> None:
+@@ -3239,7 +3251,7 @@ class _StreamingCall(StreamingWaitMonitor):
+                         try:
+                             mark(self.agent)
+                         except Exception:
+-                            pass
++                            logger.debug("TTFT tool-delta observation failed", exc_info=True)
+                     if name is not None:
+                         self._emit_tool_started(name)
+                         # Lets the stub-builder warn if streaming dies before the args
+diff --git a/agent/curator.py b/agent/curator.py
+index 9cdc144515..015a27fb26 100644
+--- a/agent/curator.py
++++ b/agent/curator.py
+@@ -1065,7 +1065,7 @@ def _resolve_review_provider() -> tuple:
+     overrides, provider, model_name, binding = {}, None, "", None
+     try:
+         from hermes_cli.config import load_config_readonly
+-        from hermes_cli.models import apply_aux_service_tier_overrides
++        from hermes_cli.models import apply_aux_service_tier_overrides, bind_aux_slot_service_tier
+         from hermes_cli.runtime_provider import resolve_runtime_provider
+         cfg = load_config_readonly()
+         binding = _resolve_review_runtime(cfg)
+@@ -1100,6 +1100,7 @@ def _run_llm_review(prompt: str) -> dict[str, Any]:
+     result_meta: dict[str, Any] = _llm_meta("")
+     try:
+         from run_agent import AIAgent
++        from hermes_cli.models import bind_aux_slot_service_tier
+     except Exception as e:
+         result_meta["error"] = result_meta["summary"] = f"AIAgent import failed: {e}"
+         return result_meta
+diff --git a/agent/fast_mode.py b/agent/fast_mode.py
+index bc1c22ad9f..fb72430ac8 100644
+--- a/agent/fast_mode.py
++++ b/agent/fast_mode.py
+@@ -18,6 +18,8 @@ from typing import Any
+ 
+ BOUNDED_MODES = frozenset({"auto", "cold"})
+ DEFAULT_WINDOW_SECONDS = 60
++# Wire keys whose values can be framework-baked by a tier selection.
++TIER_WIRE_KEYS = ("service_tier", "speed")
+ # Documented fast-mode rate-limit headers; a limit of 0 means the organization has no fast
+ # capacity for the model (https://platform.claude.com/docs/en/build-with-claude/fast-mode).
+ _FAST_LIMIT_HEADERS = ("anthropic-fast-input-tokens-limit", "anthropic-fast-output-tokens-limit")
+@@ -198,26 +200,36 @@ def begin_turn(
+ 
+ def _apply_escalation_overlay(agent: Any, overrides: dict[str, Any]) -> dict[str, Any]:
+     """Last-step TTFT ladder overlay. No-op when escalation is disabled or gated."""
+-    try:
+-        from agent.service_tier_escalation import apply_escalation_to_overrides
++    from agent.service_tier_escalation import apply_escalation_to_overrides
+ 
+-        return apply_escalation_to_overrides(agent, overrides)
+-    except Exception:
+-        return overrides
++    return apply_escalation_to_overrides(agent, overrides)
+ 
+ 
+ def effective_request_overrides(agent: Any) -> dict[str, Any]:
+-    """``agent.request_overrides`` plus the fast override while the window is open, minus
+-    ``speed`` for a model this session learned has no fast capacity."""
++    """Resolve framework tier sources onto a copy, preserving unrelated caller overrides."""
+     overrides = dict(getattr(agent, "request_overrides", None) or {})
+-    if getattr(agent, "service_tier", None) in BOUNDED_MODES and time.monotonic() < getattr(agent, "_fast_until", 0.0):
+-        from hermes_cli.models import resolve_fast_mode_overrides
+-        base_url = getattr(agent, "base_url", None)
+-        if getattr(agent, "api_mode", None) == "anthropic_messages":
+-            base_url = getattr(agent, "_anthropic_base_url", None) or base_url
+-        overrides.update(
+-            resolve_fast_mode_overrides(getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url) or {}
+-        )
++    for key in TIER_WIRE_KEYS:
++        if key in (getattr(agent, "_framework_baked_tier_keys", None) or ()):
++            overrides.pop(key, None)
++    if not _framework_replaces_tier_keys(agent):
++        return _apply_escalation_overlay(agent, _drop_unprovisioned_speed(agent, overrides))
++    for key in TIER_WIRE_KEYS:
++        overrides.pop(key, None)
++    mode = logical_service_tier(agent)
++    model, provider, base_url = _agent_route(agent)
++    if mode in BOUNDED_MODES:
++        if time.monotonic() < getattr(agent, "_fast_until", 0.0):
++            from hermes_cli.models import resolve_fast_mode_overrides
++
++            overrides.update(resolve_fast_mode_overrides(model, provider=provider, base_url=base_url) or {})
++    else:
++        from hermes_cli.models import resolve_service_tier_overrides
++
++        overrides.update(resolve_service_tier_overrides(model, mode, provider=provider, base_url=base_url) or {})
++    return _apply_escalation_overlay(agent, _drop_unprovisioned_speed(agent, overrides))
++
++
++def _drop_unprovisioned_speed(agent: Any, overrides: dict[str, Any]) -> dict[str, Any]:
+     if "speed" in overrides and getattr(agent, "model", None) in (getattr(agent, "_fast_mode_unavailable_models", None) or ()):
+         overrides.pop("speed", None)
+     from agent.codex_service_tiers import negotiate_request_tier
+diff --git a/agent/service_tier_escalation.py b/agent/service_tier_escalation.py
+index e2ead12191..e5cc559e46 100644
+--- a/agent/service_tier_escalation.py
++++ b/agent/service_tier_escalation.py
+@@ -57,18 +57,15 @@ def escalation_base_tier(agent: Any):
+     raw ``request_overrides.service_tier`` (flex/priority) is the starting
+     rung so enabling escalation does not strip it before any observation.
+     """
+-    try:
+-        from agent.fast_mode import logical_service_tier_source
++    from agent.fast_mode import logical_service_tier_source
+ 
+-        mode, configured = logical_service_tier_source(agent)
+-        if configured:
+-            return mode
+-        raw = parse_service_tier(
+-            (getattr(agent, "request_overrides", None) or {}).get("service_tier")
+-        )
+-        return raw if raw in _WIRE_TIERS else None
+-    except Exception:
+-        return parse_service_tier(getattr(agent, "service_tier", None))
++    mode, configured = logical_service_tier_source(agent)
++    if configured:
++        return mode
++    raw = parse_service_tier(
++        (getattr(agent, "request_overrides", None) or {}).get("service_tier")
++    )
++    return raw if raw in _WIRE_TIERS else None
+ 
+ 
+ def _logical_base_tier(agent: Any):
+@@ -231,17 +228,14 @@ def _climb_from(base_tier: str | None, rungs: int) -> str | None:
+ 
+ def _openrouter_service_tier_route(agent: Any) -> bool:
+     """Same OpenRouter predicate used when overlaying ``service_tier`` on the wire."""
+-    try:
+-        from hermes_cli.models import _is_openrouter_service_tier_route
++    from hermes_cli.models import _is_openrouter_service_tier_route
+ 
+-        return bool(
+-            _is_openrouter_service_tier_route(
+-                getattr(agent, "provider", None),
+-                getattr(agent, "base_url", None),
+-            )
++    return bool(
++        _is_openrouter_service_tier_route(
++            getattr(agent, "provider", None),
++            getattr(agent, "base_url", None),
+         )
+-    except Exception:
+-        return False
++    )
+ 
+ 
+ def _surface_blocks_escalation(agent: Any) -> bool:
+diff --git a/agent/turn_truncation.py b/agent/turn_truncation.py
+index 0fab226bb8..2b8f1086fb 100644
+--- a/agent/turn_truncation.py
++++ b/agent/turn_truncation.py
+@@ -579,7 +579,7 @@ def continue_codex_incomplete(
+     whole budget), the next attempt goes out with reasoning off and a doubled output
+     cap — the same one-shot overrides the chat-completions length path uses — because
+     re-sending the identical budget and effort re-burns the budget identically (#90393)."""
+-    from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
++    from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE, _try_accept_logical_request
+     from agent.turn_response_check import _codex_finish_reason
+ 
+     agent._codex_incomplete_retries += 1
+diff --git a/batch_runner.py b/batch_runner.py
+index 0ab87f7d17..d3b9794618 100644
+--- a/batch_runner.py
++++ b/batch_runner.py
+@@ -263,6 +263,7 @@ def _process_single_prompt(
+             # even for callers that build a config without it.
+             platform=config.get("platform") or "batch",
+         )
++        agent._block_service_tier_escalation = True
+         try:
+             # task_id ensures each task gets its own isolated VM
+             result = agent.run_conversation(prompt, task_id=task_id)
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 3ab1393a48..142583a33c 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -310,7 +310,7 @@ class GatewayTurnMixin:
+         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
+         from gateway.run import _deep_merge_request_overrides
+         from agent.fast_mode import STATIC_TIERS
+-        from hermes_cli.models import resolve_fast_mode_overrides
++        from hermes_cli.models import resolve_service_tier_overrides
+         # Tests bind this method onto bare namespaces, so no class-level tables here.
+         runtime = {
+             k: runtime_kwargs.get(k) for k in (
+@@ -334,12 +334,9 @@ class GatewayTurnMixin:
+             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
+             route["request_overrides"] = base_request_overrides
+             return route
+-        try:
+-            overrides = resolve_fast_mode_overrides(
+-                route["model"], provider=runtime["provider"], base_url=runtime["base_url"], tier=tier,
+-            )
+-        except Exception:
+-            overrides = None
++        overrides = resolve_service_tier_overrides(
++            route["model"], tier, provider=runtime["provider"], base_url=runtime["base_url"],
++        )
+         mapped = overrides or {}
+         # Fast-mode keys (service_tier / speed) are top-level and don't collide with extra_body.
+         route["request_overrides"] = _deep_merge_request_overrides(base_request_overrides, mapped)
+diff --git a/gateway/slash_commands_model.py b/gateway/slash_commands_model.py
+index 1353c92e83..0557cab0e3 100644
+--- a/gateway/slash_commands_model.py
++++ b/gateway/slash_commands_model.py
+@@ -32,17 +32,17 @@ _FAST_SELECTIONS = {
+     "auto": ("auto", "auto", None),
+     "cold": ("cold", "cold", None),
+     "ultrafast": ("ultrafast", "ultrafast", None),
+-    "flex": ("flex", "flex", None),
++    "ultra": ("ultrafast", "ultrafast", None),
+ }
+ 
+ 
+ def _fast_route_supports(model: str, runtime: dict, tier: Optional[str] = None) -> bool:
+     """The turn's own gate (``run_turn.py::_resolve_turn_agent_config``): a tier /fast accepts must be
+     one the session's next request actually carries, so proxies and other providers are refused."""
+-    from hermes_cli.models import resolve_fast_mode_overrides
++    from hermes_cli.models import resolve_service_tier_overrides
+ 
+-    return resolve_fast_mode_overrides(
+-        model, provider=runtime.get("provider"), base_url=runtime.get("base_url"), tier=tier) is not None
++    return resolve_service_tier_overrides(
++        model, tier or "priority", provider=runtime.get("provider"), base_url=runtime.get("base_url")) is not None
+ 
+ 
+ # /reasoning display-toggle arguments -> show_reasoning value.
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index a5fad9a184..f39b208426 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -533,15 +533,15 @@ class CLIAgentSetupMixin:
+         provider. With a static `/fast` tier (fast / ultrafast) attach request_overrides;
+         auto/cold tiers are applied per request by agent.fast_mode instead."""
+         from agent.fast_mode import STATIC_TIERS
+-        from hermes_cli.models import resolve_fast_mode_overrides
++        from hermes_cli.models import resolve_service_tier_overrides
+         runtime = _current_runtime(self)
+         route = {"model": self.model, "runtime": runtime, "signature": _route_signature(self.model, runtime)}
+-        overrides = None
++        mapped = None
+         tier = getattr(self, "service_tier", None)
+         if tier in STATIC_TIERS:
+             try:
+-                overrides = resolve_fast_mode_overrides(
+-                    route["model"], provider=runtime["provider"], base_url=runtime["base_url"], tier=tier)
++                mapped = resolve_service_tier_overrides(
++                    route["model"], tier, provider=runtime["provider"], base_url=runtime["base_url"])
+             except Exception:
+                 pass
+         route["request_overrides"] = mapped
+@@ -631,7 +631,10 @@ class CLIAgentSetupMixin:
+         self._reopen_session()
+         return True
+ 
+-    def _init_agent(self, *, model_override: str | None = None, runtime_override: dict | None = None, request_overrides: dict | None = None) -> bool:
++    def _init_agent(
++        self, *, model_override: str | None = None, runtime_override: dict | None = None,
++        request_overrides: dict | None = None, framework_baked_tier_keys: dict | None = None,
++    ) -> bool:
+         """Build the agent on first use; when resuming, restore history from SQLite.
+         Returns True on success."""
+         from cli import ChatConsole, _cprint, _prepare_deferred_agent_startup, logger
+diff --git a/hermes_cli/cli_fast_mode_mixin.py b/hermes_cli/cli_fast_mode_mixin.py
+index a039471ed3..3639c18ec7 100644
+--- a/hermes_cli/cli_fast_mode_mixin.py
++++ b/hermes_cli/cli_fast_mode_mixin.py
+@@ -38,14 +38,14 @@ def handle_fast_command(cli, cmd: str):
+             return _cp(_dim_line(_t("fast.ultrafast_not_supported", model=model or "?")), usage)
+         feature_name = _t("fast.feature_ultrafast")
+     elif _FAST_TIERS[arg][0] == "flex":
+-        from hermes_cli.models import resolve_fast_mode_overrides
+-        if resolve_fast_mode_overrides(
+-            model, provider=getattr(cli, "provider", None), base_url=getattr(cli, "base_url", None),
+-            tier="flex") is None:
++        from hermes_cli.models import resolve_service_tier_overrides
++        if resolve_service_tier_overrides(
++            model, "flex", provider=getattr(cli, "provider", None), base_url=getattr(cli, "base_url", None)) is None:
+             return _cp(_dim_line(_t("fast.not_supported")), usage)
+         feature_name = _t("fast.feature_flex")
+     cli.service_tier, saved_value = _FAST_TIERS[arg]
+     _retire_agent(cli)
+     saved = explicit_global and _save("agent.service_tier", saved_value)
++    cli._service_tier_session_pinned = not saved
+     outcome = _scope_outcome(explicit_global, saved)
+     _cp(_accent_line(_t("fast.set_to", feature=feature_name, value=saved_value.upper(), scope=outcome)))
+diff --git a/hermes_cli/cli_single_query.py b/hermes_cli/cli_single_query.py
+index ddb719d544..6be4f7e366 100644
+--- a/hermes_cli/cli_single_query.py
++++ b/hermes_cli/cli_single_query.py
+@@ -546,6 +546,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool
+                     model_override=turn_route["model"],
+                     runtime_override=turn_route["runtime"],
+                     request_overrides=turn_route.get("request_overrides"),
++                    framework_baked_tier_keys=turn_route.get("framework_baked_tier_keys"),
+                 ):
+                     _configure_quiet_agent(cli.agent)
+                     if emitter is not None:
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index 07617d8eb0..445d51ba7e 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -222,9 +222,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
+     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
+                args_hint="[level|show|hide|full|clamp] [--global]",
+                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
+-    CommandDef("fast", "Fast mode — OpenAI Priority Processing / Anthropic Fast Mode (normal/fast/auto/cold/ultrafast)", "Configuration",
+-               args_hint="[normal|fast|auto|cold|ultrafast|status] [--global]",
+-               subcommands=("normal", "fast", "auto", "cold", "ultrafast", "ultra", "status", "on", "off", "--global"),
++    CommandDef("fast", "Fast mode — provider service tiers (normal/fast/flex/auto/cold/ultrafast)", "Configuration",
++               args_hint="[normal|fast|flex|auto|cold|ultrafast|status] [--global]",
++               subcommands=("normal", "fast", "flex", "auto", "cold", "ultrafast", "ultra", "status", "on", "off", "--global"),
+                desktop="advanced"),
+     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
+                cli_only=True, args_hint="[name]", argument_mode="options"),
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index feb3522729..afd3f50f42 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1261,6 +1261,25 @@ def model_supports_ultrafast(model_id: Optional[str]) -> bool:
+     return base in _OPENAI_ULTRAFAST_MODELS
+ 
+ 
++def _is_openrouter_service_tier_route(provider: Optional[str], base_url: Optional[str]) -> bool:
++    """OpenRouter carries service_tier for any model, independent of its catalog slug."""
++    if provider:
++        normalized = normalize_provider(provider)
++        if normalized == "openrouter":
++            if not base_url:
++                return True
++            from utils import base_url_host_matches
++
++            return base_url_host_matches(base_url, "openrouter.ai")
++        if normalized not in {"auto", "custom"}:
++            return False
++    if not base_url:
++        return False
++    from utils import base_url_host_matches
++
++    return base_url_host_matches(base_url, "openrouter.ai")
++
++
+ def resolve_fast_mode_overrides(
+     model_id: Optional[str], *, provider: Optional[str] = None, base_url: Optional[str] = None,
+     tier: Optional[str] = None,
+@@ -1275,15 +1294,18 @@ def resolve_fast_mode_overrides(
+     bill MORE for a setting chosen to cost less) and on Grok (xAI publishes no flex tier).
+     With ``provider``/``base_url`` the route is gated too (``fast_mode_route_supported``) so proxies
+     never see the params. Single fast-mode gate for ``/fast`` and ``agent.fast_mode`` windows."""
+-    if not model_supports_fast_mode(model_id):
+-        return None
+-    if provider or base_url:
++    openrouter = _is_openrouter_service_tier_route(provider, base_url)
++    if (provider or base_url) and not (openrouter and tier != "ultrafast"):
+         from hermes_cli.fast_mode_models import fast_mode_route_supported
+ 
+         if not fast_mode_route_supported(model_id, provider, base_url):
+             return None
+     if tier == "ultrafast":
+         return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
++    if openrouter:
++        return {"service_tier": "priority"}
++    if not model_supports_fast_mode(model_id):
++        return None
+     if tier == "flex":
+         from agent.model_metadata import is_grok_46_family
+ 
+@@ -1302,26 +1324,19 @@ def resolve_service_tier_overrides(
+ ) -> dict[str, Any] | None:
+     """Return request overrides for a normalized service-tier preference.
+ 
+-    OpenRouter accepts both ``flex`` and ``priority`` as top-level request
+-    fields for every catalog model. Elsewhere, ``flex`` is warned and ignored;
+-    ``priority`` retains the existing model-aware /fast mapping: OpenAI models
+-    receive ``service_tier`` while supported Anthropic models receive ``speed``.
++    OpenRouter accepts both ``flex`` and ``priority`` for every catalog model.
++    Elsewhere the existing model-aware mapping remains: OpenAI/Gemini receive
++    ``service_tier`` while supported Anthropic models receive ``speed``.
+     """
+     from hermes_constants import parse_service_tier
+ 
+     tier = parse_service_tier(service_tier)
+-    if tier == "flex":
+-        if _is_openrouter_service_tier_route(provider, base_url):
+-            return {"service_tier": "flex"}
+-        logger.warning(
+-            "service_tier 'flex' is OpenRouter-only; ignoring for %s",
+-            provider or base_url or "this route",
+-        )
+-        return None
+-    if tier == "priority" and _is_openrouter_service_tier_route(provider, base_url):
+-        return {"service_tier": "priority"}
+-    if tier == "priority":
+-        return resolve_fast_mode_overrides(model_id, provider=provider, base_url=base_url)
++    if tier == "ultrafast":
++        return resolve_fast_mode_overrides(model_id, provider=provider, base_url=base_url, tier=tier)
++    if tier == "flex" and _is_openrouter_service_tier_route(provider, base_url):
++        return {"service_tier": "flex"}
++    if tier in {"priority", "flex"}:
++        return resolve_fast_mode_overrides(model_id, provider=provider, base_url=base_url, tier=tier)
+     return None
+ 
+ 
+diff --git a/hermes_constants.py b/hermes_constants.py
+index 0d7ec50da9..eb3991afe0 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -1038,6 +1038,8 @@ _SERVICE_TIER_ALIASES = {
+     "fast": "priority",
+     "on": "priority",
+     "priority": "priority",
++    "ultrafast": "ultrafast",
++    "ultra": "ultrafast",
+     "flex": "flex",
+     "auto": "auto",
+     "cold": "cold",
+@@ -1047,8 +1049,8 @@ _SERVICE_TIER_ALIASES = {
+ def parse_service_tier(value) -> str | None:
+     """Normalize a configured service-tier preference.
+ 
+-    Wire values: ``priority`` (aliases ``fast`` / ``on``) and OpenRouter
+-    ``flex``. Bounded fast-mode windows: ``auto`` and ``cold`` — stored on
++    Wire values: ``priority`` (aliases ``fast`` / ``on``), ``ultrafast``,
++    and ``flex``. Bounded fast-mode windows: ``auto`` and ``cold`` — stored on
+     ``agent.service_tier`` and applied per request by ``agent.fast_mode``,
+     not sent as OpenRouter ``service_tier``. Empty, normal, and unrecognized
+     values return ``None`` so callers can keep their current default or
+diff --git a/tests/agent/test_fast_mode_auto.py b/tests/agent/test_fast_mode_auto.py
+index 8208f5009b..197545a4df 100644
+--- a/tests/agent/test_fast_mode_auto.py
++++ b/tests/agent/test_fast_mode_auto.py
+@@ -196,7 +196,9 @@ def test_fast_auto_and_cold_parse_and_slash_command(monkeypatch):
+     }
+     route_stub.base_url = "https://openrouter.ai/api/v1"
+     route_stub.provider = "openrouter"
+-    assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] is None
++    assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] == {
++        "service_tier": "priority"
++    }
+ 
+ 
+ class _FastRateLimitError(Exception):
+@@ -226,7 +228,8 @@ def test_unprovisioned_detects_only_zero_limit_fast_429s():
+ def test_unavailable_model_drops_speed_for_the_session_and_only_that_model():
+     agent = _agent(
+         service_tier="priority", model="claude-opus-5", provider="anthropic",
+-        api_mode="anthropic_messages", request_overrides={"speed": "fast"},
++        base_url="https://api.anthropic.com", api_mode="anthropic_messages",
++        request_overrides={"speed": "fast"},
+     )
+     assert fast_mode.effective_request_overrides(agent) == {"speed": "fast"}
+     assert fast_mode.mark_fast_mode_unavailable(agent) is True
+diff --git a/tests/agent/test_openai_ultrafast.py b/tests/agent/test_openai_ultrafast.py
+index 9dfe5a87f8..12e72d3558 100644
+--- a/tests/agent/test_openai_ultrafast.py
++++ b/tests/agent/test_openai_ultrafast.py
+@@ -68,8 +68,8 @@ def test_desktop_surfaces_carry_the_exact_tier_ultrafast_is_never_plain_fast():
+         assert caps[model]["fast"] and caps[model].get("ultrafast"), model
+     assert caps["gpt-6-sol"]["fast"] and not caps["gpt-6-sol"].get("ultrafast")
+     assert caps["gpt-daybreak-blue-latest-900k"]["fast"] and not caps["gpt-daybreak-blue-latest-900k"].get("ultrafast")
+-    assert not caps["openai/gpt-6-astra"]["fast"] and not caps["openai/gpt-6-astra"].get("ultrafast")  # proxy route
+-    assert not caps["openai/gpt-6.1-sol"]["fast"] and not caps["openai/gpt-6.1-sol"].get("ultrafast")
++    assert caps["openai/gpt-6-astra"]["fast"] and not caps["openai/gpt-6-astra"].get("ultrafast")
++    assert caps["openai/gpt-6.1-sol"]["fast"] and not caps["openai/gpt-6.1-sol"].get("ultrafast")
+     for params, tier in (({"fast": True, "service_tier": "ultrafast"}, "ultrafast"),
+                          ({"fast": True, "service_tier": "normal"}, ""), ({"fast": True}, "priority"), ({}, None)):
+         assert create_overrides(params)[2] == tier, params
+@@ -159,7 +159,11 @@ def test_sol_ultrafast_codex_request_uses_the_wire_slug_and_keeps_subscription_a
+     base_url = "https://chatgpt.com/backend-api/codex"
+     runtime_model = normalize_model_for_provider(model, "openai-codex")
+     overrides = resolve_fast_mode_overrides(runtime_model, provider="openai-codex", base_url=base_url, tier="ultrafast")
+-    agent = SimpleNamespace(service_tier="ultrafast", request_overrides=overrides)
++    agent = SimpleNamespace(
++        service_tier="ultrafast", request_overrides=overrides, model=runtime_model,
++        provider="openai-codex", base_url=base_url, api_mode="codex_responses",
++        _service_tier_session_pinned=True,
++    )
+     transport = ResponsesApiTransport()
+     kwargs = transport.build_kwargs(
+         runtime_model, [{"role": "user", "content": "hi"}], provider="openai-codex", base_url=base_url,
+diff --git a/tests/agent/test_service_tier_escalation.py b/tests/agent/test_service_tier_escalation.py
+index d1631f867c..3aee00a909 100644
+--- a/tests/agent/test_service_tier_escalation.py
++++ b/tests/agent/test_service_tier_escalation.py
+@@ -62,7 +62,7 @@ def _validation_agent():
+     """Minimal agent for ``validate_tool_calls`` production-home tests."""
+     agent = _agent(service_tier="flex", escalation=_enabled_cfg(consecutive=1))
+     agent.valid_tool_names = {"web_search"}
+-    agent._uniquify_tool_call_ids = lambda tcs: tcs
++    agent._uniquify_tool_call_ids = lambda tcs, **_kwargs: tcs
+     agent._repair_tool_call = lambda name: None
+     agent._invalid_tool_retries = 0
+     agent._invalid_json_retries = 0
+@@ -626,6 +626,7 @@ class TestInjectAndContinueUnlocksWire:
+             agent.log_prefix = ""
+             agent._vprint = lambda *_a, **_k: None
+             agent._emit_wait_notice = lambda *_a, **_k: None
++            agent._emit_diagnostic_wait = lambda *_a, **_k: None
+             agent._emit_interim_assistant_message = lambda *_a, **_k: None
+             agent._interim_assistant_visible_text = (
+                 lambda msg: (msg.get("content") or "") if isinstance(msg, dict) else ""
+@@ -1073,8 +1074,8 @@ class TestConstructionGates:
+         import tools.delegate_tool_config as dtc
+ 
+         _write_enabled_escalation_config()
+-        monkeypatch.setattr(dt, "_load_config", lambda: {})
+-        monkeypatch.setattr(dtc, "_load_config", lambda: {})
++        monkeypatch.setattr(dt, "_load_config", dict)
++        monkeypatch.setattr(dtc, "_load_config", dict)
+         kw = dict(
+             api_key="k",
+             base_url="https://openrouter.ai/api/v1",
+diff --git a/tests/gateway/test_fast_command.py b/tests/gateway/test_fast_command.py
+index da8013b52a..76ef360385 100644
+--- a/tests/gateway/test_fast_command.py
++++ b/tests/gateway/test_fast_command.py
+@@ -201,7 +201,7 @@ async def test_fast_flex_is_accepted_on_supported_openai_route(monkeypatch, tmp_
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_fast_flex_is_refused_on_aggregator_route(monkeypatch, tmp_path):
++async def test_fast_flex_is_accepted_on_openrouter_route(monkeypatch, tmp_path):
+     runner = _make_runner()
+     event = _make_event("/fast flex")
+     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+@@ -216,7 +216,10 @@ async def test_fast_flex_is_refused_on_aggregator_route(monkeypatch, tmp_path):
+ 
+     key = runner._session_key_for_source(event.source)
+     assert response
+-    assert key not in runner._session_service_tier_overrides
++    assert runner._session_service_tier_overrides[key] == "flex"
++    route = runner._resolve_turn_agent_config("hi", "gpt-4.1", {
++        "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"})
++    assert route["request_overrides"]["service_tier"] == "flex"
+ 
+ 
+ _ASTRA_ON_CODEX = {"model": "gpt-6-astra", "provider": "openai-codex",
+@@ -226,13 +229,12 @@ _GPT_ON_OPENROUTER = {"model": "openai/gpt-5.4", "provider": "openrouter",
+ 
+ 
+ @pytest.mark.asyncio
+-@pytest.mark.parametrize("default_model, override, command, accepted", [
++@pytest.mark.parametrize("default_model, override, command, expected_tier", [
+     # #118761: Astra picked with session /model over a default /fast can't serve.
+-    ("claude-sonnet-4-6", _ASTRA_ON_CODEX, "/fast ultrafast", True),
+-    # Converse: a fast-capable default must not admit a session route whose turns never carry the tier.
+-    ("claude-opus-5-5", _GPT_ON_OPENROUTER, "/fast fast", False),
++    ("claude-sonnet-4-6", _ASTRA_ON_CODEX, "/fast ultrafast", "ultrafast"),
++    ("claude-opus-5-5", _GPT_ON_OPENROUTER, "/fast fast", "priority"),
+ ])
+-async def test_fast_gate_follows_the_session_route(monkeypatch, tmp_path, default_model, override, command, accepted):
++async def test_fast_gate_follows_the_session_route(monkeypatch, tmp_path, default_model, override, command, expected_tier):
+     """Real fast-mode tables: /fast accepts exactly the tiers the session's next turn would send."""
+     runner = _make_runner()
+     event = _make_event(command)
+@@ -247,12 +249,8 @@ async def test_fast_gate_follows_the_session_route(monkeypatch, tmp_path, defaul
+     tier = runner._resolve_session_service_tier(session_key=session_key)
+     model, runtime = runner._resolve_session_agent_runtime(source=event.source)
+     route = runner._resolve_turn_agent_config("hi", model, runtime)
+-    if accepted:
+-        assert tier == "ultrafast" and "only available" not in response
+-        assert route["request_overrides"] == {"service_tier": "ultrafast"}
+-    else:
+-        assert "only available" in response
+-        assert session_key not in runner._session_service_tier_overrides
++    assert tier == expected_tier and "only available" not in response
++    assert route["request_overrides"] == {"service_tier": expected_tier}
+ 
+ 
+ @pytest.mark.asyncio
+@@ -311,10 +309,8 @@ def test_turn_route_injects_flex_without_changing_runtime():
+     assert route["request_overrides"] == {"service_tier": "flex"}
+ 
+ 
+-def test_turn_route_gates_flex_off_aggregator_routes():
+-    """First-party tier params never ride aggregator routes: OpenRouter strips
+-    ``service_tier`` (charging nothing) or 400s on it, so the route gate
+-    (``fast_mode_route_supported``) drops the override instead of pinning it."""
++def test_turn_route_enables_flex_for_openrouter():
++    """OpenRouter Flex is route-level and is not constrained by model catalog support."""
+     runner = _make_runner()
+     runner._service_tier = "flex"
+     runtime_kwargs = {
+@@ -327,11 +323,10 @@ def test_turn_route_gates_flex_off_aggregator_routes():
+         "credential_pool": None,
+     }
+ 
+-    # A tier-eligible model id, so it is specifically the ROUTE gate doing the
+-    # dropping here — not model eligibility.
++    # A catalog model without first-party fast-mode support still receives the OpenRouter tier.
+     route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+         runner, "hi", "gpt-4.1", runtime_kwargs
+     )
+ 
+     assert route["runtime"]["provider"] == "openrouter"
+-    assert not route["request_overrides"]
++    assert route["request_overrides"]["service_tier"] == "flex"
+diff --git a/tests/hermes_cli/test_fast_command.py b/tests/hermes_cli/test_fast_command.py
+index 047cc6f765..8ff6369cc6 100644
+--- a/tests/hermes_cli/test_fast_command.py
++++ b/tests/hermes_cli/test_fast_command.py
+@@ -71,6 +71,9 @@ class TestHandleFastCommand(unittest.TestCase):
+     def test_flex_argument_sets_flex_and_pins(self):
+         cli_mod = _import_cli()
+         stub = self._make_cli(service_tier=None)
++        stub.provider = "openrouter"
++        stub.base_url = "https://openrouter.ai/api/v1"
++        stub.agent = None
+         with (
+             patch.object(cli_mod, "_cprint"),
+             patch.object(cli_mod, "save_config_value") as mock_save,
+diff --git a/tests/test_per_model_service_tier.py b/tests/test_per_model_service_tier.py
+index 39a4a9d6e5..6f670fcc47 100644
+--- a/tests/test_per_model_service_tier.py
++++ b/tests/test_per_model_service_tier.py
+@@ -201,7 +201,7 @@ def test_delegated_child_does_not_inherit_parent_pin(tier_cfg):
+     assert fast_mode.effective_request_overrides(child)["service_tier"] == "flex"
+ 
+ 
+-def test_nous_and_first_party_ignore_flex():
++def test_nous_ignores_flex_and_first_party_keeps_native_flex():
+     nous = _agent(
+         provider="nous", base_url=_NOUS, service_tier="flex",
+         _service_tier_session_pinned=True,
+@@ -216,7 +216,7 @@ def test_nous_and_first_party_ignore_flex():
+         _service_tier_session_pinned=True,
+     )
+     wire = fast_mode.effective_request_overrides(openai)
+-    assert "service_tier" not in wire
++    assert wire["service_tier"] == "flex"
+     assert "speed" not in wire
+ 
+     portal = resolve_service_tier_overrides(
+@@ -237,6 +237,13 @@ def test_openrouter_any_catalog_model_gets_flex_and_priority():
+     assert fast_mode.effective_request_overrides(agent)["service_tier"] == "flex"
+ 
+ 
++def test_openrouter_provider_on_a_different_host_does_not_get_openrouter_tiers():
++    for tier in ("priority", "flex"):
++        assert resolve_service_tier_overrides(
++            "gpt-5.4", tier, provider="openrouter", base_url="https://proxy.example/v1",
++        ) is None
++
++
+ def test_extra_body_not_rewritten_when_tier_applied(tier_cfg):
+     extra = {"keep": 1, "provider": {"order": ["anthropic"]}}
+     agent = _agent(request_overrides={"extra_body": extra, "temperature": 0.2})
+@@ -416,8 +423,8 @@ def test_delegated_child_strips_parent_baked_tier_on_real_path(monkeypatch):
+     import tools.delegate_tool_config as dtc
+ 
+     _empty_tier_cfg(monkeypatch)
+-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+-    monkeypatch.setattr(dtc, "_load_config", lambda: {})
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dtc, "_load_config", dict)
+     kw = dict(
+         api_key="k",
+         base_url=_OPENROUTER,
+@@ -497,8 +504,8 @@ def test_delegated_child_keeps_parent_raw_when_logical_and_raw_conflict(monkeypa
+     import tools.delegate_tool_config as dtc
+ 
+     _empty_tier_cfg(monkeypatch)
+-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+-    monkeypatch.setattr(dtc, "_load_config", lambda: {})
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dtc, "_load_config", dict)
+     parent = AIAgent(
+         api_key="k",
+         base_url=_OPENROUTER,
+@@ -547,8 +554,8 @@ def test_delegated_child_keeps_explicit_delegation_tier(monkeypatch):
+     import tools.delegate_tool_config as dtc
+ 
+     _empty_tier_cfg(monkeypatch)
+-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+-    monkeypatch.setattr(dtc, "_load_config", lambda: {})
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dtc, "_load_config", dict)
+     parent = AIAgent(
+         api_key="k",
+         base_url=_OPENROUTER,
+@@ -618,8 +625,8 @@ def test_cli_fast_parent_bake_not_inherited_by_delegated_child(monkeypatch):
+     )
+ 
+     _empty_tier_cfg(monkeypatch)
+-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+-    monkeypatch.setattr(dtc, "_load_config", lambda: {})
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dtc, "_load_config", dict)
+     stub = _cli_openrouter_stub("priority")
+     route = CLIAgentSetupMixin._resolve_turn_agent_config(stub, "hi")
+     parent = AIAgent(
+@@ -676,8 +683,8 @@ def test_cli_raw_overrides_stay_unmarked_without_fast(monkeypatch):
+     from hermes_cli.cli_agent_setup_mixin import _apply_framework_tier_bake
+ 
+     _empty_tier_cfg(monkeypatch)
+-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+-    monkeypatch.setattr(dtc, "_load_config", lambda: {})
++    monkeypatch.setattr(dt, "_load_config", dict)
++    monkeypatch.setattr(dtc, "_load_config", dict)
+     parent = AIAgent(
+         api_key="k",
+         base_url=_OPENROUTER,
+diff --git a/tests/tui_gateway/test_fast_session_scope.py b/tests/tui_gateway/test_fast_session_scope.py
+index 28146d1da6..fb2928d369 100644
+--- a/tests/tui_gateway/test_fast_session_scope.py
++++ b/tests/tui_gateway/test_fast_session_scope.py
+@@ -149,9 +149,9 @@ class TestSessionInfoFastFollowsTheRoute:
+         info = self._info(model="Qwen3.8-27B-UD-Q4_K_M", provider="llamacpp", base_url="http://127.0.0.1:18434/v1")
+         assert (info["service_tier"], info["fast"]) == ("priority", False)
+ 
+-    def test_fast_capable_model_behind_a_proxy_reports_no_fast(self) -> None:
++    def test_openrouter_fast_tier_is_available_for_any_catalog_model(self) -> None:
+         info = self._info(model="gpt-5.4", provider="openrouter", base_url="https://openrouter.ai/api/v1")
+-        assert info["fast"] is False
++        assert info["fast"] is True
+ 
+     def test_pending_switch_is_judged_by_the_new_route(self) -> None:
+         """Mid-turn the agent still holds the old base URL; the pending pick decides."""
+diff --git a/tests/tui_gateway/test_service_tier_request_overrides.py b/tests/tui_gateway/test_service_tier_request_overrides.py
+index 9eb7e90e2b..4914174387 100644
+--- a/tests/tui_gateway/test_service_tier_request_overrides.py
++++ b/tests/tui_gateway/test_service_tier_request_overrides.py
+@@ -36,15 +36,15 @@ def _build(tier: str | None, model: str = "gpt-5.4", provider: str = "openai",
+            service_tier_override: str | None = None):
+     """Call _make_agent with the runtime stubbed out, returning AIAgent kwargs.
+ 
+-    The default runtime is a first-party OpenAI route: tier params are gated to the
+-    first-party endpoint that bills for them (``fast_mode_route_supported``), so an
+-    aggregator runtime deliberately yields no overrides — pinned by the gate test below.
++    The default runtime is a first-party OpenAI route. OpenRouter supports its own
++    service tiers for any catalog model; other aggregators remain gated.
+     """
+     captured = {}
+ 
+     class _Agent:
+         def __init__(self, **kwargs):
+             captured.update(kwargs)
++            captured["agent"] = self
+ 
+     resolution = MagicMock()
+     resolution.used_fallback = False
+@@ -89,6 +89,62 @@ def test_flex_from_config_reaches_request_overrides():
+     assert kwargs["request_overrides"] == {"service_tier": "flex"}
+ 
+ 
++def test_session_tier_pin_provenance_is_applied_when_agent_is_built():
++    pinned = _build("priority", service_tier_override="")
++    assert pinned["agent"]._service_tier_session_pinned is True
++    assert not pinned["agent"]._framework_baked_tier_keys
++
++    configured = _build("priority")
++    assert configured["agent"]._service_tier_session_pinned is False
++    assert configured["agent"]._framework_baked_tier_keys == frozenset({"service_tier"})
++
++
++def test_background_agent_uses_a_frozen_service_tier_snapshot(monkeypatch):
++    from tui_gateway import server
++
++    for name, value in {
++        "_load_cfg": dict, "_load_service_tier": lambda: "priority", "_resolve_model": lambda: "gpt-5.4",
++        "_cfg_max_turns": lambda *_args: 25, "_load_enabled_toolsets": lambda *_args: ["file"],
++        "_load_disabled_toolsets": list, "_load_reasoning_config": lambda *_args: None,
++        "_get_db": lambda: None,
++    }.items():
++        monkeypatch.setattr(server, name, value)
++    parent = SimpleNamespace(
++        _service_tier_session_pinned=True, service_tier="flex",
++        _framework_baked_tier_keys=frozenset({"service_tier"}),
++        request_overrides={"service_tier": "flex", "extra_body": {"keep": 1}},
++        _fallback_chain=[],
++    )
++
++    snap = server._background_tier_snapshot(parent)
++    kwargs = server._background_agent_kwargs(parent, "bg-1", snap)
++    side_agent = SimpleNamespace(**kwargs)
++    server._apply_background_tier_provenance(side_agent, parent, snap)
++
++    assert kwargs["service_tier"] == "flex"
++    assert kwargs["request_overrides"] == {"service_tier": "flex", "extra_body": {"keep": 1}}
++    assert side_agent._service_tier_session_pinned is True
++    assert side_agent._framework_baked_tier_keys == frozenset({"service_tier"})
++
++
++def test_resume_preserves_legacy_unmarked_service_tier(monkeypatch):
++    from hermes_state import SessionDB
++    from tui_gateway import server
++
++    monkeypatch.setattr(server, "_row_follows_profile", lambda _row: False)
++    monkeypatch.setattr(
++        SessionDB, "session_gateway_runtime",
++        staticmethod(lambda _row: {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}),
++    )
++    row = {
++        "id": "legacy-session", "title": "Legacy conversation", "model": "gpt-5.4",
++        "billing_provider": "openrouter",
++        "model_config": '{"service_tier":"flex","base_url":"https://openrouter.ai/api/v1"}',
++    }
++
++    assert server._stored_session_runtime_overrides(row)["service_tier_override"] == "flex"
++
++
+ def test_tier_merges_with_custom_provider_request_body():
+     """#127015 passes the resolved entry's request body through _make_agent; the tier
+     merges ON TOP of it (the two-dicts merge that PR's notes call for): the entry's
+@@ -156,15 +212,12 @@ def test_anthropic_flex_sends_nothing():
+     assert not kwargs.get("request_overrides")
+ 
+ 
+-def test_aggregator_route_gates_the_tier():
+-    """First-party tier params never ride aggregator routes: OpenRouter strips
+-    ``service_tier`` (charging nothing) or 400s on it, so the route gate drops
+-    the override instead of pinning it (parity with the gateway/CLI builders).
+-    A tier-eligible model id, so it is specifically the ROUTE gate dropping here."""
++def test_openrouter_route_accepts_catalog_wide_flex():
++    """OpenRouter accepts service tiers for any catalog model."""
+     kwargs = _build("flex", model="gpt-4.1",
+                     provider="openrouter", base_url="https://openrouter.ai/api/v1")
+ 
+-    assert not kwargs.get("request_overrides")
++    assert kwargs["request_overrides"] == {"service_tier": "flex"}
+ 
+ 
+ def test_anthropic_priority_sends_speed_not_service_tier():
+@@ -410,7 +463,7 @@ def test_config_set_flex_is_session_scoped_and_preserves_custom_body(monkeypatch
+ @pytest.mark.parametrize(
+     ("provider", "accepted"),
+     [
+-        ("openrouter", False),
++        ("openrouter", True),
+     ],
+ )
+ def test_config_set_lazy_session_validates_its_selected_route(monkeypatch, tmp_path, provider, accepted):
+@@ -480,8 +533,8 @@ def _configure_profile_route(monkeypatch, tmp_path, provider, base_url):
+     ("provider", "base_url", "override", "accepted"),
+     [
+         ("openai-api", None, None, True),
+-        ("openrouter", None, None, False),
+-        ("openrouter", None, {"model": "gpt-5.4"}, False),
++        ("openrouter", None, None, True),
++        ("openrouter", None, {"model": "gpt-5.4"}, True),
+         ("openai-api", "https://proxy.example/v1", None, False),
+     ],
+ )
+@@ -530,7 +583,7 @@ def test_config_set_lazy_flex_uses_profile_default_and_partial_override_route(
+     ("provider", "base_url", "accepted"),
+     [
+         ("openai-api", None, True),
+-        ("openrouter", None, False),
++        ("openrouter", None, True),
+         ("openai-api", "https://proxy.example/v1", False),
+     ],
+ )
+diff --git a/tools/delegate_tool_config.py b/tools/delegate_tool_config.py
+index 150f6baa15..7f85738f8a 100644
+--- a/tools/delegate_tool_config.py
++++ b/tools/delegate_tool_config.py
+@@ -443,7 +443,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+         )
+         return _credential_bundle(
+             values["model"], None, None, None, None,
+-            _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
++            _merge_request_overrides(inherited, explicit_request_overrides),
+         )
+     return _runtime_provider_credentials(values, explicit_request_overrides)
+ 
+diff --git a/tui_gateway/agent_callbacks.py b/tui_gateway/agent_callbacks.py
+index c47725d8e6..1255b1279d 100644
+--- a/tui_gateway/agent_callbacks.py
++++ b/tui_gateway/agent_callbacks.py
+@@ -391,7 +391,24 @@ def _sync_agent_fallback_with_config(sid: str, session: dict) -> None:
+     GatewayRunner._apply_fallback_chain_to_agent(agent, chain)
+ 
+ 
+-def _background_agent_kwargs(agent, task_id: str) -> dict:
++def _background_tier_snapshot(parent) -> dict:
++    """Capture session tier intent and its wire overrides once before a background build."""
++    from agent.fast_mode import TIER_WIRE_KEYS
++
++    pinned = getattr(parent, "_service_tier_session_pinned", False) is True
++    parent_tier = getattr(parent, "service_tier", None)
++    overrides = dict(getattr(parent, "request_overrides", None) or {})
++    baked = getattr(parent, "_framework_baked_tier_keys", None) or ()
++    mapped = {key: overrides[key] for key in TIER_WIRE_KEYS if key in baked and key in overrides}
++    return {
++        "service_tier": parent_tier if pinned else (parent_tier or _load_service_tier()),
++        "pinned": pinned,
++        "framework_baked_tier_keys": mapped or None,
++        "request_overrides": overrides,
++    }
++
++
++def _background_agent_kwargs(agent, task_id: str, snap=None) -> dict:
+     cfg = _load_cfg()
+ 
+     def g(name, default=None):
+@@ -417,8 +434,8 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
+         "quiet_mode": True, "verbose_logging": False,
+         "provider_require_parameters": g("provider_require_parameters", False), "session_id": task_id,
+         "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
+-        "service_tier": g("service_tier") or _load_service_tier(),
+-        "request_overrides": dict(g("request_overrides", {}) or {}),
++        "service_tier": snap["service_tier"],
++        "request_overrides": dict(snap.get("request_overrides") or {}),
+         # The side agent persists into the PARENT's store: a named-profile chat's ``bg_*`` rows
+         # belong to that profile's state.db, not the launch handle.
+         "platform": "tui", "session_db": getattr(agent, "_session_db", None) or _get_db(), "fallback_model": fallback,
+diff --git a/tui_gateway/methods_config_set.py b/tui_gateway/methods_config_set.py
+index 8ecb9fe00c..cd84431bfa 100644
+--- a/tui_gateway/methods_config_set.py
++++ b/tui_gateway/methods_config_set.py
+@@ -186,9 +186,11 @@ def _set_fast(rid, params, key, value, session):
+     nv = _FAST_WORDS.get(raw, ("normal" if current_tier in STATIC_TIERS else "fast") if raw in {"", "toggle"} else None)
+     if nv is None:
+         return _err(rid, 4002, f"unknown fast mode: {value}")
++    from hermes_constants import parse_service_tier
++    tier = parse_service_tier(nv)
+     overrides = None
+     if nv in ("fast", "ultrafast", "flex"):
+-        from hermes_cli.models import resolve_fast_mode_overrides
++        from hermes_cli.models import resolve_service_tier_overrides
+         if agent is not None:
+             target_model = getattr(agent, "model", None)
+             target_provider = getattr(agent, "provider", None)
+@@ -202,9 +204,8 @@ def _set_fast(rid, params, key, value, session):
+             target_api_key = target_runtime.get("api_key")
+         if not target_model:
+             return _err(rid, 4002, "fast mode is not available without a selected model")
+-        overrides = resolve_fast_mode_overrides(target_model, provider=target_provider,
+-                                                base_url=target_base_url,
+-                                                tier=nv if nv in ("ultrafast", "flex") else None)
++        overrides = resolve_service_tier_overrides(
++            target_model, tier, provider=target_provider, base_url=target_base_url)
+         if overrides is not None and nv == "ultrafast":
+             from agent.codex_service_tiers import ultrafast_offered
+             if not ultrafast_offered(target_model, provider=target_provider,
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 2c87444e54..872c872fe5 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -1099,9 +1099,13 @@ def _(rid, params: dict) -> dict:
+ 
+     def body():
+         from run_agent import AIAgent
+-        kwargs = _background_agent_kwargs(session["agent"], task_id)
++        live = session["agent"]
++        snap = _background_tier_snapshot(live)
++        kwargs = _background_agent_kwargs(live, task_id, snap)
+         with _side_agent_session_db(kwargs.get("session_db")) as session_db:
+             agent = AIAgent(**{**kwargs, "session_db": session_db})
++            _apply_background_tier_provenance(agent, live, snap)
++            agent._block_service_tier_escalation = True
+             try:
+                 result = agent.run_conversation(user_message=text, task_id=task_id)
+             finally:
+diff --git a/tui_gateway/methods_slash.py b/tui_gateway/methods_slash.py
+index f71d167cb5..060912b4aa 100644
+--- a/tui_gateway/methods_slash.py
++++ b/tui_gateway/methods_slash.py
+@@ -449,11 +449,11 @@ def _mirror_fast(sid, session, agent, arg) -> None:
+ 
+             resolved = None
+             if tier in STATIC_TIERS:
+-                from hermes_cli.models import resolve_fast_mode_overrides
++                from hermes_cli.models import resolve_service_tier_overrides
+                 try:
+-                    resolved = resolve_fast_mode_overrides(
+-                        getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+-                        base_url=getattr(agent, "base_url", None), tier=tier)
++                    resolved = resolve_service_tier_overrides(
++                        getattr(agent, "model", None), tier, provider=getattr(agent, "provider", None),
++                        base_url=getattr(agent, "base_url", None))
+                     if tier == "ultrafast" and resolved is not None:
+                         from agent.codex_service_tiers import ultrafast_offered
+                         if not ultrafast_offered(
+@@ -531,7 +531,7 @@ def _compute_host_slash(sid: str, session: dict, name: str, command: str) -> tup
+     return "ok", str(ack.get("output") or "")
+ 
+ 
+-def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
++def _mirror_slash_side_effects(sid: str, session: dict, command: str, output: str | None = None) -> str:
+     """Apply side effects that must also hit the gateway's live agent."""
+     parts = command.lstrip("/").split(None, 1)
+     if not parts:
+@@ -539,6 +539,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+     name, arg, agent = parts[0], (parts[1].strip() if len(parts) > 1 else ""), session.get("agent")
+     if name == "compact":  # /compact aliases /compress; the compute-host control forwards the raw alias
+         name = "compress"
++    if name == "fast" and output and output.startswith(("Unknown argument:", "not available for this model/account/route")):
++        return ""
+     if name in _MUTATES_WHILE_RUNNING:
+         if _session_uses_compute_host(session):
+             return _compute_host_slash(sid, session, name, command)[1]
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index d4176f7374..e850c4ae34 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1178,7 +1178,7 @@ def _(rid, params: dict) -> dict:
+             # send dispatch (both Desktop and TUI clients already handle {type:"send"}).
+             return _ok(rid, {"type": "send", "message": seed})
+         payload = {"output": output or "(no output)"}
+-        if warning := _mirror_slash_side_effects(sid, session, cmd):
++        if warning := _mirror_slash_side_effects(sid, session, cmd, output):
+             payload["warning"] = warning
+         if base in _SESSION_CONTROL_SLASHES:
+             _publish_session_control_snapshot(sid, session)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 462341699c..b7871bc0a1 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1708,13 +1708,12 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
+         overrides["provider_override"] = provider
+     if isinstance(reasoning_config, dict):
+         overrides["reasoning_config_override"] = reasoning_config
+-    # * Only an explicit session /fast pin is restored as an override.
+-    # Unpinned rows inherit profile resolution (per-model > global).
+-    # ``normal`` without the flag is a legacy explicit pin (never written
+-    # for unpinned inherit).
++    # New rows mark pins explicitly and omit inherited tiers. Before that marker,
++    # the stored value is the only evidence of the tier the session last used;
++    # keep restoring it to avoid a silent route/tariff change on upgrade.
+     if service_tier and (
+-        model_config.get("service_tier_session_pinned")
+-        or service_tier.lower() == "normal"
++        model_config.get("service_tier_session_pinned") is True
++        or "service_tier_session_pinned" not in model_config
+     ):
+         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+     return overrides
+@@ -2350,14 +2349,15 @@ def _fast_tier_applies(agent, model: str, provider: str, *, route_known: bool, t
+     profile-wide ``service_tier: fast`` sends nothing to a local server or a proxy, and the session must not
+     report Fast there either. ``route_known`` is False while a switch is pending: the agent's base URL still
+     belongs to the old route."""
+-    from hermes_cli.models import resolve_fast_mode_overrides
++    from hermes_cli.models import resolve_service_tier_overrides
+     base_url = None
+     if route_known and agent is not None:
+         if getattr(agent, "api_mode", None) == "anthropic_messages":
+             base_url = getattr(agent, "_anthropic_base_url", None)
+         base_url = base_url or getattr(agent, "base_url", None)
+     try:
+-        return resolve_fast_mode_overrides(model, provider=provider or None, base_url=base_url, tier=tier) is not None
++        return resolve_service_tier_overrides(
++            model, tier or "priority", provider=provider or None, base_url=base_url) is not None
+     except Exception:
+         return False
+ 
+@@ -2704,12 +2704,11 @@ def _make_agent(
+     # them here would bill a fixed tier the user never chose. The resolver's
+     # _SUPPORTED_SERVICE_TIERS whitelist backstops this, but the gate keeps intent local.
+     if _effective_tier in ("priority", "ultrafast", "flex"):
+-        from hermes_cli.models import resolve_fast_mode_overrides
++        from hermes_cli.models import resolve_service_tier_overrides
+ 
+         try:
+-            _tier_overrides = resolve_fast_mode_overrides(
+-                model, tier=_effective_tier,
+-                provider=runtime.get("provider"), base_url=runtime.get("base_url"))
++            _tier_overrides = resolve_service_tier_overrides(
++                model, _effective_tier, provider=runtime.get("provider"), base_url=runtime.get("base_url"))
+             if _effective_tier == "ultrafast" and _tier_overrides is not None:
+                 from agent.codex_service_tiers import ultrafast_offered
+                 if not ultrafast_offered(model, provider=runtime.get("provider"),
+@@ -2749,6 +2748,10 @@ def _make_agent(
+         # (service_tier / speed), so the entry's extra_body passes through untouched.
+         request_overrides={**(runtime.get("request_overrides") or {}), **(_tier_overrides or {})} or None,
+         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
++    agent._service_tier_session_pinned = service_tier_override is not None
++    from agent.fast_mode import set_framework_baked_tier_keys
++
++    set_framework_baked_tier_keys(agent, _tier_overrides)
+     if context_cwd_is_launch_artifact is None:
+         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
+     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index a04d527b77..ae8ef79757 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1957,7 +1957,7 @@ The override applies automatically everywhere: CLI startup, `hermes -p` one-shot
+ 
+ ## Fast Mode
+ 
+-Fast mode selects a provider tier: OpenAI [Priority Processing](https://openai.com/api-priority-processing/) (`service_tier: priority`), lower-cost Flex (`service_tier: flex`) on eligible OpenAI and Gemini models, and Ultrafast (`service_tier: ultrafast`) on supported OpenAI models; xAI Priority Processing on Grok 4.6; or Anthropic [Fast Mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) (`speed: fast`, Opus 4.8 / Opus 5 / Opus 5.5 only). Gemini Flex is limited to Gemini 2.5+ and is sent as a top-level `service_tier` field. The `openai` and `openai-api` providers use the first-party OpenAI endpoint. It is **off by default**.
++Fast mode selects a provider tier: OpenAI [Priority Processing](https://openai.com/api-priority-processing/) (`service_tier: priority`), lower-cost Flex (`service_tier: flex`) on eligible OpenAI and Gemini models, and Ultrafast (`service_tier: ultrafast`) on supported OpenAI models; xAI Priority Processing on Grok 4.6; or Anthropic [Fast Mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) (`speed: fast`, Opus 4.8 / Opus 5 / Opus 5.5 only). OpenRouter accepts `priority` and `flex` for any catalog model. Gemini Flex is limited to Gemini 2.5+ and is sent as a top-level `service_tier` field. The `openai` and `openai-api` providers use the first-party OpenAI endpoint. It is **off by default**.
+ 
+ ```yaml
+ agent:
+@@ -1973,13 +1973,13 @@ agent:
+ |------|---------------------------|------------|
+ | `normal` (default, `""`) | Never | Cheapest; standard latency |
+ | `fast` | Every request | Long interactive sessions where you always want speed |
+-| `flex` | Every request, on eligible OpenAI or Gemini 2.5+ routes | Lower-cost processing when latency is less important |
++| `flex` | Every request, on OpenRouter, eligible OpenAI, or Gemini 2.5+ routes | Lower-cost processing when latency is less important |
+ | `auto` | Requests in the first `fast_auto_seconds` of **every** turn | Snappy first reply; long tool loops fall back to standard pricing |
+ | `cold` | Same window, but only on the **first turn** of a session (no prior history) | Fast onboarding reply, standard pricing afterwards |
+ 
+-`/fast normal|fast|flex|ultrafast|auto|cold` switches the mode for the session (`/fast ultra` is shorthand for `ultrafast`). Flex is only offered where the selected first-party OpenAI/Gemini model and route support it; unsupported selections are not converted to a different tier. On a ChatGPT/Codex subscription, Ultrafast is offered only when your account's Codex model catalog lists it for the current model; the backend otherwise accepts the request and serves standard speed. Add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode.
++`/fast normal|fast|flex|ultrafast|auto|cold` switches the mode for the session (`/fast ultra` is shorthand for `ultrafast`). OpenRouter supports `priority` and `flex` across its catalog; first-party routes still require model/route eligibility. Unsupported selections are not converted to a different tier. On a ChatGPT/Codex subscription, Ultrafast is offered only when your account's Codex model catalog lists it for the current model; the backend otherwise accepts the request and serves standard speed. Add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode.
+ 
+-**Cost note:** premium tiers can cost more than standard (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing; Flex is the lower-cost provider option where supported. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound the premium tier to the window only. Fast params are only sent to first-party endpoints that support them; OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive a derived first-party tier.
++**Cost note:** premium tiers can cost more than standard (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing; Flex is the lower-cost provider option where supported. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound the premium tier to the window only. OpenRouter receives its documented `service_tier` values; other aggregators, proxies, and custom `base_url` routes do not receive derived first-party tier values.
+ 
+ **Prompt cache:** only the per-request parameter changes between requests; the system prompt, tools, and messages stay byte-identical. Anthropic keeps a separate prompt cache for each speed, so on Anthropic every `auto`/`cold` window boundary re-writes the conversation prefix at the new speed. For long Anthropic sessions, `fast` or `normal` keeps a single warm cache.
+ 
+@@ -1989,7 +1989,7 @@ When an Anthropic organization has no fast-mode capacity for a model (the API an
+ 
+ ### Fast tiers behind a gateway or proxy
+ 
+-The first-party-only rule is deliberate: a fast-tier parameter is a billing instruction, and Hermes only sends it to the endpoint whose price list it knows. If you run an OpenAI-compatible gateway, router, or proxy that exposes its own priority tier (its own `service_tier` value, or a differently named field), request it through that provider's `extra_body` instead of `agent.service_tier`. `extra_body` on a [named custom provider](../integrations/providers.md#named-custom-providers) is merged into **every** chat-completions request routed to that endpoint, survives gateway turns and `/fast` changes, and is dropped again when you `/model` away from the provider:
++OpenRouter's `priority` and `flex` tiers are sent through `agent.service_tier` for any catalog model. For another OpenAI-compatible gateway or proxy that exposes its own priority tier (its own `service_tier` value, or a differently named field), request it through that provider's `extra_body` instead. `extra_body` on a [named custom provider](../integrations/providers.md#named-custom-providers) is merged into **every** chat-completions request routed to that endpoint, survives gateway turns and `/fast` changes, and is dropped again when you `/model` away from the provider:
+ 
+ ```yaml
+ providers:
+@@ -2001,7 +2001,7 @@ providers:
+       service_tier: priority     # whatever tier value your gateway documents
+ ```
+ 
+-Differences from `agent.service_tier`: the tier is always on for that provider (no `auto`/`cold` window), `/fast` does not toggle it, and Hermes does not validate the value — the gateway decides what it accepts and what it bills.
++Differences from `agent.service_tier`: the custom tier is always on for that provider (no `auto`/`cold` window), `/fast` does not toggle it, and Hermes does not validate the value — the gateway decides what it accepts and what it bills.
+ 
+ #### Per-turn tier escalation (opt-in)
+ 
+-- 
+2.54.0
+

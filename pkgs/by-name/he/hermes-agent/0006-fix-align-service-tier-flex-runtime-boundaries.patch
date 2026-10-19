@@ -1,0 +1,993 @@
+From 5dfbcc6d875865793a9bfa940e67b548a6d25bdf Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Fri, 16 Oct 2026 13:04:03 +0000
+Subject: [PATCH 06/23] fix: align service tier flex runtime boundaries
+
+---
+ agent/gemini_native_adapter.py                |   2 +-
+ gateway/slash_commands_model.py               |   7 +-
+ hermes_cli/cli_commands_mixin.py              |  37 +---
+ hermes_cli/cli_fast_mode_mixin.py             |  51 +++++
+ hermes_cli/fast_mode_models.py                |  34 +++
+ hermes_cli/models.py                          |  63 +-----
+ locales/en.yaml                               |   4 +-
+ tests/agent/test_gemini_service_tier.py       |  32 +++
+ tests/gateway/test_fast_command.py            |  40 +++-
+ tests/hermes_cli/test_fast_command.py         |  15 ++
+ tests/hermes_cli/test_service_tier_flex.py    |  20 +-
+ .../test_service_tier_request_overrides.py    | 203 +++++++++++++++++-
+ tui_gateway/methods_config_set.py             |   6 +-
+ tui_gateway/methods_slash.py                  |  48 +++--
+ tui_gateway/server.py                         |   1 +
+ ui-tui/src/app/slash/commands/session.ts      |   9 +-
+ ui-tui/src/i18n/en/slashCmd/session.ts        |   2 +-
+ website/docs/user-guide/configuration.md      |   9 +-
+ 18 files changed, 449 insertions(+), 134 deletions(-)
+ create mode 100644 hermes_cli/cli_fast_mode_mixin.py
+ create mode 100644 hermes_cli/fast_mode_models.py
+
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 5371d83df0..100e65a922 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -183,7 +183,7 @@ def gemini_supports_service_tier(model: str) -> bool:
+     reject the whole request on an unexpected body field (400 INVALID_ARGUMENT).
+ 
+     Last-line defense, duplicating the eligibility gate in
+-    ``hermes_cli.models._is_google_service_tier_model`` at the adapter: a tier pinned into
++    ``hermes_cli.fast_mode_models.is_google_service_tier_model`` at the adapter: a tier pinned into
+     ``request_overrides`` at agent build survives a runtime ``/model`` switch verbatim
+     (``_apply_switched_provider_request_overrides`` keeps ``service_tier``/``speed``), so
+     without this gate a switch from a tier-eligible Gemini to an older one would hard-fail
+diff --git a/gateway/slash_commands_model.py b/gateway/slash_commands_model.py
+index cea2c26781..c08071a6ae 100644
+--- a/gateway/slash_commands_model.py
++++ b/gateway/slash_commands_model.py
+@@ -30,6 +30,7 @@ _FAST_SELECTIONS = {
+     "auto": ("auto", "auto", None),
+     "cold": ("cold", "cold", None),
+     "ultrafast": ("ultrafast", "ultrafast", None),
++    "flex": ("flex", "flex", None),
+ }
+ 
+ 
+@@ -842,6 +843,8 @@ class GatewayModelCommandsMixin:
+         if not _fast_route_supports(model, runtime):
+             return t("gateway.fast.not_supported")
+         args = FAST_ARG_ALIASES.get(args, args)
++        if args == "flex" and not _fast_route_supports(model, runtime, tier="flex"):
++            return t("gateway.fast.not_supported")
+         from agent.codex_service_tiers import ultrafast_offered
+         ultrafast = ultrafast_offered(model, provider=runtime.get("provider"), base_url=runtime.get("base_url"),
+                                       access_token=runtime.get("api_key"))
+@@ -861,7 +864,9 @@ class GatewayModelCommandsMixin:
+             title=t("gateway.fast.picker_title", mode=status),
+             choices=[
+                 {"value": v, "label": t(f"gateway.fast.choice_{v}"), "is_current": mode == v}
+-                for v in ("fast", "normal", "auto", "cold", *(("ultrafast",) if ultrafast else ()))
++                for v in ("fast", "normal", "auto", "cold",
++                          *(("ultrafast",) if ultrafast else ()),
++                          *(("flex",) if _fast_route_supports(model, runtime, tier="flex") else ()))
+             ],
+             on_choice_selected=_on_fast_choice,
+         )
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index 3a5a0e0928..079ae44fb8 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -96,12 +96,6 @@ _OFF_WORDS = {"off", "disable", "false", "0"}
+ # ``cli.commands.busy.short_<mode>`` (status line) / ``long_<mode>`` (post-set explanation).
+ _BUSY_MODES = ("queue", "steer", "interrupt")
+ 
+-# /fast argument -> (service_tier value, persisted config value)
+-_FAST_TIERS = {
+-    "fast": ("priority", "fast"), "on": ("priority", "fast"), "normal": (None, "normal"),
+-    "off": (None, "normal"), "auto": ("auto", "auto"), "cold": ("cold", "cold"),
+-    "ultrafast": ("ultrafast", "ultrafast"), "ultra": ("ultrafast", "ultrafast")}
+-
+ # /reasoning display toggles: arg -> (attr, value, headline key, follow-up note key or None);
+ # the keys resolve under ``cli.commands.reasoning.*`` at call time.
+ _REASONING_TOGGLES = {
+@@ -2342,34 +2336,9 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
+         _persist_display_choice("display.tui_status_indicator", arg, _t("indicator.label"), _t("indicator.note"))
+ 
+     def _handle_fast_command(self, cmd: str):
+-        """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode).
+-        Session-scoped by default; ``--global`` persists agent.service_tier to config.yaml
+-        (parity with /model and /reasoning)."""
+-        if not self._fast_command_available():
+-            return _cp(f"  {_t('fast.not_supported')}")
+-        # Determine the branding for the current model
+-        model = getattr(getattr(self, "agent", None), "model", None) or getattr(self, "model", None)
+-        anthropic = _probe("hermes_cli.models", "_is_anthropic_fast_model", None, model)
+-        feature_name = _t("fast.feature_generic" if anthropic is None
+-                          else "fast.feature_anthropic" if anthropic else "fast.feature_openai")
+-        raw = _command_arg(cmd)
+-        usage = _dim_line(_t("fast.usage"))
+-        if not raw or raw.lower() == "status":
+-            from agent.fast_mode import service_tier_word
+-            status = service_tier_word(self.service_tier)
+-            return _cp(_accent_line(_t("fast.status", feature=feature_name, status=status)), usage)
+-        arg, explicit_global = _split_scope_flags(raw)
+-        if arg not in _FAST_TIERS:
+-            return _cp(_dim_line(_t("shared.unknown_argument", arg=arg)), usage)
+-        if _FAST_TIERS[arg][0] == "ultrafast":
+-            if not _probe("agent.codex_service_tiers", "ultrafast_offered_for", False, self, model):
+-                return _cp(_dim_line(_t("fast.ultrafast_not_supported", model=model or "?")), usage)
+-            feature_name = _t("fast.feature_ultrafast")
+-        self.service_tier, saved_value = _FAST_TIERS[arg]
+-        _retire_agent(self)  # Force agent re-init with new service-tier config
+-        saved = explicit_global and _save("agent.service_tier", saved_value)
+-        outcome = _scope_outcome(explicit_global, saved)
+-        _cp(_accent_line(_t("fast.set_to", feature=feature_name, value=saved_value.upper(), scope=outcome)))
++        from hermes_cli.cli_fast_mode_mixin import handle_fast_command
++
++        return handle_fast_command(self, cmd)
+ 
+     # ---- /debug, /update, /voice, /wake ---------------------------------------------------
+     def _handle_debug_command(self, cmd_original: str = ""):
+diff --git a/hermes_cli/cli_fast_mode_mixin.py b/hermes_cli/cli_fast_mode_mixin.py
+new file mode 100644
+index 0000000000..a039471ed3
+--- /dev/null
++++ b/hermes_cli/cli_fast_mode_mixin.py
+@@ -0,0 +1,51 @@
++"""Interactive CLI handler for static and bounded fast modes."""
++
++from __future__ import annotations
++
++from hermes_cli.cli_agent_setup_mixin import _retire_agent
++from hermes_cli.cli_commands_session_tools import _accent_line, _command_arg, _cp, _dim_line, _probe, _save, _t
++
++
++_FAST_TIERS = {
++    "fast": ("priority", "fast"), "on": ("priority", "fast"), "normal": (None, "normal"),
++    "off": (None, "normal"), "auto": ("auto", "auto"), "cold": ("cold", "cold"),
++    "ultrafast": ("ultrafast", "ultrafast"), "ultra": ("ultrafast", "ultrafast"),
++    "flex": ("flex", "flex"),
++}
++
++
++def handle_fast_command(cli, cmd: str):
++    """Handle /fast, session-scoped unless --global persists the config value."""
++    from hermes_cli.cli_commands_mixin import _scope_outcome, _split_scope_flags
++
++    if not cli._fast_command_available():
++        return _cp(f"  {_t('fast.not_supported')}")
++    model = getattr(getattr(cli, "agent", None), "model", None) or getattr(cli, "model", None)
++    anthropic = _probe("hermes_cli.models", "_is_anthropic_fast_model", None, model)
++    feature_name = _t("fast.feature_generic" if anthropic is None
++                      else "fast.feature_anthropic" if anthropic else "fast.feature_openai")
++    raw = _command_arg(cmd)
++    usage = _dim_line(_t("fast.usage"))
++    if not raw or raw.lower() == "status":
++        from agent.fast_mode import service_tier_word
++        status = service_tier_word(cli.service_tier)
++        return _cp(_accent_line(_t("fast.status", feature=feature_name, status=status)), usage)
++    arg, explicit_global = _split_scope_flags(raw)
++    if arg not in _FAST_TIERS:
++        return _cp(_dim_line(_t("shared.unknown_argument", arg=arg)), usage)
++    if _FAST_TIERS[arg][0] == "ultrafast":
++        if not _probe("agent.codex_service_tiers", "ultrafast_offered_for", False, cli, model):
++            return _cp(_dim_line(_t("fast.ultrafast_not_supported", model=model or "?")), usage)
++        feature_name = _t("fast.feature_ultrafast")
++    elif _FAST_TIERS[arg][0] == "flex":
++        from hermes_cli.models import resolve_fast_mode_overrides
++        if resolve_fast_mode_overrides(
++            model, provider=getattr(cli, "provider", None), base_url=getattr(cli, "base_url", None),
++            tier="flex") is None:
++            return _cp(_dim_line(_t("fast.not_supported")), usage)
++        feature_name = _t("fast.feature_flex")
++    cli.service_tier, saved_value = _FAST_TIERS[arg]
++    _retire_agent(cli)
++    saved = explicit_global and _save("agent.service_tier", saved_value)
++    outcome = _scope_outcome(explicit_global, saved)
++    _cp(_accent_line(_t("fast.set_to", feature=feature_name, value=saved_value.upper(), scope=outcome)))
+diff --git a/hermes_cli/fast_mode_models.py b/hermes_cli/fast_mode_models.py
+new file mode 100644
+index 0000000000..b2ba646388
+--- /dev/null
++++ b/hermes_cli/fast_mode_models.py
+@@ -0,0 +1,34 @@
++"""Model and route eligibility for provider service tiers."""
++
++from __future__ import annotations
++
++import re
++from urllib.parse import urlparse
++
++
++def is_google_service_tier_model(model_id: str | None) -> bool:
++    """Gemini 2.5+ accepts top-level service_tier; aggregator IDs and non-Gemini models do not."""
++    base = str(model_id or "").strip().lower()
++    base = base.split("/", 1)[1] if "/" in base else base
++    base = base.split(":", 1)[0]
++    match = re.match(r"gemini-(\d+)(?:\.(\d+))?", base)
++    return bool(match) and (int(match.group(1)), int(match.group(2) or 0)) >= (2, 5)
++
++
++def fast_mode_route_supported(model_id: str | None, provider: str | None, base_url: str | None) -> bool:
++    """Only first-party providers and hosts receive their published tier parameters."""
++    from agent.model_metadata import is_grok_46_family
++    from hermes_cli.models import _is_anthropic_fast_model, normalize_provider
++
++    if _is_anthropic_fast_model(model_id):
++        allowed = {"anthropic": "api.anthropic.com"}
++    elif is_grok_46_family(str(model_id or "")):
++        allowed = {"xai": "api.x.ai"}
++    elif is_google_service_tier_model(model_id):
++        allowed = {"gemini": "generativelanguage.googleapis.com"}
++    else:
++        allowed = {"openai": "api.openai.com", "openai-api": "api.openai.com", "openai-codex": "chatgpt.com"}
++    if provider and normalize_provider(provider) not in allowed:
++        return False
++    host = (urlparse(str(base_url or "")).hostname or "").lower()
++    return not host or host in allowed.values()
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 6a02a40a36..478080cdc4 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1233,41 +1233,16 @@ def _strip_vendor_prefix(model_id: str) -> str:
+     return raw.split("/", 1)[1] if "/" in raw else raw
+ 
+ 
+-def _is_google_service_tier_model(model_id: Optional[str]) -> bool:
+-    """Return True if the model accepts Gemini's ``service_tier`` request field.
+-
+-    Gemini exposes both tiers on ``generateContent`` as a top-level body field:
+-    ``flex`` (https://ai.google.dev/gemini-api/docs/flex-inference) and
+-    ``priority``
+-    (https://ai.google.dev/gemini-api/docs/generate-content/priority-inference).
+-    Both docs list the same ``gemini-2.5+`` family, so match ``gemini-*`` by
+-    pattern rather than pinning a version list that goes stale each release.
+-    """
+-    # Two-level aggregator ids ('openrouter/google/gemini-x') deliberately do
+-    # NOT match — same reasoning as the OpenAI check. Gemma/Lyria are also not
+-    # matched: service tiers apply to Gemini only.
+-    base = _strip_vendor_prefix(str(model_id or "")).split(":")[0]
+-    match = re.match(r"gemini-(\d+)(?:\.(\d+))?", base)
+-    if not match:
+-        return False
+-    # Both tier docs list gemini-2.5 and newer. Gemini's native REST rejects
+-    # the entire request on an unexpected body field, so sending service_tier
+-    # to 1.5/2.0 would hard-fail every call for a globally-configured tier —
+-    # gate on version rather than matching gemini-* broadly.
+-    major = int(match.group(1))
+-    minor = int(match.group(2) or 0)
+-    return (major, minor) >= (2, 5)
+-
+-
+ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
+     """Return whether Hermes should expose the /fast toggle for this model."""
+     from agent.model_metadata import is_grok_46_family
++    from hermes_cli.fast_mode_models import is_google_service_tier_model
+ 
+     return (
+         _is_anthropic_fast_model(model_id)
+         or _is_openai_fast_model(model_id)
+         or is_grok_46_family(str(model_id or ""))
+-        or _is_google_service_tier_model(model_id))
++        or is_google_service_tier_model(model_id))
+ 
+ 
+ def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
+@@ -1278,31 +1253,6 @@ def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
+     return is_anthropic_fast_mode_model(model_id)
+ 
+ 
+-def _fast_mode_route_supported(
+-    model_id: Optional[str], provider: Optional[str], base_url: Optional[str]) -> bool:
+-    """Only the first-party endpoint that bills for fast mode may receive its params."""
+-    from urllib.parse import urlparse
+-
+-    from agent.model_metadata import is_grok_46_family
+-
+-    if _is_anthropic_fast_model(model_id):
+-        allowed = {"anthropic": "api.anthropic.com"}
+-    elif is_grok_46_family(str(model_id or "")):
+-        allowed = {"xai": "api.x.ai"}
+-    elif _is_google_service_tier_model(model_id):
+-        allowed = {"gemini": "generativelanguage.googleapis.com"}
+-    else:
+-        allowed = {
+-            "openai": "api.openai.com",
+-            "openai-api": "api.openai.com",
+-            "openai-codex": "chatgpt.com",
+-        }
+-    if provider and normalize_provider(provider) not in allowed:
+-        return False
+-    host = (urlparse(str(base_url or "")).hostname or "").lower()
+-    return not host or host in allowed.values()
+-
+-
+ def model_supports_ultrafast(model_id: Optional[str]) -> bool:
+     """OpenAI Ultrafast (``service_tier: "ultrafast"``) is published per model, not per family."""
+     from agent.model_metadata import strip_codex_context_variant_suffix
+@@ -1323,12 +1273,15 @@ def resolve_fast_mode_overrides(
+     tier-eligible Gemini models (a top-level ``generateContent`` field there), None on Anthropic
+     (no flex equivalent — ``speed`` is a go-faster knob, so mapping flex onto it would silently
+     bill MORE for a setting chosen to cost less) and on Grok (xAI publishes no flex tier).
+-    With ``provider``/``base_url`` the route is gated too (``_fast_mode_route_supported``) so proxies
++    With ``provider``/``base_url`` the route is gated too (``fast_mode_route_supported``) so proxies
+     never see the params. Single fast-mode gate for ``/fast`` and ``agent.fast_mode`` windows."""
+     if not model_supports_fast_mode(model_id):
+         return None
+-    if (provider or base_url) and not _fast_mode_route_supported(model_id, provider, base_url):
+-        return None
++    if provider or base_url:
++        from hermes_cli.fast_mode_models import fast_mode_route_supported
++
++        if not fast_mode_route_supported(model_id, provider, base_url):
++            return None
+     if tier == "ultrafast":
+         return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
+     if tier == "flex":
+diff --git a/locales/en.yaml b/locales/en.yaml
+index d9e709db06..5d6685a593 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -188,6 +188,7 @@ gateway:
+     choice_auto: "auto — fast for the first seconds of every turn"
+     choice_cold: "cold — fast for the first turn of a session only"
+     choice_ultrafast: "ultrafast — OpenAI Ultrafast, 6x price"
++    choice_flex: "flex — lower-cost processing on OpenAI and Gemini"
+     ultrafast_not_supported: "⚡ Ultrafast isn't available for `{model}` on this account or route."
+   footer:
+     status: "📎 Runtime footer: **{state}**\nFields: `{fields}`\nPlatform: `{platform}`"
+@@ -2755,8 +2756,9 @@ cli:
+       feature_anthropic: "Anthropic Fast Mode"
+       feature_openai: "Priority Processing"
+       feature_ultrafast: "OpenAI Ultrafast"
++      feature_flex: "Flex Processing"
+       ultrafast_not_supported: "(._.) Ultrafast isn't available for {model} on this account or route."
+-      usage: "Usage: /fast [normal|fast|auto|cold|ultrafast|status] [--global]"
++      usage: "Usage: /fast [normal|fast|flex|auto|cold|ultrafast|status] [--global]"
+       status: "{feature}: {status}"
+       set_to: "✓ {feature} set to {value} {scope}"
+     hatch:
+diff --git a/tests/agent/test_gemini_service_tier.py b/tests/agent/test_gemini_service_tier.py
+index ac3226b783..9d3b29e367 100644
+--- a/tests/agent/test_gemini_service_tier.py
++++ b/tests/agent/test_gemini_service_tier.py
+@@ -95,6 +95,38 @@ def test_build_gemini_request_drops_unsupported_tier_values():
+     assert "service_tier" not in request
+ 
+ 
++def test_switched_openai_ultrafast_is_dropped_by_gemini_wire_adapter():
++    """A stale OpenAI pin survives /model; Gemini must drop it at the wire boundary."""
++    from types import SimpleNamespace
++
++    from agent.agent_runtime_helpers import _apply_switched_provider_request_overrides
++    from agent.gemini_native_adapter import GeminiNativeClient
++
++    agent = SimpleNamespace(
++        model="gemini-2.5-flash",
++        base_url="https://generativelanguage.googleapis.com/v1beta",
++        request_overrides={"service_tier": "ultrafast"},
++        _custom_providers=[],
++    )
++    _apply_switched_provider_request_overrides(agent, "gemini")
++    posted = {}
++
++    class _HTTP:
++        def post(self, url, json=None, headers=None, timeout=None):
++            posted["body"] = json
++            return DummyResponse(payload={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
++
++    client = GeminiNativeClient(api_key="test-key", http_client=_HTTP())
++    client._create_chat_completion(
++        model=agent.model,
++        messages=[{"role": "user", "content": "hi"}],
++        service_tier=agent.request_overrides["service_tier"],
++    )
++
++    assert agent.request_overrides["service_tier"] == "ultrafast"
++    assert "service_tier" not in posted["body"]
++
++
+ def test_native_client_sends_service_tier_on_the_wire(monkeypatch):
+     """End-to-end: the tier must appear in the posted generateContent body."""
+     from agent.gemini_native_adapter import GeminiNativeClient
+diff --git a/tests/gateway/test_fast_command.py b/tests/gateway/test_fast_command.py
+index e881f734ab..6bbf811cc6 100644
+--- a/tests/gateway/test_fast_command.py
++++ b/tests/gateway/test_fast_command.py
+@@ -180,6 +180,44 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
+     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
+ 
+ 
++@pytest.mark.asyncio
++async def test_fast_flex_is_accepted_on_supported_openai_route(monkeypatch, tmp_path):
++    runner = _make_runner()
++    event = _make_event("/fast flex")
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
++    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-4.1")
++    monkeypatch.setattr(
++        runner, "_resolve_session_agent_runtime",
++        lambda **_kwargs: ("gpt-4.1", {"provider": "openai", "base_url": "https://api.openai.com/v1"}),
++    )
++    monkeypatch.setattr(runner, "_try_send_choice_picker", AsyncMock(return_value=False))
++
++    await runner._handle_fast_command(event)
++
++    key = runner._session_key_for_source(event.source)
++    assert runner._resolve_session_service_tier(session_key=key) == "flex"
++
++
++@pytest.mark.asyncio
++async def test_fast_flex_is_refused_on_aggregator_route(monkeypatch, tmp_path):
++    runner = _make_runner()
++    event = _make_event("/fast flex")
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
++    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-4.1")
++    monkeypatch.setattr(
++        runner, "_resolve_session_agent_runtime",
++        lambda **_kwargs: ("gpt-4.1", {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}),
++    )
++
++    response = await runner._handle_fast_command(event)
++
++    key = runner._session_key_for_source(event.source)
++    assert response
++    assert key not in runner._session_service_tier_overrides
++
++
+ _ASTRA_ON_CODEX = {"model": "gpt-6-astra", "provider": "openai-codex",
+                    "base_url": "https://chatgpt.com/backend-api/codex", "api_key": "***"}
+ _GPT_ON_OPENROUTER = {"model": "openai/gpt-5.4", "provider": "openrouter",
+@@ -275,7 +313,7 @@ def test_turn_route_injects_flex_without_changing_runtime():
+ def test_turn_route_gates_flex_off_aggregator_routes():
+     """First-party tier params never ride aggregator routes: OpenRouter strips
+     ``service_tier`` (charging nothing) or 400s on it, so the route gate
+-    (``_fast_mode_route_supported``) drops the override instead of pinning it."""
++    (``fast_mode_route_supported``) drops the override instead of pinning it."""
+     runner = _make_runner()
+     runner._service_tier = "flex"
+     runtime_kwargs = {
+diff --git a/tests/hermes_cli/test_fast_command.py b/tests/hermes_cli/test_fast_command.py
+index 9fa2510ebe..c2fb19ce9f 100644
+--- a/tests/hermes_cli/test_fast_command.py
++++ b/tests/hermes_cli/test_fast_command.py
+@@ -67,6 +67,21 @@ class TestHandleFastCommand(unittest.TestCase):
+         self.assertIsNone(stub.service_tier)
+         self.assertIsNone(stub.agent)
+ 
++    def test_flex_argument_selects_flex_for_supported_openai_route(self):
++        cli_mod = _import_cli()
++        stub = self._make_cli(service_tier=None)
++        stub.provider = "openai"
++        stub.base_url = "https://api.openai.com/v1"
++        stub.agent = None
++        with (
++            patch.object(cli_mod, "_cprint"),
++            patch.object(cli_mod, "save_config_value") as mock_save,
++        ):
++            cli_mod.HermesCLI._handle_fast_command(stub, "/fast flex")
++
++        self.assertEqual(stub.service_tier, "flex")
++        mock_save.assert_not_called()
++
+ class TestPriorityProcessingModels(unittest.TestCase):
+     """Verify the expanded Priority Processing model registry."""
+ 
+diff --git a/tests/hermes_cli/test_service_tier_flex.py b/tests/hermes_cli/test_service_tier_flex.py
+index 29ed414e39..044f95e86d 100644
+--- a/tests/hermes_cli/test_service_tier_flex.py
++++ b/tests/hermes_cli/test_service_tier_flex.py
+@@ -66,7 +66,7 @@ class TestGoogleServiceTier(unittest.TestCase):
+     """
+ 
+     def test_gemini_models_detected(self):
+-        from hermes_cli.models import _is_google_service_tier_model
++        from hermes_cli.fast_mode_models import is_google_service_tier_model
+ 
+         for model in [
+             "gemini-3.6-flash",
+@@ -74,10 +74,10 @@ class TestGoogleServiceTier(unittest.TestCase):
+             "gemini-2.5-pro",
+             "google/gemini-3.5-flash",
+         ]:
+-            assert _is_google_service_tier_model(model), f"{model} should be tier-eligible"
++            assert is_google_service_tier_model(model), f"{model} should be tier-eligible"
+ 
+     def test_non_gemini_models_not_detected(self):
+-        from hermes_cli.models import _is_google_service_tier_model
++        from hermes_cli.fast_mode_models import is_google_service_tier_model
+ 
+         # Two-level aggregator ids are deliberately ineligible (route-gated anyway;
+         # matching them would only expose a lying /fast toggle).
+@@ -85,7 +85,7 @@ class TestGoogleServiceTier(unittest.TestCase):
+             "gpt-5.4", "claude-opus-4-6",
+             "openrouter/openai/gpt-4.1", "openrouter/google/gemini-3.5-flash",
+         ]:
+-            assert not _is_google_service_tier_model(model), f"{model} must not be tier-eligible"
++            assert not is_google_service_tier_model(model), f"{model} must not be tier-eligible"
+ 
+ 
+ class TestFlexTier(unittest.TestCase):
+@@ -150,7 +150,7 @@ class TestGeminiVersionGate(unittest.TestCase):
+     """
+ 
+     def test_supported_versions_detected(self):
+-        from hermes_cli.models import _is_google_service_tier_model
++        from hermes_cli.fast_mode_models import is_google_service_tier_model
+ 
+         for model in [
+             "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+@@ -158,22 +158,22 @@ class TestGeminiVersionGate(unittest.TestCase):
+             "gemini-3.5-flash", "gemini-3.6-flash",
+             "google/gemini-3.5-flash",
+         ]:
+-            assert _is_google_service_tier_model(model), f"{model} should be eligible"
++            assert is_google_service_tier_model(model), f"{model} should be eligible"
+ 
+     def test_pre_2_5_models_excluded(self):
+-        from hermes_cli.models import _is_google_service_tier_model
++        from hermes_cli.fast_mode_models import is_google_service_tier_model
+ 
+         for model in [
+             "gemini-1.5-pro", "gemini-1.5-flash",
+             "gemini-2.0-flash", "google/gemini-2.0-flash-lite",
+         ]:
+-            assert not _is_google_service_tier_model(model), f"{model} predates tiers"
++            assert not is_google_service_tier_model(model), f"{model} predates tiers"
+ 
+     def test_non_gemini_google_models_excluded(self):
+-        from hermes_cli.models import _is_google_service_tier_model
++        from hermes_cli.fast_mode_models import is_google_service_tier_model
+ 
+         for model in ["gemma-3-27b", "google/gemma-2-9b", "lyria-2"]:
+-            assert not _is_google_service_tier_model(model), f"{model} is not Gemini"
++            assert not is_google_service_tier_model(model), f"{model} is not Gemini"
+ 
+ 
+ class TestTierWhitelist(unittest.TestCase):
+diff --git a/tests/tui_gateway/test_service_tier_request_overrides.py b/tests/tui_gateway/test_service_tier_request_overrides.py
+index 35d4ff0693..d4fa29364e 100644
+--- a/tests/tui_gateway/test_service_tier_request_overrides.py
++++ b/tests/tui_gateway/test_service_tier_request_overrides.py
+@@ -14,6 +14,7 @@ just the config resolution.
+ 
+ from __future__ import annotations
+ 
++from contextlib import nullcontext
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+@@ -25,15 +26,16 @@ import pytest
+ # hermes_cli.mcp_startup whose module globals nobody else reads.
+ import run_agent
+ 
+-import tui_gateway.server as server
++from tui_gateway import server
+ 
+ 
+ def _build(tier: str | None, model: str = "gpt-5.4", provider: str = "openai",
+-           base_url: str = "https://api.openai.com/v1", runtime_request_overrides=None):
++           base_url: str = "https://api.openai.com/v1", runtime_request_overrides=None,
++           service_tier_override: str | None = None):
+     """Call _make_agent with the runtime stubbed out, returning AIAgent kwargs.
+ 
+     The default runtime is a first-party OpenAI route: tier params are gated to the
+-    first-party endpoint that bills for them (``_fast_mode_route_supported``), so an
++    first-party endpoint that bills for them (``fast_mode_route_supported``), so an
+     aggregator runtime deliberately yields no overrides — pinned by the gate test below.
+     """
+     captured = {}
+@@ -73,7 +75,7 @@ def _build(tier: str | None, model: str = "gpt-5.4", provider: str = "openai",
+         patch.object(server, "_load_fallback_model", return_value=None),
+         patch.object(server, "_load_enabled_toolsets", return_value=None),
+     ):
+-        server._make_agent("sid-1", "key-1")
++        server._make_agent("sid-1", "key-1", service_tier_override=service_tier_override)
+ 
+     return captured
+ 
+@@ -111,6 +113,33 @@ def test_priority_from_config_reaches_request_overrides():
+     assert kwargs["request_overrides"] == {"service_tier": "priority"}
+ 
+ 
++def test_session_tier_override_beats_profile_config_at_build():
++    kwargs = _build("priority", service_tier_override="flex")
++
++    assert kwargs["service_tier"] == "flex"
++    assert kwargs["request_overrides"] == {"service_tier": "flex"}
++
++
++def test_explicit_session_normal_drops_profile_tier_at_build():
++    kwargs = _build("flex", service_tier_override="")
++
++    assert kwargs["service_tier"] == ""
++    assert not kwargs.get("request_overrides")
++
++
++def test_tui_build_does_not_pin_denied_codex_ultrafast(monkeypatch):
++    import agent.codex_service_tiers as codex_tiers
++    from hermes_cli import models
++
++    monkeypatch.setattr(models, "resolve_fast_mode_overrides", lambda *a, **k: {"service_tier": "ultrafast"})
++    monkeypatch.setattr(codex_tiers, "ultrafast_offered", lambda *a, **k: False)
++    kwargs = _build("ultrafast", model="gpt-6-astra", provider="openai-codex",
++                    base_url="https://chatgpt.com/backend-api/codex")
++
++    assert kwargs["service_tier"] == "ultrafast"
++    assert not kwargs.get("request_overrides")
++
++
+ def test_no_tier_sends_no_overrides():
+     kwargs = _build(None)
+ 
+@@ -216,6 +245,172 @@ def test_typed_fast_on_uses_provider_appropriate_key():
+     assert agent.request_overrides == {"speed": "fast"}
+ 
+ 
++def test_typed_fast_flex_sets_static_tier_and_preserves_extra_body():
++    agent = SimpleNamespace(
++        model="gpt-5.4",
++        provider="openai",
++        base_url="https://api.openai.com/v1",
++        service_tier="priority",
++        request_overrides={"extra_body": {"tenant": "custom"}, "service_tier": "priority"},
++    )
++
++    _mirror(agent, "flex")
++
++    assert agent.service_tier == "flex"
++    assert agent.request_overrides == {"extra_body": {"tenant": "custom"}, "service_tier": "flex"}
++
++
++def _slash_exec(monkeypatch, *, agent, command, output):
++    from tui_gateway import server
++
++    class _Worker:
++        def run(self, _command):
++            return output
++
++    session = {
++        "agent": agent,
++        "session_key": "fast-session-key",
++        "slash_worker": _Worker(),
++        "history": [],
++        "profile_home": None,
++        "create_service_tier_override": "priority",
++    }
++    server._sessions["fast-session"] = session
++    monkeypatch.setattr(server, "_session_home_scope", lambda *_args, **_kwargs: nullcontext())
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda *_args, **_kwargs: nullcontext())
++    monkeypatch.setattr(server, "_profile_skill_command", lambda *_args: False)
++    monkeypatch.setattr(server, "_plugin_command_handler", lambda *_args: None)
++    monkeypatch.setattr(server, "_live_slash_command_output", lambda *_args: None)
++    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
++    monkeypatch.setattr(server, "_emit", lambda *_args: None)
++    persisted = []
++    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda s: persisted.append(dict(s)))
++    try:
++        response = server.handle_request({
++            "id": "slash-fast",
++            "method": "slash.exec",
++            "params": {"session_id": "fast-session", "command": command},
++        })
++    finally:
++        server._sessions.pop("fast-session", None)
++    return response, session, persisted
++
++
++@pytest.mark.parametrize("word", ["ultrafast", "ultra"])
++def test_slash_exec_entitled_ultrafast_mirrors_exact_tier(monkeypatch, word):
++    import agent.codex_service_tiers as codex_tiers
++    from hermes_cli import models
++    from tui_gateway import server
++
++    agent = SimpleNamespace(
++        model="gpt-6-astra", provider="openai-codex",
++        base_url="https://chatgpt.com/backend-api/codex", api_key="token",
++        service_tier="priority", request_overrides={"service_tier": "priority", "other": "keep"},
++    )
++    monkeypatch.setattr(models, "resolve_fast_mode_overrides", lambda *a, **k: {"service_tier": "ultrafast"})
++    monkeypatch.setattr(codex_tiers, "ultrafast_offered", lambda *a, **k: True)
++
++    response, session, persisted = _slash_exec(monkeypatch, agent=agent, command=f"/fast {word}", output="set")
++
++    assert response["result"]["output"] == "set"
++    assert agent.service_tier == "ultrafast"
++    assert agent.request_overrides == {"other": "keep", "service_tier": "ultrafast"}
++    assert session["create_service_tier_override"] == "ultrafast"
++    assert persisted
++
++
++@pytest.mark.parametrize(
++    ("command", "model", "route", "ultrafast_offered"),
++    [
++        ("/fast ultra", "gpt-6-astra", "openai-codex", False),
++        ("/fast flex", "unsupported-model", "openai", True),
++        ("/fast flex", "gpt-4.1", "openrouter", True),
++    ],
++)
++def test_slash_exec_refusal_keeps_existing_tier_state(monkeypatch, command, model, route, ultrafast_offered):
++    import agent.codex_service_tiers as codex_tiers
++    from hermes_cli import models
++
++    agent = SimpleNamespace(
++        model=model, provider=route, base_url="https://openrouter.ai/api/v1" if route == "openrouter" else None,
++        api_key="token", service_tier="priority",
++        request_overrides={"service_tier": "priority", "other": "keep"},
++    )
++    session_pin = "priority"
++    # The resolver's real gate determines unsupported model/route cases; the ultrafast row
++    # reaches the entitlement check and is refused there.
++    if command.endswith("ultra"):
++        monkeypatch.setattr(models, "resolve_fast_mode_overrides", lambda *a, **k: {"service_tier": "ultrafast"})
++        monkeypatch.setattr(codex_tiers, "ultrafast_offered", lambda *a, **k: ultrafast_offered)
++    response, session, persisted = _slash_exec(
++        monkeypatch, agent=agent, command=command, output="not available for this model/account/route")
++
++    assert "not available" in response["result"]["output"]
++    assert agent.service_tier == "priority"
++    assert agent.request_overrides == {"service_tier": "priority", "other": "keep"}
++    assert session["create_service_tier_override"] == session_pin
++    assert not persisted
++
++
++def test_config_set_flex_is_session_scoped_and_preserves_custom_body(monkeypatch):
++    from tui_gateway import server
++
++    agent = SimpleNamespace(
++        model="gpt-5.4", provider="openai", base_url="https://api.openai.com/v1",
++        service_tier="priority", request_overrides={"extra_body": {"tenant": "custom"}, "speed": "stale"},
++    )
++    session = {"agent": agent, "session_key": "fast-session-key"}
++    server._sessions["fast-session"] = session
++    writes = []
++    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
++    monkeypatch.setattr(server, "_write_config_key", lambda *args: writes.append(args))
++    monkeypatch.setattr(server, "_emit", lambda *_args: None)
++    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
++
++    try:
++        response = server.handle_request({
++            "id": "config-fast-flex",
++            "method": "config.set",
++            "params": {"session_id": "fast-session", "key": "fast", "value": "flex"},
++        })
++    finally:
++        server._sessions.pop("fast-session", None)
++
++    assert response["result"]["value"] == "flex"
++    assert agent.service_tier == "flex"
++    assert agent.request_overrides == {"extra_body": {"tenant": "custom"}, "service_tier": "flex"}
++    assert session["create_service_tier_override"] == "flex"
++    assert not writes
++
++
++def test_config_set_unsupported_flex_does_not_mutate_session(monkeypatch):
++    from tui_gateway import server
++
++    agent = SimpleNamespace(
++        model="claude-opus-4-8", provider="anthropic", base_url="https://api.anthropic.com",
++        service_tier="priority", request_overrides={"speed": "fast", "extra_body": {"keep": True}},
++    )
++    session = {"agent": agent, "session_key": "fast-session-key", "create_service_tier_override": "priority"}
++    server._sessions["fast-session"] = session
++    monkeypatch.setattr(server, "_write_config_key", lambda *_args: None)
++    monkeypatch.setattr(server, "_emit", lambda *_args: None)
++    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
++
++    try:
++        response = server.handle_request({
++            "id": "config-fast-flex",
++            "method": "config.set",
++            "params": {"session_id": "fast-session", "key": "fast", "value": "flex"},
++        })
++    finally:
++        server._sessions.pop("fast-session", None)
++
++    assert response["error"]["code"] == 4002
++    assert agent.service_tier == "priority"
++    assert agent.request_overrides == {"speed": "fast", "extra_body": {"keep": True}}
++    assert session["create_service_tier_override"] == "priority"
++
++
+ def test_resolver_crash_fails_open_to_no_overrides():
+     """A resolver bug must not break agent construction: fail open to an
+     unpinned build rather than a failed one (coverage idea from #101524)."""
+diff --git a/tui_gateway/methods_config_set.py b/tui_gateway/methods_config_set.py
+index d691c1d2a8..8fed145261 100644
+--- a/tui_gateway/methods_config_set.py
++++ b/tui_gateway/methods_config_set.py
+@@ -168,7 +168,7 @@ def _set_model(rid, params, key, value, session):
+ 
+ 
+ _FAST_WORDS = {"fast": "fast", "on": "fast", "normal": "normal", "off": "normal",
+-               "auto": "auto", "cold": "cold", "ultrafast": "ultrafast", "ultra": "ultrafast"}
++               "auto": "auto", "cold": "cold", "ultrafast": "ultrafast", "ultra": "ultrafast", "flex": "flex"}
+ 
+ 
+ def _set_fast(rid, params, key, value, session):
+@@ -187,7 +187,7 @@ def _set_fast(rid, params, key, value, session):
+     if nv is None:
+         return _err(rid, 4002, f"unknown fast mode: {value}")
+     overrides = None
+-    if nv in ("fast", "ultrafast"):
++    if nv in ("fast", "ultrafast", "flex"):
+         from hermes_cli.models import resolve_fast_mode_overrides
+         if agent is not None:
+             target_model = getattr(agent, "model", None)
+@@ -198,7 +198,7 @@ def _set_fast(rid, params, key, value, session):
+             return _err(rid, 4002, "fast mode is not available without a selected model")
+         overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
+                                                 base_url=getattr(agent, "base_url", None),
+-                                                tier="ultrafast" if nv == "ultrafast" else None)
++                                                tier=nv if nv in ("ultrafast", "flex") else None)
+         if overrides is not None and nv == "ultrafast":
+             from agent.codex_service_tiers import ultrafast_offered
+             if not ultrafast_offered(target_model, provider=getattr(agent, "provider", None),
+diff --git a/tui_gateway/methods_slash.py b/tui_gateway/methods_slash.py
+index 10000c9738..de505ca452 100644
+--- a/tui_gateway/methods_slash.py
++++ b/tui_gateway/methods_slash.py
+@@ -415,32 +415,50 @@ def _mirror_personality(sid, session, agent, arg) -> None:
+ 
+ 
+ _FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None, "auto": "auto", "cold": "cold",
+-               "ultrafast": "ultrafast", "ultra": "ultrafast"}
++               "ultrafast": "ultrafast", "ultra": "ultrafast", "flex": "flex"}
+ 
+ 
+ def _mirror_fast(sid, session, agent, arg) -> None:
+     if agent:
+-        if arg.lower() in _FAST_TIERS:
+-            # Keep request_overrides in lock-step with service_tier (mirrors _set_fast in
+-            # methods_config_set): the transport emits the tier from the overrides, so setting
+-            # only service_tier would leave a session built with a configured tier still
+-            # sending it after `/fast off` (reporting normal while billing the tier), and
+-            # `/fast on` would relabel without sending. auto/cold windows are applied per
+-            # request by agent.fast_mode, so they only clear pinned tier keys.
+-            tier = _FAST_TIERS[arg.lower()]
+-            overrides = {k: v for k, v in (getattr(agent, "request_overrides", {}) or {}).items()
+-                         if k not in ("service_tier", "speed")}
+-            agent.service_tier = tier
+-            if tier == "priority":
++        words = arg.lower().split()
++        global_scope = "--global" in words
++        mode = next((word for word in words if not word.startswith("--")), "")
++        if mode in _FAST_TIERS:
++            tier = _FAST_TIERS[mode]
++            from agent.fast_mode import STATIC_TIERS
++
++            resolved = None
++            if tier in STATIC_TIERS:
+                 from hermes_cli.models import resolve_fast_mode_overrides
+                 try:
+                     resolved = resolve_fast_mode_overrides(
+                         getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+-                        base_url=getattr(agent, "base_url", None))
++                        base_url=getattr(agent, "base_url", None), tier=tier)
++                    if tier == "ultrafast" and resolved is not None:
++                        from agent.codex_service_tiers import ultrafast_offered
++                        if not ultrafast_offered(
++                            getattr(agent, "model", None), provider=getattr(agent, "provider", None),
++                            base_url=getattr(agent, "base_url", None),
++                            access_token=getattr(agent, "api_key", None)):
++                            resolved = None
+                 except Exception:
++                    logger.debug("fast-tier override resolution failed", exc_info=True)
+                     resolved = None
+-                overrides.update(resolved or {})
++                # slash.exec mirrors even a worker's textual refusal; don't let a rejected
++                # choice erase the previously accepted tier or its request overrides.
++                if resolved is None:
++                    _emit("session.info", sid, _session_info(agent, session))
++                    return
++            if global_scope:
++                session.pop("create_service_tier_override", None)
++            else:
++                session["create_service_tier_override"] = "" if tier is None else tier
++            overrides = {k: v for k, v in (getattr(agent, "request_overrides", {}) or {}).items()
++                         if k not in ("service_tier", "speed")}
++            agent.service_tier = tier
++            overrides.update(resolved or {})
+             agent.request_overrides = overrides
++            _persist_live_session_runtime(session)
+         _emit("session.info", sid, _session_info(agent, session))
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 5c4d053e85..dff75a416c 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2703,6 +2703,7 @@ def _make_agent(
+                                          access_token=runtime.get("api_key")):
+                     _tier_overrides = None
+         except Exception:
++            logger.debug("could not resolve configured service tier for TUI agent build", exc_info=True)
+             _tier_overrides = None
+     agent = AIAgent(
+         model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+diff --git a/ui-tui/src/app/slash/commands/session.ts b/ui-tui/src/app/slash/commands/session.ts
+index 8296d65348..67d1d1ed3e 100644
+--- a/ui-tui/src/app/slash/commands/session.ts
++++ b/ui-tui/src/app/slash/commands/session.ts
+@@ -26,10 +26,11 @@ const TUI_SESSION_MODEL_RE = new RegExp(`(?:^|\\s)${TUI_SESSION_MODEL_FLAG}(?:\\
+ const REASONING_SESSION_FLAGS = new Set(['--session'])
+ const REASONING_GLOBAL_FLAGS = new Set(['--global'])
+ 
+-type FastModeWord = 'fast' | 'normal' | 'ultrafast'
++type FastModeWord = 'fast' | 'normal' | 'ultrafast' | 'flex'
+ 
+ // `config.get/set fast` answer fast | ultrafast | normal (auto/cold windows read as normal here).
+-const fastModeWord = (value: unknown): FastModeWord => (value === 'fast' || value === 'ultrafast' ? value : 'normal')
++const fastModeWord = (value: unknown): FastModeWord =>
++  value === 'fast' || value === 'ultrafast' || value === 'flex' ? value : 'normal'
+ 
+ const modelValueForConfigSet = (arg: string) => {
+   const trimmed = arg.trim()
+@@ -615,7 +616,7 @@ export const sessionCommands: SlashCommand[] = [
+     name: 'fast',
+     run: (arg, ctx) => {
+       const mode = arg.trim().toLowerCase()
+-      const valid = new Set(['', 'status', 'normal', 'fast', 'ultrafast', 'on', 'off', 'toggle'])
++      const valid = new Set(['', 'status', 'normal', 'fast', 'ultrafast', 'flex', 'on', 'off', 'toggle'])
+ 
+       if (!valid.has(mode)) {
+         return ctx.transcript.sys(t('slashCmd.session.fast.usage'))
+@@ -644,7 +645,7 @@ export const sessionCommands: SlashCommand[] = [
+                 ? {
+                     ...state.info,
+                     fast: next !== 'normal',
+-                    service_tier: { fast: 'priority', normal: '', ultrafast: 'ultrafast' }[next]
++                    service_tier: { fast: 'priority', normal: '', ultrafast: 'ultrafast', flex: 'flex' }[next]
+                   }
+                 : state.info
+             }))
+diff --git a/ui-tui/src/i18n/en/slashCmd/session.ts b/ui-tui/src/i18n/en/slashCmd/session.ts
+index da4e42132c..ff7f8aa3f1 100644
+--- a/ui-tui/src/i18n/en/slashCmd/session.ts
++++ b/ui-tui/src/i18n/en/slashCmd/session.ts
+@@ -30,7 +30,7 @@ export const slashCmdSessionEn = {
+     },
+     fast: {
+       mode: (mode: string) => `fast mode: ${mode}`,
+-      usage: 'usage: /fast [normal|fast|ultrafast|status|on|off|toggle]'
++      usage: 'usage: /fast [normal|fast|flex|ultrafast|status|on|off|toggle]'
+     },
+     indicator: {
+       current: (style: string) => `indicator: ${style}`,
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 8fff6a72cb..70279fe2ff 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1956,11 +1956,11 @@ The override applies automatically everywhere: CLI startup, `hermes -p` one-shot
+ 
+ ## Fast Mode
+ 
+-Fast mode asks the provider for faster output at a premium price: OpenAI [Priority Processing](https://openai.com/api-priority-processing/) (`service_tier: priority`) and Ultrafast (`service_tier: ultrafast`) on supported OpenAI models, xAI Priority Processing on Grok 4.6, and Anthropic [Fast Mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) (`speed: fast`, Opus 4.8 / Opus 5 / Opus 5.5 only). The `openai` and `openai-api` providers use the first-party OpenAI endpoint. It is **off by default**.
++Fast mode selects a provider tier: OpenAI [Priority Processing](https://openai.com/api-priority-processing/) (`service_tier: priority`), lower-cost Flex (`service_tier: flex`) on eligible OpenAI and Gemini models, and Ultrafast (`service_tier: ultrafast`) on supported OpenAI models; xAI Priority Processing on Grok 4.6; or Anthropic [Fast Mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) (`speed: fast`, Opus 4.8 / Opus 5 / Opus 5.5 only). Gemini Flex is limited to Gemini 2.5+ and is sent as a top-level `service_tier` field. The `openai` and `openai-api` providers use the first-party OpenAI endpoint. It is **off by default**.
+ 
+ ```yaml
+ agent:
+-  service_tier: ""          # "" / normal | fast | priority | ultrafast | auto | cold
++  service_tier: ""          # "" / normal | fast | priority | flex | ultrafast | auto | cold
+   fast_auto_seconds: 60     # window for auto / cold
+ ```
+ 
+@@ -1968,12 +1968,13 @@ agent:
+ |------|---------------------------|------------|
+ | `normal` (default, `""`) | Never | Cheapest; standard latency |
+ | `fast` | Every request | Long interactive sessions where you always want speed |
++| `flex` | Every request, on eligible OpenAI or Gemini 2.5+ routes | Lower-cost processing when latency is less important |
+ | `auto` | Requests in the first `fast_auto_seconds` of **every** turn | Snappy first reply; long tool loops fall back to standard pricing |
+ | `cold` | Same window, but only on the **first turn** of a session (no prior history) | Fast onboarding reply, standard pricing afterwards |
+ 
+-`/fast normal|fast|ultrafast|auto|cold` switches the mode for the session (`/fast ultra` is shorthand for `ultrafast`). On a ChatGPT/Codex subscription, Ultrafast is offered only when your account's Codex model catalog lists it for the current model; the backend otherwise accepts the request and serves standard speed. Add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode.
++`/fast normal|fast|flex|ultrafast|auto|cold` switches the mode for the session (`/fast ultra` is shorthand for `ultrafast`). Flex is only offered where the selected first-party OpenAI/Gemini model and route support it; unsupported selections are not converted to a different tier. On a ChatGPT/Codex subscription, Ultrafast is offered only when your account's Codex model catalog lists it for the current model; the backend otherwise accepts the request and serves standard speed. Add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode.
+ 
+-**Cost note:** both providers bill fast requests at a multiplier on standard rates (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound that premium to the window only. Fast params are only sent to the first-party endpoint that supports them (`api.openai.com` / Codex subscription, `api.anthropic.com`, `api.x.ai`); OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive them in any mode.
++**Cost note:** premium tiers can cost more than standard (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing; Flex is the lower-cost provider option where supported. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound the premium tier to the window only. Fast params are only sent to first-party endpoints that support them; OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive a derived first-party tier.
+ 
+ **Prompt cache:** only the per-request parameter changes between requests; the system prompt, tools, and messages stay byte-identical. Anthropic keeps a separate prompt cache for each speed, so on Anthropic every `auto`/`cold` window boundary re-writes the conversation prefix at the new speed. For long Anthropic sessions, `fast` or `normal` keeps a single warm cache.
+ 
+-- 
+2.54.0
+

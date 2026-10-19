@@ -1,0 +1,240 @@
+From 904d2654671a331aaf452374a49f44c537731ba7 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Sat, 17 Oct 2026 03:10:17 +0000
+Subject: [PATCH 20/23] fix(aux): keep auxiliary tier config route-aware
+
+---
+ agent/fast_mode.py                         |  5 ++-
+ agent/review_engine.py                     |  6 ++-
+ hermes_cli/models_service_tiers.py         | 38 ++++++++--------
+ tests/agent/test_auxiliary_service_tier.py | 51 +++++++++++++++++++---
+ tests/agent/test_review_engine.py          | 18 ++++++++
+ tools/delegate_tool.py                     |  6 ++-
+ 6 files changed, 95 insertions(+), 29 deletions(-)
+
+diff --git a/agent/fast_mode.py b/agent/fast_mode.py
+index fb72430ac8..a88335a7da 100644
+--- a/agent/fast_mode.py
++++ b/agent/fast_mode.py
+@@ -90,11 +90,14 @@ def logical_service_tier_source(agent: Any) -> tuple[str | None, bool]:
+         raw = cfg.get("agent")
+         if isinstance(raw, dict):
+             agent_cfg = raw
+-    return resolve_service_tier_source(
++    tier, configured = resolve_service_tier_source(
+         agent_cfg,
+         str(getattr(agent, "model", "") or ""),
+         fallback=getattr(agent, "service_tier", None),
+     )
++    if getattr(agent, "_aux_service_tier", False) and tier in BOUNDED_MODES:
++        return None, True
++    return tier, configured
+ 
+ 
+ def logical_service_tier(agent: Any) -> str | None:
+diff --git a/agent/review_engine.py b/agent/review_engine.py
+index 12e81ca4cc..c3164e4333 100644
+--- a/agent/review_engine.py
++++ b/agent/review_engine.py
+@@ -177,7 +177,11 @@ def start_review(parent_agent, messages: list[dict[str, Any]], user_prompt: str
+     credentials_cfg = _load_review_credentials_cfg()
+ 
+     from tools.delegate_tool import delegate_task
+-    raw = delegate_task(goal=goal, context=context, background=True, parent_agent=parent_agent, credentials_cfg=credentials_cfg)
++    raw = delegate_task(
++        goal=goal, context=context, background=True, parent_agent=parent_agent,
++        credentials_cfg=credentials_cfg,
++        auxiliary_slot=(credentials_cfg or {}).get("_aux_slot", {}),
++    )
+     try:
+         result = json.loads(raw)
+     except Exception:
+diff --git a/hermes_cli/models_service_tiers.py b/hermes_cli/models_service_tiers.py
+index 7e8ff26ec8..5db67a811b 100644
+--- a/hermes_cli/models_service_tiers.py
++++ b/hermes_cli/models_service_tiers.py
+@@ -104,11 +104,8 @@ def apply_aux_service_tier_overrides(
+ 
+ 
+ def bind_aux_slot_service_tier(agent: Any, slot: dict[str, Any] | None) -> None:
+-    """Pin logical auxiliary tier intent, not its route-specific wire mapping."""
+-    from hermes_constants import (
+-        SERVICE_TIER_BOUNDED_VALUES, SERVICE_TIER_DISABLED_VALUES,
+-        parse_service_tier, resolve_service_tier_source,
+-    )
++    """Pin explicit slot tiers; otherwise keep global/model config live per request."""
++    from hermes_constants import SERVICE_TIER_BOUNDED_VALUES, SERVICE_TIER_DISABLED_VALUES, parse_service_tier
+     from agent.fast_mode import TIER_WIRE_KEYS, set_framework_baked_tier_keys
+ 
+     raw = None
+@@ -118,23 +115,24 @@ def bind_aux_slot_service_tier(agent: Any, slot: dict[str, Any] | None) -> None:
+         if raw in (None, ""):
+             raw = slot.get("service_tier")
+     normalized = str(raw or "").strip().lower()
+-    if raw not in (None, "") and (
++    local_configured = raw not in (None, "") and (
+         parse_service_tier(raw) is not None or normalized in SERVICE_TIER_DISABLED_VALUES
+-    ):
+-        tier, configured = parse_service_tier(raw), True
+-    else:
+-        try:
+-            from hermes_cli.config import load_config_readonly
+-            agent_cfg = load_config_readonly().get("agent") or {}
+-            tier, configured = resolve_service_tier_source(
+-                agent_cfg, getattr(agent, "model", ""),
+-                fallback=getattr(agent, "service_tier", None),
+-            )
+-        except Exception:
+-            logger.debug("Could not resolve service tier for auxiliary agent", exc_info=True)
+-            return
+-    if not configured:
++    )
++    agent._aux_service_tier = True
++    if not local_configured:
++        # Keep global/model settings live across route changes; never inherit a
++        # parent's session pin or its bounded fast-mode window.
++        agent.service_tier = None
++        agent._service_tier_session_pinned = False
++        overrides = getattr(agent, "request_overrides", None)
++        mapped = {
++            key: overrides[key]
++            for key in TIER_WIRE_KEYS
++            if isinstance(overrides, dict) and key in overrides
++        }
++        set_framework_baked_tier_keys(agent, mapped or None)
+         return
++    tier = parse_service_tier(raw)
+     # auto/cold are bounded main-session windows, not auxiliary request tiers.
+     if tier in SERVICE_TIER_BOUNDED_VALUES:
+         tier = None
+diff --git a/tests/agent/test_auxiliary_service_tier.py b/tests/agent/test_auxiliary_service_tier.py
+index 4aa1433f6b..b9d933c40a 100644
+--- a/tests/agent/test_auxiliary_service_tier.py
++++ b/tests/agent/test_auxiliary_service_tier.py
+@@ -196,25 +196,64 @@ def test_aux_global_bounded_mode_does_not_reopen_window_in_agent_turn(monkeypatc
+     )
+     bind_aux_slot_service_tier(agent, {})
+     begin_turn(agent, [])
+-    assert agent._service_tier_session_pinned is True
++    assert agent._service_tier_session_pinned is False
+     assert agent.service_tier is None
+     assert "service_tier" not in effective_request_overrides(agent)
+ 
+ 
+-def test_aux_global_model_override_is_pinned_as_logical_tier(monkeypatch):
+-    from agent.fast_mode import effective_request_overrides
++def test_aux_global_and_model_tiers_follow_current_aux_model(monkeypatch):
++    from agent.fast_mode import begin_turn, effective_request_overrides
+     from hermes_cli.models_service_tiers import bind_aux_slot_service_tier
+ 
+     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+-        "agent": {"service_tier": "priority", "service_tier_overrides": {"gpt-5.4": "flex"}},
++        "agent": {
++            "service_tier": "priority",
++            "service_tier_overrides": {
++                "gpt-5.4": "flex", "gpt-5.5": "normal", "gpt-5.6": "auto",
++            },
++        },
+     })
+     agent = SimpleNamespace(
+         request_overrides={}, model="gpt-5.4", provider="openai",
+         base_url="https://api.openai.com/v1", service_tier="priority",
+     )
+-    bind_aux_slot_service_tier(agent, None)
+-    assert agent.service_tier == "flex"
++    bind_aux_slot_service_tier(agent, {})
++    begin_turn(agent, [])
+     assert effective_request_overrides(agent)["service_tier"] == "flex"
++    for model, expected in (("gpt-5.5", None), ("gpt-5.6", None), ("gpt-5.7", "priority")):
++        agent.model = model
++        assert effective_request_overrides(agent).get("service_tier") == expected
++
++
++@pytest.mark.parametrize("bounded_tier", ["auto", "cold"])
++@pytest.mark.parametrize("review", [{}, {"provider": "openai", "model": "gpt-5.4"}])
++def test_review_bounded_tier_is_suppressed_in_final_wire_kwargs(monkeypatch, bounded_tier, review):
++    from agent.fast_mode import begin_turn
++    from hermes_cli.models_service_tiers import bind_aux_slot_service_tier
++    from run_agent import AIAgent
++
++    from agent.review_engine import _load_review_credentials_cfg
++
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
++        "agent": {"service_tier": bounded_tier}, "auxiliary": {"review": review},
++    })
++    credentials_cfg = _load_review_credentials_cfg()
++    slot = (credentials_cfg or {}).get("_aux_slot", {})
++    agent = AIAgent(
++        api_key="fixture-only", base_url="https://api.openai.com/v1",
++        provider="openai", api_mode="chat_completions",
++        model=(credentials_cfg or {}).get("model") or "gpt-5.4",
++        service_tier=bounded_tier, quiet_mode=True, skip_context_files=True,
++        skip_memory=True, save_trajectories=False, enabled_toolsets=["file"],
++    )
++    try:
++        bind_aux_slot_service_tier(agent, slot)
++        begin_turn(agent, [])
++        kwargs = agent._build_api_kwargs([{"role": "user", "content": "review"}])
++        assert "service_tier" not in kwargs
++        assert "speed" not in kwargs
++    finally:
++        agent.close()
+ 
+ 
+ def test_aux_explicit_normal_binding_stops_global_fallback(monkeypatch):
+diff --git a/tests/agent/test_review_engine.py b/tests/agent/test_review_engine.py
+index 0e213f008a..a84cdbf497 100644
+--- a/tests/agent/test_review_engine.py
++++ b/tests/agent/test_review_engine.py
+@@ -162,6 +162,24 @@ def test_start_review_passes_tier_only_slot_to_delegation(monkeypatch):
+     )
+     assert result["status"] == "dispatched"
+     assert captured["credentials_cfg"]["_aux_slot"] == {"service_tier": "priority"}
++    assert captured["auxiliary_slot"] == {"service_tier": "priority"}
++
++
++@pytest.mark.parametrize("review", [{}, {"provider": "openai", "model": "gpt-5.4"}])
++def test_start_review_passes_aux_identity_without_local_tier(monkeypatch, review):
++    captured = {}
++    monkeypatch.setattr(
++        "hermes_cli.config.load_config_readonly",
++        lambda: {"auxiliary": {"review": review}},
++    )
++
++    def fake_delegate_task(**kwargs):
++        captured.update(kwargs)
++        return json.dumps({"status": "dispatched", "delegation_id": "review-test"})
++
++    monkeypatch.setattr("tools.delegate_tool.delegate_task", fake_delegate_task)
++    start_review(_fake_parent(), [{"role": "user", "content": "review this"}])
++    assert captured["auxiliary_slot"] == {}
+ 
+ def test_load_review_credentials_cfg_missing_section(monkeypatch):
+     monkeypatch.setattr(
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 3cf16f23cd..80f6082fae 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -508,6 +508,7 @@ def delegate_task(
+     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
+     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+     credentials_cfg: Optional[dict[str, Any]] = None,
++    auxiliary_slot: Optional[dict[str, Any]] = None,
+ ) -> str:
+     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
+     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
+@@ -600,7 +601,10 @@ def delegate_task(
+     children, err = _build_children(
+         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+-        auxiliary_slot=credentials_cfg.get("_aux_slot") if credentials_cfg else None,
++        auxiliary_slot=(
++            auxiliary_slot if auxiliary_slot is not None
++            else credentials_cfg.get("_aux_slot") if credentials_cfg else None
++        ),
+     )
+     if err:
+         return tool_error(err)
+-- 
+2.54.0
+

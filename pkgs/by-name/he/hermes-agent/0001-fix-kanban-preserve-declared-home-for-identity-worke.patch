@@ -1,0 +1,662 @@
+From 76a953fbe297824bc276b380d9a966a4adca4591 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Tue, 13 Oct 2026 20:18:13 +0000
+Subject: [PATCH 01/23] fix(kanban): preserve declared home for identity
+ workers
+
+An allowlisted alias can lack a local profile directory, but spawning with -p default may redirect its worker away from the declaring HERMES_HOME. Validate the configured identity before selecting a lock, preserve the declaring home through CLI pre-parsing, and prefer an existing real profile. Invalid or malformed identity config falls back to legacy singleton locking; no database schema change.
+
+Per-lane isolation still depends on dispatch_profiles. Identity-scoped and legacy gateways use different lock namespaces; coordinate a gateway restart during rollout and after rollback.
+
+Verification on the identical source tree: focused tests 63 passed; broader Kanban tests 98 passed, 1 skipped; 10 repository guards and three fresh-CLI subprocess smoke cases passed. Pinned Ruff 0.15.10 health check was unavailable; no live rollout was performed.
+---
+ gateway/kanban_watchers.py                    |  13 +-
+ hermes_cli/config_defaults.py                 |   5 +-
+ hermes_cli/kanban_db_dispatch.py              | 158 +++++++--------
+ hermes_cli/main.py                            |   9 +-
+ .../test_kanban_dispatcher_identity_lock.py   |  81 ++++++++
+ .../test_kanban_dispatch_identity.py          | 184 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  26 ++-
+ 7 files changed, 377 insertions(+), 99 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_dispatcher_identity_lock.py
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_identity.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 0d2a832290..80a16a6463 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -237,10 +237,17 @@ class GatewayKanbanWatchersMixin:
+             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+             return None
+ 
+-        # Single-dispatcher backstop (see _acquire_singleton_lock). The lock
+-        # lives at the machine-global kanban root, so it serialises ALL gateways.
++        # Single-dispatcher backstop (see _acquire_singleton_lock). Keep the
++        # legacy global lock unless this home declares a validated identity.
+         self._kanban_dispatcher_lock_handle = None
+-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
++        from hermes_cli.kanban_db_dispatch import _dispatch_identity
++        from hermes_cli.profiles import normalize_profile_name
++
++        _identity = _dispatch_identity(normalize_profile_name)
++        _lock_name = f".dispatcher.{_identity}.lock" if _identity else ".dispatcher.lock"
++        _lock_path = _kb.kanban_home() / "kanban" / _lock_name
++        if _identity:
++            logger.info("kanban dispatcher: board identity=%r (lane lock %s)", _identity, _lock_name)
+         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+         if _lock_state == "contended":
+             logger.info("kanban dispatcher: another gateway already holds the dispatcher "
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 76b6fbd23a..8b6a43526c 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1926,9 +1926,6 @@ DEFAULT_CONFIG = {
+         # Per-profile cap: positive int = no single profile runs more than N workers even if the
+         # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
+         # when fan-out would saturate one profile's model/API quota/browser pool.
+-        # Unset (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for
+-        # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
+-        # pool while leaving other profiles idle. See #21582.
+         "max_in_progress_per_profile": None,
+         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
+         # this home's dispatcher may claim (list or comma-separated string). None = any existing
+@@ -1936,6 +1933,8 @@ DEFAULT_CONFIG = {
+         # root profile named "default", so on a shared kanban.db every home can otherwise claim
+         # default-assigned cards.
+         "dispatch_profiles": None,
++        # Shared-board identity; a missing named profile remains valid in this home's context.
++        "agent_profile_name": None,
+         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
+         # decompose <id>` or the dashboard's Decompose button.
+         "auto_decompose": True,
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 7ae9f4dcfc..1e6a9ca5d6 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -26,6 +26,8 @@ from typing import Mapping
+ from typing import Optional
+ from typing import TYPE_CHECKING
+ 
++import hermes_yaml as yaml
++
+ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+ 
+ if TYPE_CHECKING:
+@@ -1661,101 +1663,91 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
+     return bool(to) and "from" in data and data["from"] != to
+ 
+ 
+-def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
+-    """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
+-    imported (local import avoids a cycle; callers fall back to trusting the
+-    assignee).
+-
+-    When ``kanban.dispatch_profiles`` is set (#110995) the returned predicate
+-    additionally requires the assignee to be listed, fail-closed — so a card
+-    assigned to ``default`` is only claimable by homes that opted into it.
+-    Foreign assignees land in the existing ``skipped_nonspawnable`` bucket.
+-    """
+-    try:
+-        from hermes_cli.profiles import normalize_profile_name, profile_exists
+-    except Exception:
+-        return None
+-    allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+-    if allowlist is None:
+-        return profile_exists
+-
+-    def _gated(name: str) -> bool:
+-        try:
+-            canon = normalize_profile_name(name)
+-        except ValueError:
+-            return False
+-        return canon in allowlist and bool(profile_exists(name))
+-
+-    return _gated
+-
+-
+ def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
+-    """Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995).
+-
+-    On a shared board (one ``kanban.db`` mounted across several Hermes homes),
+-    every home's ``profile_exists`` returns True for ``default`` — the root
+-    profile every home has — so a card assigned to ``default`` is claimable by
+-    every home's dispatcher. A home opts out of foreign claims by declaring
+-    which assignees it may claim::
+-
+-        kanban:
+-          dispatch_profiles: ["sage", "researcher"]   # or "sage,researcher"
+-
+-    Returns ``None`` only when the key is absent from the user config (upstream
+-    behavior: any existing profile is claimable). A present value is
+-    fail-closed: an empty list, ``null`` or a bare ``dispatch_profiles:`` claims
+-    nothing. The user layer is read without the ``DEFAULT_CONFIG`` merge (whose
+-    ``None`` placeholder would make the key look present in every home), and a
+-    config read that raises also claims nothing — a corrupt config on a shared
+-    board must never widen this home's claim scope silently (#113620).
+-    """
++    """None preserves legacy behavior; configured allowlists fail closed."""
+     try:
+         from hermes_cli.config_effective import load_user_config_effective
+         kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+-    except Exception as exc:
+-        _kb._log.warning(
+-            "kanban: could not read kanban.dispatch_profiles (%s: %s) — "
+-            "this home claims no cards until the config is readable",
+-            type(exc).__name__, exc,
+-        )
++    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
++        _kb._log.warning("kanban.dispatch_profiles unavailable; this home claims no cards: %s", exc)
+         return frozenset()
+     if not isinstance(kanban, Mapping) or "dispatch_profiles" not in kanban:
+         return None
+     raw = kanban["dispatch_profiles"]
+     if raw is None or (isinstance(raw, str) and not raw.strip()):
+-        _kb._log.warning(
+-            "kanban: kanban.dispatch_profiles is present but empty — this home "
+-            "claims no cards; omit the key to allow any existing profile"
+-        )
++        _kb._log.warning("kanban.dispatch_profiles present but empty; omit the key to allow any")
+         return frozenset()
+-    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
++    names = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+     allowed = set()
+-    for n in names:
++    for name in names:
+         try:
+-            allowed.add(normalize_profile_name(n))
++            allowed.add(normalize_profile_name(str(name)))
+         except ValueError:
+             continue
+     return frozenset(allowed)
+ 
+ 
+-def dispatch_profile_allowlist_summary() -> str:
+-    """Human-readable resolution of ``kanban.dispatch_profiles`` for this home.
++def _dispatch_identity(normalize_profile_name) -> Optional[str]:
++    """Return this home's validated Kanban identity, if configured."""
++    try:
++        from hermes_cli.config_effective import load_user_config_effective
++        from hermes_cli.profiles import validate_profile_name
++        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
++    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
++        _kb._log.warning("kanban.agent_profile_name unavailable; alias disabled: %s", exc)
++        return None
++    if not isinstance(kanban, Mapping) or kanban.get("agent_profile_name") is None:
++        return None
++    raw = kanban["agent_profile_name"]
++    try:
++        identity = normalize_profile_name(raw)
++        validate_profile_name(identity)
++        return identity
++    except ValueError as exc:
++        _kb._log.warning("kanban.agent_profile_name %r is invalid; alias disabled: %s", raw, exc)
++        return None
+ 
+-    Surfaced by ``hermes kanban diagnostics`` so an operator on a shared board
+-    can see what a home believes it may claim (#113620): ``any`` (key absent),
+-    the sorted allowed names, or ``none (fail-closed: ...)``.
+-    """
++
++def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
++    """Resolve real profiles plus this home's configured identity alias."""
++    try:
++        from hermes_cli.profiles import normalize_profile_name, profile_exists
++    except ImportError:
++        return None
++    identity = _dispatch_identity(normalize_profile_name)
++
++    def _exists(name: str) -> bool:
++        if profile_exists(name):
++            return True
++        try:
++            return identity is not None and normalize_profile_name(name) == identity
++        except ValueError:
++            return False
++    allowlist = _dispatch_profile_allowlist(normalize_profile_name)
++    if allowlist is None:
++        return _exists
++
++    def _gated(name: str) -> bool:
++        try:
++            return normalize_profile_name(name) in allowlist and _exists(name)
++        except ValueError:
++            return False
++
++    return _gated
++
++
++def dispatch_profile_allowlist_summary() -> str:
++    """Describe this home's configured dispatch allowlist for diagnostics."""
+     try:
+         from hermes_cli.profiles import normalize_profile_name
+-    except Exception as exc:
++    except ImportError as exc:
+         return f"none (fail-closed: profiles unavailable: {exc})"
+     allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+     if allowlist is None:
+         return "any"
+     if allowlist:
+         return ", ".join(sorted(allowlist))
+-    return ("none (fail-closed: kanban.dispatch_profiles is present but names no valid "
+-            "profile, or the config could not be read — omit the key to allow any)")
++    return "none (fail-closed: invalid/empty allowlist or unreadable config; omit the key to allow any)"
+ 
+ 
+ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+@@ -2737,11 +2729,12 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
+         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+ 
+ 
+-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+-    cmd = [
+-        *_resolve_hermes_argv(),
+-        "-p", profile_arg,
++def _worker_argv(task: Task, profile_arg: Optional[str], hermes_home: Optional[str]) -> list[str]:
++    """Build a worker command, omitting ``-p`` when its explicit home is authoritative."""
++    cmd = [*_resolve_hermes_argv()]
++    if profile_arg is not None:
++        cmd.extend(["-p", profile_arg])
++    cmd.extend([
+         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
+         # exits 0 without doing the task → "protocol violation" every attempt.
+         "--cli",
+@@ -2749,7 +2742,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
+         # profile's shell-hook allowlist; pass --accept-hooks explicitly so
+         # configured hooks still register.
+         "--accept-hooks",
+-    ]
++    ])
+     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
+     # ambiguity if a skill name contains unusual chars.
+     for sk in task.skills or ():
+@@ -2839,7 +2832,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
+ 
+     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+ 
+-    profile_arg = normalize_profile_name(task.assignee)
++    assignee_profile = normalize_profile_name(task.assignee)
++    profile_arg = assignee_profile
+ 
+     from agent.secret_scope import is_multiplex_active
+     from tools.environments.local import _is_routed_home, build_subprocess_env, strip_launch_profile_env
+@@ -2850,6 +2844,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
+         # No profile dir (isolated test fixtures) — the CLI resolves it from
+         # HERMES_PROFILE (set below) instead.
+         profile_home = None
++        if _dispatch_identity(normalize_profile_name) == assignee_profile:
++            from hermes_constants import get_hermes_home
++
++            profile_home = str(get_hermes_home())
++            # Preserve this home's config even when it is a named profile or
++            # the root has an active_profile selection.
++            profile_arg = None
+ 
+     # Scrub for a ROUTED home, not only under multiplex: the authority test is "does this worker act
+     # for another profile", exactly as served_profile_child_env decides it (tools/environments/local.py).
+@@ -2924,9 +2925,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
+     # Board slug — defense-in-depth pin if a path is resolved without the
+     # DB / workspaces env vars.
+     env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
+-    # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
+-    # doesn't set the env var.
+-    env["HERMES_PROFILE"] = profile_arg
++    # Preserve alias identity for kanban comments; -p does not set HERMES_PROFILE.
++    env["HERMES_PROFILE"] = assignee_profile
+     # This is the grant boundary: the dispatcher assigned this new worker's task.
+     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+     env.pop(DELEGATED_CHILD_ENV_MARKER, None)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 87876c2a32..46f7247a29 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -600,14 +600,13 @@ def _apply_profile_override() -> None:
+     profile_name, consume, profile_index = _scan_profile_flag(argv)
+     from_sticky_profile = False
+ 
+-    # HERMES_HOME already set with no explicit flag: trust it only when it
+-    # points at a specific profile dir ("profiles" as immediate parent). If it
+-    # points at the hermes root (systemd hardcodes HERMES_HOME=/root/.hermes)
+-    # we must still read active_profile — the user may have run
+-    # `hermes profile use` and the gateway should honour it (#22502).
++    # Preserve named homes. A root home still honors active_profile (systemd pins
++    # the root); Kanban workers are the exception because their identity owns it.
+     hermes_home_env = os.environ.get("HERMES_HOME", "")
+     if profile_name is None and hermes_home_env and Path(hermes_home_env).parent.name == "profiles":
+         return
++    if profile_name is None and hermes_home_env and os.environ.get("HERMES_KANBAN_TASK"):
++        return
+ 
+     if (profile_name is None and not _under_gateway_supervisor(argv)
+             and not _startup_fast.is_desktop_ssh_backend_argv(argv)
+diff --git a/tests/gateway/test_kanban_dispatcher_identity_lock.py b/tests/gateway/test_kanban_dispatcher_identity_lock.py
+new file mode 100644
+index 0000000000..84ca92d3db
+--- /dev/null
++++ b/tests/gateway/test_kanban_dispatcher_identity_lock.py
+@@ -0,0 +1,81 @@
++"""Dispatcher singleton locking for shared-board identities."""
++from __future__ import annotations
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.delenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    return home
++
++
++def _boot():
++    runner = SimpleNamespace(_kanban_dispatcher_lock_handle=None)
++    return runner, GatewayKanbanWatchersMixin._kanban_dispatcher_boot(runner)
++
++
++def _write_identity(home, value):
++    (home / "config.yaml").write_text(f"kanban:\n  agent_profile_name: {value}\n", encoding="utf-8")
++
++
++def test_same_identity_serializes_gateway_dispatchers(kanban_home):
++    _write_identity(kanban_home, "sage")
++    owner, boot = _boot()
++    assert boot is not None
++    contender, contender_boot = _boot()
++    assert contender_boot is None
++    assert contender._kanban_dispatcher_lock_handle is None
++    lock_dir = Path(boot[1].kanban_home()) / "kanban"
++    assert (lock_dir / ".dispatcher.sage.lock").exists()
++    GatewayKanbanWatchersMixin._release_kanban_dispatcher_lock(owner)
++
++
++def test_distinct_identities_use_distinct_locks(kanban_home):
++    _write_identity(kanban_home, "sage")
++    first, first_boot = _boot()
++    assert first_boot is not None
++    _write_identity(kanban_home, "researcher")
++    second, second_boot = _boot()
++    assert second_boot is not None
++    lock_dir = Path(first_boot[1].kanban_home()) / "kanban"
++    assert (lock_dir / ".dispatcher.sage.lock").exists()
++    assert (lock_dir / ".dispatcher.researcher.lock").exists()
++    GatewayKanbanWatchersMixin._release_kanban_dispatcher_lock(first)
++    GatewayKanbanWatchersMixin._release_kanban_dispatcher_lock(second)
++
++
++@pytest.mark.parametrize("identity", [None, "bad/name"], ids=["unset", "invalid"])
++def test_unset_or_invalid_identity_keeps_legacy_global_lock(kanban_home, identity):
++    if identity is not None:
++        _write_identity(kanban_home, identity)
++    owner, boot = _boot()
++    assert boot is not None
++    _contender, contender_boot = _boot()
++    assert contender_boot is None
++    lock_dir = Path(boot[1].kanban_home()) / "kanban"
++    assert (lock_dir / ".dispatcher.lock").exists()
++    assert not list(lock_dir.glob(".dispatcher.*.lock"))
++    GatewayKanbanWatchersMixin._release_kanban_dispatcher_lock(owner)
++
++
++def test_malformed_config_keeps_legacy_global_lock(kanban_home, caplog):
++    (kanban_home / "config.yaml").write_text("kanban: [broken\n", encoding="utf-8")
++    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
++        owner, boot = _boot()
++    assert boot is not None
++    lock_dir = Path(boot[1].kanban_home()) / "kanban"
++    assert (lock_dir / ".dispatcher.lock").exists()
++    assert any("agent_profile_name unavailable" in record.getMessage() for record in caplog.records)
++    GatewayKanbanWatchersMixin._release_kanban_dispatcher_lock(owner)
+diff --git a/tests/hermes_cli/test_kanban_dispatch_identity.py b/tests/hermes_cli/test_kanban_dispatch_identity.py
+new file mode 100644
+index 0000000000..4dae2c4337
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_identity.py
+@@ -0,0 +1,184 @@
++"""Shared-board identity aliases must stay within their declaring Hermes home."""
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.profiles import normalize_profile_name
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    root = tmp_path / ".hermes"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return root
++
++
++@pytest.fixture(autouse=True)
++def _normal_memory_pressure(monkeypatch):
++    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
++
++
++def _task(assignee="sage"):
++    return kb.Task(
++        id="t_identity", title="identity alias", body=None, assignee=assignee,
++        status="running", priority=0, created_by="test", created_at=1,
++        started_at=None, completed_at=None, workspace_kind="dir", workspace_path=None,
++        claim_lock="lock", claim_expires=None, tenant=None, current_run_id=1,
++    )
++
++
++def _spawn(monkeypatch, task, workspace):
++    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
++    captured = {}
++
++    class FakeProc:
++        pid = 4242
++
++    def fake_popen(cmd, *args, **kwargs):
++        captured["cmd"] = list(cmd)
++        captured["env"] = dict(kwargs.get("env") or {})
++        return FakeProc()
++
++    monkeypatch.setattr(subprocess, "Popen", fake_popen)
++    kbd._default_spawn(task, str(workspace))
++    return captured
++
++
++def test_identity_claims_allowlisted_missing_profile(kanban_home):
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  agent_profile_name: sage\n  dispatch_profiles: [sage]\n", encoding="utf-8",
++    )
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="own card", assignee="sage")
++        assert kbd.has_spawnable_ready(conn)
++        result = kbd.dispatch_once(conn, dry_run=True)
++    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [tid]
++    assert not result.skipped_nonspawnable
++
++
++def test_identity_alias_works_without_allowlist(kanban_home):
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  agent_profile_name: sage\n", encoding="utf-8",
++    )
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="own card", assignee="sage")
++        assert kbd.has_spawnable_ready(conn)
++        result = kbd.dispatch_once(conn, dry_run=True)
++    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [tid]
++    assert not result.skipped_nonspawnable
++
++
++def test_allowlist_remains_authoritative_for_identity(kanban_home):
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  agent_profile_name: sage\n  dispatch_profiles: [researcher]\n", encoding="utf-8",
++    )
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="foreign card", assignee="sage")
++        assert not kbd.has_spawnable_ready(conn)
++        result = kbd.dispatch_once(conn, dry_run=True)
++    assert result.spawned == []
++    assert result.skipped_nonspawnable == [tid]
++
++
++def test_path_like_identity_is_rejected_before_claim_and_spawn(kanban_home, caplog):
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  agent_profile_name: bad/name\n  dispatch_profiles: [bad/name]\n", encoding="utf-8",
++    )
++    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
++        assert kbd._dispatch_identity(normalize_profile_name) is None
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="invalid identity", assignee="bad/name")
++        assert not kbd.has_spawnable_ready(conn)
++        result = kbd.dispatch_once(conn, dry_run=True)
++    assert result.spawned == []
++    assert result.skipped_nonspawnable == [tid]
++    assert any("agent_profile_name" in record.getMessage() and "invalid" in record.getMessage()
++               for record in caplog.records)
++
++
++def test_identity_config_read_failure_disables_alias(kanban_home, monkeypatch, caplog):
++    from hermes_cli import config_effective
++
++    def fail_read(**_kwargs):
++        raise OSError("config unavailable")
++
++    monkeypatch.setattr(config_effective, "load_user_config_effective", fail_read)
++    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
++        assert kbd._dispatch_identity(normalize_profile_name) is None
++    assert any("agent_profile_name unavailable" in record.getMessage() for record in caplog.records)
++
++
++def test_malformed_config_disables_alias_and_claims(kanban_home, caplog):
++    (kanban_home / "config.yaml").write_text("kanban: [broken\n", encoding="utf-8")
++    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
++        assert kbd._dispatch_identity(normalize_profile_name) is None
++        assert kbd._dispatch_profile_allowlist(normalize_profile_name) == frozenset()
++        with kbc.connect() as conn:
++            tid = kb.create_task(conn, title="closed config", assignee="default")
++            assert not kbd.has_spawnable_ready(conn)
++            result = kbd.dispatch_once(conn, dry_run=True)
++    assert result.spawned == []
++    assert result.skipped_nonspawnable == [tid]
++    assert any("agent_profile_name unavailable" in record.getMessage() for record in caplog.records)
++    assert any("dispatch_profiles unavailable" in record.getMessage() for record in caplog.records)
++
++
++@pytest.mark.parametrize("named_home", [False, True], ids=["root-home", "named-home"])
++def test_alias_worker_preserves_declaring_home_and_real_cli_preparse(
++    tmp_path, monkeypatch, kanban_home, named_home,
++):
++    owner = kanban_home / "profiles" / "owner" if named_home else kanban_home
++    if named_home:
++        owner.mkdir(parents=True)
++    (owner / "config.yaml").write_text(
++        "kanban:\n  agent_profile_name: sage\n", encoding="utf-8",
++    )
++    (kanban_home / "active_profile").write_text("other", encoding="utf-8")
++    other = kanban_home / "profiles" / "other"
++    other.mkdir(parents=True)
++    (other / "config.yaml").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setenv("HERMES_HOME", str(owner))
++
++    workspace = tmp_path / "workspace"
++    workspace.mkdir()
++    captured = _spawn(monkeypatch, _task(), workspace)
++    cmd = captured["cmd"]
++    assert "-p" not in cmd
++    assert captured["env"]["HERMES_HOME"] == str(owner)
++    assert captured["env"]["HERMES_PROFILE"] == "sage"
++
++    # Exercise the actual CLI pre-parser on the exact child argv: neither the
++    # root's active_profile nor the alias may move a worker out of its home.
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_identity")
++    monkeypatch.setattr(sys, "argv", cmd)
++    from hermes_cli.main import _apply_profile_override
++
++    _apply_profile_override()
++    assert os.environ["HERMES_HOME"] == str(owner)
++
++
++def test_existing_profile_directory_takes_priority(kanban_home, monkeypatch, tmp_path):
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  agent_profile_name: sage\n", encoding="utf-8",
++    )
++    profile = kanban_home / "profiles" / "sage"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
++    workspace = tmp_path / "workspace"
++    workspace.mkdir()
++
++    captured = _spawn(monkeypatch, _task(), workspace)
++    cmd = captured["cmd"]
++    assert cmd[cmd.index("-p") + 1] == "sage"
++    assert captured["env"]["HERMES_HOME"] == str(profile)
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 66e7224230..34f8caf4fa 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -332,6 +332,9 @@ kanban:
+                                    # claims. Fail-closed: an empty list, `null`
+                                    # or a bare `dispatch_profiles:` claims
+                                    # nothing, and so does an unreadable config.
++  # agent_profile_name: sage        # optional shared-board identity for this home;
++                                   # if profiles/sage is absent, workers run in
++                                   # this home. A real profile dir takes priority.
+ ```
+ 
+ Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
+@@ -378,15 +381,19 @@ a gateway-embedded dispatcher AND a standalone daemon against the same
+ 
+ Mounting one `kanban.db` in several Hermes homes (containers, fleet hosts) shares
+ the board, but profile names are home-local and every home has a root profile
+-named `default` — so `default` collides by construction. The dispatcher's spawn
+-gate checks `profile_exists(assignee)` against the *claiming* home, and without
+-further configuration every home's dispatcher considers a card assigned to
+-`default` claimable, so the wrong home can claim and run it. Either give each
+-home unique profile names and never assign cards to `default` on a shared board,
+-or set `kanban.dispatch_profiles` per home to declare exactly which assignees
+-that home may claim — anything else lands in the dispatcher's
+-`skipped_nonspawnable` bucket instead of spawning, and no longer counts as
+-spawnable work for the gateway's wake-up probe.
++named `default` — so `default` collides by construction. Set a unique
++`kanban.agent_profile_name` on each home to declare its board identity, and set
++`kanban.dispatch_profiles` to that home's allowed assignees. The identity lets
++the home run its own lane even when `profiles/<identity>` is absent; workers
++stay in the declaring home, while a real profile directory with that name takes
++priority. The allowlist remains authoritative. Without an allowlist, existing
++profiles remain claimable according to the legacy behavior, so the identity
++alone does not provide per-lane isolation. Invalid identities fail closed and
++are logged; they do not affect the dispatcher lock path. Apply the setting to
++all homes sharing a board and restart their gateways together: older gateways
++still use the legacy global lock. Removing the identity and restarting returns
++the home to its ordinary profile-existence gate and the legacy global dispatcher
++lock; no board data is migrated.
+ 
+ ### Idempotent create (for automation / webhooks)
+ 
+@@ -1013,6 +1020,7 @@ All commands are also available as a slash command in the interactive CLI and in
+ | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+ | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+ | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
++| `kanban.agent_profile_name` | unset | Optional validated identity of this home on a shared board. If the matching profile directory is absent, that lane can still be claimed and workers run in the declaring home; an existing profile directory wins. With the key set, gateways use an identity-scoped dispatcher lock; unset keeps the legacy global lock. Pair with `dispatch_profiles` to restrict claims—this key alone does not isolate lanes. |
+ | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
+ | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+ 
+-- 
+2.54.0
+

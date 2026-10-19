@@ -1,0 +1,121 @@
+From b48389c8d274f4614c4a8a08df3d26479a370488 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Sat, 17 Oct 2026 03:53:12 +0000
+Subject: [PATCH 22/23] fix(curator): preserve auxiliary tier on fallback
+
+---
+ agent/curator.py            |  7 +++--
+ tests/agent/test_curator.py | 56 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/agent/curator.py b/agent/curator.py
+index 102f3b580d..f686b4a847 100644
+--- a/agent/curator.py
++++ b/agent/curator.py
+@@ -1063,22 +1063,24 @@ def _resolve_review_provider() -> tuple:
+     (HTTP 400 "No models provided"). Never raises."""
+     rp: dict[str, Any] = {}
+     overrides, provider, model_name, binding = {}, None, "", None
++    slot = None
+     try:
+         from hermes_cli.config import load_config_readonly
+         from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides, bind_aux_slot_service_tier
+         from hermes_cli.runtime_provider import resolve_runtime_provider
+         cfg = load_config_readonly()
++        slot = _subdict(cfg, "auxiliary", "curator")
+         binding = _resolve_review_runtime(cfg)
+         model_name = binding.model
+         rp = resolve_runtime_provider(
+             requested=binding.provider, target_model=binding.model,
+             explicit_api_key=binding.explicit_api_key, explicit_base_url=binding.explicit_base_url,
+         )
++        rp["_aux_slot"] = slot
+         provider = rp.get("provider") or binding.provider
+         overrides = _merge_request_overrides(rp.get("request_overrides"), binding.request_overrides.get("extra_body"))
+         if isinstance(rp.get("model"), str) and rp["model"].strip():
+             model_name = rp["model"].strip()
+-        slot = _subdict(cfg, "auxiliary", "curator")
+         overrides = apply_aux_service_tier_overrides(
+             overrides,
+             slot,
+@@ -1087,8 +1089,9 @@ def _resolve_review_provider() -> tuple:
+             base_url=rp.get("base_url") or binding.explicit_base_url,
+             task="curator",
+         )
+-        rp["_aux_slot"] = slot
+     except Exception as e:
++        if slot is not None:
++            rp["_aux_slot"] = slot
+         logger.warning("curator: auxiliary.curator.provider '%s' (model '%s') could not be resolved: %s — the review "
+                        "runs on the main model instead", getattr(binding, "provider", None), model_name, e)
+     return rp, model_name, provider, overrides
+diff --git a/tests/agent/test_curator.py b/tests/agent/test_curator.py
+index 3fc7e895a8..0c7ec925b5 100644
+--- a/tests/agent/test_curator.py
++++ b/tests/agent/test_curator.py
+@@ -948,6 +948,62 @@ def test_curator_final_api_kwargs_extra_body_beats_slot_tier(monkeypatch):
+         agent.close()
+ 
+ 
++@pytest.mark.parametrize("resolver_fails", [False, True])
++@pytest.mark.parametrize(
++    ("local_tier", "expected"),
++    [("normal", None), (None, "flex")],
++)
++def test_curator_slot_tier_survives_runtime_resolution_failure(monkeypatch, resolver_fails, local_tier, expected):
++    """The real curator fork applies local tier intent even when runtime lookup falls back."""
++    from run_agent import AIAgent
++
++    from agent.curator import _run_llm_review
++
++    slot = {"provider": "openai", "model": "gpt-5.4"}
++    if local_tier:
++        slot["service_tier"] = local_tier
++    else:
++        slot["extra_body"] = {"service_tier": "flex"}
++    cfg = {
++        "agent": {"service_tier": "priority"},
++        "model": {"provider": "openai", "default": "gpt-5.4"},
++        "auxiliary": {"curator": slot},
++    }
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
++
++    def resolve_runtime_provider(**_kwargs):
++        if resolver_fails:
++            raise RuntimeError("offline")
++        return {
++            "provider": "openai", "model": "gpt-5.4", "api_key": "fixture-key",
++            "base_url": "https://api.openai.com/v1", "api_mode": "chat_completions",
++            "request_overrides": {},
++        }
++
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve_runtime_provider)
++    captured = {}
++    real_agent = AIAgent
++
++    def _capturing(*args, **kwargs):
++        if not kwargs.get("api_key"):
++            kwargs.update(provider="openai", api_key="fixture-key", base_url="https://api.openai.com/v1")
++        agent = real_agent(*args, **kwargs)
++        captured["agent"] = agent
++        agent.run_conversation = lambda *_a, **_k: {"final_response": "ok", "messages": []}
++        return agent
++
++    monkeypatch.setattr("run_agent.AIAgent", _capturing)
++    result = _run_llm_review("review skills")
++    agent = captured["agent"]
++    try:
++        kwargs = agent._build_api_kwargs([{"role": "user", "content": "review"}])
++        assert result["error"] is None
++        assert kwargs.get("service_tier") == expected
++        assert agent._service_tier_session_pinned is True
++    finally:
++        agent.close()
++
++
+ def test_review_runtime_strips_blank_aux_credentials(curator_env):
+     curator = curator_env["curator"]
+     cfg = {
+-- 
+2.54.0
+

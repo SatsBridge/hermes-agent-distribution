@@ -1,0 +1,160 @@
+From 4c5f97d0b92cca66663b0b4a7e1adf4ec908ad7e Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Fri, 16 Oct 2026 13:20:40 +0000
+Subject: [PATCH 07/23] fix(tui): reject invalid fast mode mirror requests
+
+---
+ .../test_service_tier_request_overrides.py    | 76 +++++++++++++++++++
+ tui_gateway/methods_config_set.py             | 18 +++--
+ tui_gateway/methods_slash.py                  |  5 +-
+ 3 files changed, 91 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_service_tier_request_overrides.py b/tests/tui_gateway/test_service_tier_request_overrides.py
+index d4fa29364e..b6764bd93b 100644
+--- a/tests/tui_gateway/test_service_tier_request_overrides.py
++++ b/tests/tui_gateway/test_service_tier_request_overrides.py
+@@ -352,6 +352,28 @@ def test_slash_exec_refusal_keeps_existing_tier_state(monkeypatch, command, mode
+     assert not persisted
+ 
+ 
++@pytest.mark.parametrize(
++    ("command", "output"),
++    [
++        ("/fast flex garbage", "Unknown argument: flex garbage"),
++        ("/fast on --bogus", "Unknown argument: on --bogus"),
++    ],
++)
++def test_slash_exec_rejected_fast_arguments_leave_state_unchanged(monkeypatch, command, output):
++    agent = SimpleNamespace(
++        model="gpt-5.4", provider="openai", base_url="https://api.openai.com/v1",
++        service_tier="priority", request_overrides={"service_tier": "priority", "other": "keep"},
++    )
++
++    response, session, persisted = _slash_exec(monkeypatch, agent=agent, command=command, output=output)
++
++    assert response["result"]["output"] == output
++    assert agent.service_tier == "priority"
++    assert agent.request_overrides == {"service_tier": "priority", "other": "keep"}
++    assert session["create_service_tier_override"] == "priority"
++    assert not persisted
++
++
+ def test_config_set_flex_is_session_scoped_and_preserves_custom_body(monkeypatch):
+     from tui_gateway import server
+ 
+@@ -383,6 +405,60 @@ def test_config_set_flex_is_session_scoped_and_preserves_custom_body(monkeypatch
+     assert not writes
+ 
+ 
++@pytest.mark.parametrize(
++    ("provider", "base_url", "accepted"),
++    [
++        ("openai", "https://api.openai.com/v1", True),
++        ("openrouter", "https://openrouter.ai/api/v1", False),
++    ],
++)
++def test_config_set_lazy_session_validates_its_selected_route(monkeypatch, provider, base_url, accepted):
++    from tui_gateway import server
++
++    session = {
++        "agent": None, "session_key": "fast-session-key",
++        "model_override": {"model": "gpt-5.4", "provider": provider, "base_url": base_url},
++        "create_service_tier_override": "priority",
++    }
++    server._sessions["fast-session"] = session
++    writes = []
++    monkeypatch.setattr(server, "_write_config_key", lambda *args: writes.append(args))
++
++    try:
++        response = server.handle_request({
++            "id": "config-fast-flex-lazy",
++            "method": "config.set",
++            "params": {"session_id": "fast-session", "key": "fast", "value": "flex"},
++        })
++    finally:
++        server._sessions.pop("fast-session", None)
++
++    if accepted:
++        assert response["result"]["value"] == "flex"
++        assert session["create_service_tier_override"] == "flex"
++    else:
++        assert response["error"]["code"] == 4002
++        assert session["create_service_tier_override"] == "priority"
++    assert not writes
++
++
++def test_config_set_global_flex_rejects_unsupported_profile_route(monkeypatch):
++    from tui_gateway import server
++
++    writes = []
++    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("gpt-5.4", "openrouter"))
++    monkeypatch.setattr(server, "_write_config_key", lambda *args: writes.append(args))
++
++    response = server.handle_request({
++        "id": "config-fast-flex-global",
++        "method": "config.set",
++        "params": {"key": "fast", "value": "flex"},
++    })
++
++    assert response["error"]["code"] == 4002
++    assert not writes
++
++
+ def test_config_set_unsupported_flex_does_not_mutate_session(monkeypatch):
+     from tui_gateway import server
+ 
+diff --git a/tui_gateway/methods_config_set.py b/tui_gateway/methods_config_set.py
+index 8fed145261..0e4d3b9a0f 100644
+--- a/tui_gateway/methods_config_set.py
++++ b/tui_gateway/methods_config_set.py
+@@ -191,18 +191,26 @@ def _set_fast(rid, params, key, value, session):
+         from hermes_cli.models import resolve_fast_mode_overrides
+         if agent is not None:
+             target_model = getattr(agent, "model", None)
++            target_provider = getattr(agent, "provider", None)
++            target_base_url = getattr(agent, "base_url", None)
+         else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
+             session_override = (session or {}).get("model_override") or {}
+-            target_model = (isinstance(session_override, dict) and session_override.get("model")) or _resolve_model()
++            session_override = session_override if isinstance(session_override, dict) else {}
++            startup_model, startup_provider = (
++                _resolve_startup_runtime()
++                if not session_override.get("model") or not session_override.get("provider") else (None, None))
++            target_model = session_override.get("model") or startup_model
++            target_provider = session_override.get("provider") or startup_provider
++            target_base_url = session_override.get("base_url")
+         if not target_model:
+             return _err(rid, 4002, "fast mode is not available without a selected model")
+-        overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
+-                                                base_url=getattr(agent, "base_url", None),
++        overrides = resolve_fast_mode_overrides(target_model, provider=target_provider,
++                                                base_url=target_base_url,
+                                                 tier=nv if nv in ("ultrafast", "flex") else None)
+         if overrides is not None and nv == "ultrafast":
+             from agent.codex_service_tiers import ultrafast_offered
+-            if not ultrafast_offered(target_model, provider=getattr(agent, "provider", None),
+-                                     base_url=getattr(agent, "base_url", None),
++            if not ultrafast_offered(target_model, provider=target_provider,
++                                     base_url=target_base_url,
+                                      access_token=getattr(agent, "api_key", None)):
+                 overrides = None
+         if overrides is None:
+diff --git a/tui_gateway/methods_slash.py b/tui_gateway/methods_slash.py
+index de505ca452..4761ff15d0 100644
+--- a/tui_gateway/methods_slash.py
++++ b/tui_gateway/methods_slash.py
+@@ -420,9 +420,8 @@ _FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None
+ 
+ def _mirror_fast(sid, session, agent, arg) -> None:
+     if agent:
+-        words = arg.lower().split()
+-        global_scope = "--global" in words
+-        mode = next((word for word in words if not word.startswith("--")), "")
++        from hermes_cli.cli_commands_mixin import _split_scope_flags
++        mode, global_scope = _split_scope_flags(arg)
+         if mode in _FAST_TIERS:
+             tier = _FAST_TIERS[mode]
+             from agent.fast_mode import STATIC_TIERS
+-- 
+2.54.0
+

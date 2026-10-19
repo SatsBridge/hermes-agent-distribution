@@ -1,0 +1,218 @@
+From 903af8cd5b95554ea148fa30f38be6152c89f581 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Fri, 16 Oct 2026 14:13:43 +0000
+Subject: [PATCH 08/23] fix(tui): validate lazy service tier against resolved
+ route
+
+---
+ .../test_service_tier_request_overrides.py    | 116 ++++++++++++++++--
+ tui_gateway/methods_config_set.py             |  16 ++-
+ 2 files changed, 113 insertions(+), 19 deletions(-)
+
+diff --git a/tests/tui_gateway/test_service_tier_request_overrides.py b/tests/tui_gateway/test_service_tier_request_overrides.py
+index b6764bd93b..9eb7e90e2b 100644
+--- a/tests/tui_gateway/test_service_tier_request_overrides.py
++++ b/tests/tui_gateway/test_service_tier_request_overrides.py
+@@ -15,10 +15,12 @@ just the config resolution.
+ from __future__ import annotations
+ 
+ from contextlib import nullcontext
++from pathlib import Path
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
++from hermes_cli.config import DEFAULT_CONFIG, atomic_config_write
+ 
+ # Imported for real (NOT via patch.dict(sys.modules)): a sys.modules patch
+ # would evict every module first-imported inside its window on exit,
+@@ -406,18 +408,19 @@ def test_config_set_flex_is_session_scoped_and_preserves_custom_body(monkeypatch
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("provider", "base_url", "accepted"),
++    ("provider", "accepted"),
+     [
+-        ("openai", "https://api.openai.com/v1", True),
+-        ("openrouter", "https://openrouter.ai/api/v1", False),
++        ("openrouter", False),
+     ],
+ )
+-def test_config_set_lazy_session_validates_its_selected_route(monkeypatch, provider, base_url, accepted):
++def test_config_set_lazy_session_validates_its_selected_route(monkeypatch, tmp_path, provider, accepted):
+     from tui_gateway import server
+ 
++    home = _configure_profile_route(monkeypatch, tmp_path, provider, None)
+     session = {
+         "agent": None, "session_key": "fast-session-key",
+-        "model_override": {"model": "gpt-5.4", "provider": provider, "base_url": base_url},
++        "profile_home": str(home),
++        "model_override": {"model": "gpt-5.4", "provider": provider},
+         "create_service_tier_override": "priority",
+     }
+     server._sessions["fast-session"] = session
+@@ -434,7 +437,7 @@ def test_config_set_lazy_session_validates_its_selected_route(monkeypatch, provi
+         server._sessions.pop("fast-session", None)
+ 
+     if accepted:
+-        assert response["result"]["value"] == "flex"
++        assert response.get("result", {}).get("value") == "flex", response
+         assert session["create_service_tier_override"] == "flex"
+     else:
+         assert response["error"]["code"] == 4002
+@@ -442,11 +445,100 @@ def test_config_set_lazy_session_validates_its_selected_route(monkeypatch, provi
+     assert not writes
+ 
+ 
+-def test_config_set_global_flex_rejects_unsupported_profile_route(monkeypatch):
++def _configure_profile_route(monkeypatch, tmp_path, provider, base_url):
++    from tui_gateway import server
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(server, "_hermes_home", home)
++    for name in ("HERMES_MODEL", "HERMES_INFERENCE_MODEL", "HERMES_TUI_PROVIDER", "HERMES_INFERENCE_PROVIDER"):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
++    (home / ".env").write_text(
++        "OPENAI_API_KEY=test-openai-key\nOPENROUTER_API_KEY=test-openrouter-key\n", encoding="utf-8")
++    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
++    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
++    model = {"provider": provider, "default": "gpt-5.4"}
++    if base_url:
++        model["base_url"] = base_url
++    atomic_config_write(home / "config.yaml", {
++        "_config_version": DEFAULT_CONFIG["_config_version"],
++        "model": model,
++        "agent": {"service_tier": "priority"},
++    })
++    from hermes_cli import runtime_provider
++    monkeypatch.setattr(runtime_provider, "load_config", lambda: {
++        "model": model,
++        "agent": {"service_tier": "priority"},
++    })
++    return home
++
++
++@pytest.mark.parametrize(
++    ("provider", "base_url", "override", "accepted"),
++    [
++        ("openai-api", None, None, True),
++        ("openrouter", None, None, False),
++        ("openrouter", None, {"model": "gpt-5.4"}, False),
++        ("openai-api", "https://proxy.example/v1", None, False),
++    ],
++)
++def test_config_set_lazy_flex_uses_profile_default_and_partial_override_route(
++    monkeypatch, tmp_path, provider, base_url, override, accepted
++):
+     from tui_gateway import server
+ 
++    home = _configure_profile_route(monkeypatch, tmp_path, provider, base_url)
++    if provider == "openrouter":
++        # Startup selection has no provider hint without a launch seed; config.set must still
++        # validate against the effective provider resolved from this profile's config.
++        assert server._resolve_startup_runtime() == ("gpt-5.4", None)
++    session = {"agent": None, "session_key": "fast-session-key", "profile_home": str(home),
++               "create_service_tier_override": "priority"}
++    if override is not None:
++        session["model_override"] = override
++    resolved_model, resolved_runtime = server._resolve_agent_model_runtime(override, None)
++    assert resolved_model == "gpt-5.4"
++    assert resolved_runtime.get("provider") == provider
++    if base_url:
++        assert resolved_runtime.get("base_url") == base_url
++    server._sessions["fast-session"] = session
++    writes = []
++    monkeypatch.setattr(server, "_write_config_key", lambda *args: writes.append(args))
++
++    try:
++        response = server.handle_request({
++            "id": "config-fast-flex-lazy-default",
++            "method": "config.set",
++            "params": {"session_id": "fast-session", "key": "fast", "value": "flex"},
++        })
++    finally:
++        server._sessions.pop("fast-session", None)
++
++    if accepted:
++        assert response.get("result", {}).get("value") == "flex", response
++        assert session["create_service_tier_override"] == "flex"
++    else:
++        assert response["error"]["code"] == 4002
++        assert session["create_service_tier_override"] == "priority"
++    assert not writes
++
++
++@pytest.mark.parametrize(
++    ("provider", "base_url", "accepted"),
++    [
++        ("openai-api", None, True),
++        ("openrouter", None, False),
++        ("openai-api", "https://proxy.example/v1", False),
++    ],
++)
++def test_config_set_global_flex_uses_profile_route(monkeypatch, tmp_path, provider, base_url, accepted):
++    from tui_gateway import server
++
++    _configure_profile_route(monkeypatch, tmp_path, provider, base_url)
+     writes = []
+-    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("gpt-5.4", "openrouter"))
+     monkeypatch.setattr(server, "_write_config_key", lambda *args: writes.append(args))
+ 
+     response = server.handle_request({
+@@ -455,8 +547,12 @@ def test_config_set_global_flex_rejects_unsupported_profile_route(monkeypatch):
+         "params": {"key": "fast", "value": "flex"},
+     })
+ 
+-    assert response["error"]["code"] == 4002
+-    assert not writes
++    if accepted:
++        assert response["result"]["value"] == "flex"
++        assert writes == [("agent.service_tier", "flex")]
++    else:
++        assert response["error"]["code"] == 4002
++        assert not writes
+ 
+ 
+ def test_config_set_unsupported_flex_does_not_mutate_session(monkeypatch):
+diff --git a/tui_gateway/methods_config_set.py b/tui_gateway/methods_config_set.py
+index 0e4d3b9a0f..d3791d678d 100644
+--- a/tui_gateway/methods_config_set.py
++++ b/tui_gateway/methods_config_set.py
+@@ -193,15 +193,13 @@ def _set_fast(rid, params, key, value, session):
+             target_model = getattr(agent, "model", None)
+             target_provider = getattr(agent, "provider", None)
+             target_base_url = getattr(agent, "base_url", None)
++            target_api_key = getattr(agent, "api_key", None)
+         else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
+-            session_override = (session or {}).get("model_override") or {}
+-            session_override = session_override if isinstance(session_override, dict) else {}
+-            startup_model, startup_provider = (
+-                _resolve_startup_runtime()
+-                if not session_override.get("model") or not session_override.get("provider") else (None, None))
+-            target_model = session_override.get("model") or startup_model
+-            target_provider = session_override.get("provider") or startup_provider
+-            target_base_url = session_override.get("base_url")
++            target_model, target_runtime = _resolve_agent_model_runtime(
++                (session or {}).get("model_override"), (session or {}).get("provider_override"))
++            target_provider = target_runtime.get("provider")
++            target_base_url = target_runtime.get("base_url")
++            target_api_key = target_runtime.get("api_key")
+         if not target_model:
+             return _err(rid, 4002, "fast mode is not available without a selected model")
+         overrides = resolve_fast_mode_overrides(target_model, provider=target_provider,
+@@ -211,7 +209,7 @@ def _set_fast(rid, params, key, value, session):
+             from agent.codex_service_tiers import ultrafast_offered
+             if not ultrafast_offered(target_model, provider=target_provider,
+                                      base_url=target_base_url,
+-                                     access_token=getattr(agent, "api_key", None)):
++                                     access_token=target_api_key):
+                 overrides = None
+         if overrides is None:
+             return _err(rid, 4002, f"{nv} mode is not available for this model")
+-- 
+2.54.0
+

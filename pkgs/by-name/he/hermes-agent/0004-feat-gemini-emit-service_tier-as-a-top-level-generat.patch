@@ -1,0 +1,226 @@
+From 7ea21ed9d3588988c3511c3cfb5dd66f5ef093a5 Mon Sep 17 00:00:00 2001
+From: justinh20 <justin.hanke@gmail.com>
+Date: Wed, 30 Sep 2026 08:21:46 -0400
+Subject: [PATCH 04/23] feat(gemini): emit service_tier as a top-level
+ generateContent field
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Both Gemini tier docs show service_tier as a snake_case SIBLING of
+contents — inside generationConfig it is silently ignored and billed at
+standard. build_gemini_request emits it for tier-eligible models only:
+pre-2.5 models reject the whole request on an unexpected body field
+(400 INVALID_ARGUMENT), and a pinned tier survives a runtime /model
+switch verbatim, so the adapter gate is the last line of defense against
+a stale pin hard-failing every subsequent turn. Carried on the streaming
+path (shared builder) and plumbed through _create_chat_completion.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ agent/gemini_native_adapter.py          |  29 ++++++
+ tests/agent/test_gemini_service_tier.py | 124 ++++++++++++++++++++++++
+ 2 files changed, 153 insertions(+)
+ create mode 100644 tests/agent/test_gemini_service_tier.py
+
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 1fc678700b..5371d83df0 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -178,6 +178,23 @@ def normalize_gemini_base_url(base_url: Optional[str]) -> str:
+     return f"{trimmed}/v1beta"
+ 
+ 
++def gemini_supports_service_tier(model: str) -> bool:
++    """Gemini 2.5+ accepts the top-level ``service_tier`` generateContent field; older models
++    reject the whole request on an unexpected body field (400 INVALID_ARGUMENT).
++
++    Last-line defense, duplicating the eligibility gate in
++    ``hermes_cli.models._is_google_service_tier_model`` at the adapter: a tier pinned into
++    ``request_overrides`` at agent build survives a runtime ``/model`` switch verbatim
++    (``_apply_switched_provider_request_overrides`` keeps ``service_tier``/``speed``), so
++    without this gate a switch from a tier-eligible Gemini to an older one would hard-fail
++    every subsequent turn until ``/fast off``.
++    """
++    match = re.match(r"gemini-(\d+)(?:\.(\d+))?", bare_gemini_model_id(model).lower())
++    if not match:
++        return False
++    return (int(match.group(1)), int(match.group(2) or 0)) >= (2, 5)
++
++
+ def is_native_gemini_base_url(base_url: str) -> bool:
+     """True when the endpoint speaks Gemini's native REST API (not ``/openai``)."""
+     normalized = str(base_url or "").strip().rstrip("/").lower()
+@@ -557,6 +574,7 @@ def build_gemini_request(
+     *, messages: list[dict[str, Any]], tools: Any = None, tool_choice: Any = None, temperature: Optional[float] = None,
+     max_tokens: Optional[int] = None, top_p: Optional[float] = None, stop: Any = None, thinking_config: Any = None,
+     response_format: Any = None, model: str = "", tools_as_json_schema: bool = False,
++    service_tier: Optional[str] = None,
+ ) -> dict[str, Any]:
+     # Gemini 3+ both requires tool-call ids and accepts multimodal functionResponse parts.
+     is_gemini3 = gemini_requires_tool_call_ids(model)
+@@ -565,6 +583,15 @@ def build_gemini_request(
+     tool_config = _translate_tool_choice_to_gemini(tool_choice)
+     optional = (("systemInstruction", system_instruction), ("tools", gemini_tools), ("toolConfig", tool_config))
+     request: dict[str, Any] = {"contents": contents, **{k: v for k, v in optional if v}}
++    # Gemini takes the tier as a top-level body field, a sibling of ``contents`` — NOT inside
++    # generationConfig, where it would be ignored and billed at the standard rate. Accepted
++    # values are "flex" and "priority"; omitting the field means standard. Dropped (not sent)
++    # for models that would 400 on the field — see gemini_supports_service_tier.
++    #   https://ai.google.dev/gemini-api/docs/flex-inference
++    #   https://ai.google.dev/gemini-api/docs/generate-content/priority-inference
++    tier = str(service_tier or "").strip().lower()
++    if tier in {"flex", "priority"} and gemini_supports_service_tier(model):
++        request["service_tier"] = tier
+     # Key order is part of the wire format (prompt-cache parity): temperature, maxOutputTokens, topP, stop, thinking.
+     generation = (
+         ("temperature", temperature), ("maxOutputTokens", _effective_gemini_max_output_tokens(max_tokens, thinking_config)),
+@@ -917,6 +944,7 @@ class GeminiNativeClient:
+         self, *, model: str = "gemini-3.7-flash", messages: Optional[list[dict[str, Any]]] = None, stream: bool = False,
+         tools: Any = None, tool_choice: Any = None, temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+         top_p: Optional[float] = None, stop: Any = None, response_format: Any = None, extra_body: Optional[dict[str, Any]] = None,
++        service_tier: Optional[str] = None,
+         timeout: Any = None, **_: Any,
+     ) -> Any:
+         extra = extra_body if isinstance(extra_body, dict) else {}
+@@ -929,6 +957,7 @@ class GeminiNativeClient:
+             top_p=top_p, stop=stop, thinking_config=extra.get("thinking_config") or extra.get("thinkingConfig"),
+             response_format=response_format or extra.get("response_format"), model=model,
+             tools_as_json_schema=gemini_accepts_parameters_json_schema(self.base_url),
++            service_tier=service_tier,
+         )
+         model = bare_gemini_model_id(model)
+         url = f"{self.base_url}/models/{model}:"
+diff --git a/tests/agent/test_gemini_service_tier.py b/tests/agent/test_gemini_service_tier.py
+new file mode 100644
+index 0000000000..ac3226b783
+--- /dev/null
++++ b/tests/agent/test_gemini_service_tier.py
+@@ -0,0 +1,124 @@
++"""Service-tier emission for the native Gemini adapter (PR #37059).
++
++Kept in its own file (not appended to test_gemini_native_adapter.py) so routine
++upstream growth of the adapter's test tail cannot conflict with these tests.
++"""
++
++from __future__ import annotations
++
++import json
++
++
++class DummyResponse:
++    def __init__(self, status_code=200, payload=None, headers=None, text=None):
++        self.status_code = status_code
++        self._payload = payload or {}
++        self.headers = headers or {}
++        self.text = text if text is not None else json.dumps(self._payload)
++
++    def json(self):
++        return self._payload
++
++
++def test_build_gemini_request_emits_top_level_service_tier():
++    """Gemini takes service_tier as a TOP-LEVEL generateContent body field.
++
++    Flex:     https://ai.google.dev/gemini-api/docs/flex-inference
++    Priority: https://ai.google.dev/gemini-api/docs/generate-content/priority-inference
++
++    Both docs show it as a sibling of ``contents``, not inside
++    ``generationConfig`` — putting it in generationConfig would be silently
++    ignored and bill at the standard rate.
++    """
++    from agent.gemini_native_adapter import build_gemini_request
++
++    request = build_gemini_request(
++        messages=[{"role": "user", "content": "hi"}],
++        model="gemini-3.6-flash",
++        service_tier="flex",
++    )
++
++    assert request["service_tier"] == "flex"
++    assert "service_tier" not in request.get("generationConfig", {})
++
++
++def test_build_gemini_request_omits_service_tier_when_unset():
++    """No tier configured must mean no field — not an explicit standard."""
++    from agent.gemini_native_adapter import build_gemini_request
++
++    request = build_gemini_request(messages=[{"role": "user", "content": "hi"}])
++
++    assert "service_tier" not in request
++
++
++def test_build_gemini_request_accepts_priority():
++    from agent.gemini_native_adapter import build_gemini_request
++
++    request = build_gemini_request(
++        messages=[{"role": "user", "content": "hi"}],
++        model="gemini-3.6-flash",
++        service_tier="priority",
++    )
++
++    assert request["service_tier"] == "priority"
++
++
++def test_build_gemini_request_drops_tier_for_pre_2_5_models():
++    """Adapter-level defense: a stale pinned tier must never 400 the session.
++
++    A tier pinned into request_overrides at build survives a runtime ``/model``
++    switch verbatim, and Gemini's native REST rejects the whole request on an
++    unexpected body field — so the adapter drops the field for models Google
++    does not list as tier-eligible, rather than hard-failing every turn.
++    """
++    from agent.gemini_native_adapter import build_gemini_request
++
++    request = build_gemini_request(
++        messages=[{"role": "user", "content": "hi"}],
++        model="gemini-2.0-flash",
++        service_tier="flex",
++    )
++
++    assert "service_tier" not in request
++
++
++def test_build_gemini_request_drops_unsupported_tier_values():
++    """OpenAI-only tiers or stale overrides must not reach Gemini's strict request body."""
++    from agent.gemini_native_adapter import build_gemini_request
++
++    request = build_gemini_request(
++        messages=[{"role": "user", "content": "hi"}],
++        model="gemini-2.5-flash",
++        service_tier="ultrafast",
++    )
++
++    assert "service_tier" not in request
++
++
++def test_native_client_sends_service_tier_on_the_wire(monkeypatch):
++    """End-to-end: the tier must appear in the posted generateContent body."""
++    from agent.gemini_native_adapter import GeminiNativeClient
++
++    posted = {}
++
++    class _HTTP:
++        def post(self, url, json=None, headers=None, timeout=None):
++            posted["url"] = url
++            posted["body"] = json
++            return DummyResponse(
++                payload={
++                    "candidates": [
++                        {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
++                    ]
++                }
++            )
++
++    client = GeminiNativeClient(api_key="test-key", http_client=_HTTP())
++    client._create_chat_completion(
++        model="gemini-3.6-flash",
++        messages=[{"role": "user", "content": "hi"}],
++        service_tier="flex",
++    )
++
++    assert posted["body"]["service_tier"] == "flex"
++
+-- 
+2.54.0
+

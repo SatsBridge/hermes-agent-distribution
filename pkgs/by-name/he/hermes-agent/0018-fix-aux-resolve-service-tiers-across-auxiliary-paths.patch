@@ -1,0 +1,981 @@
+From 0430b265354eb0f1b40a2af3c93fce3ac1c75174 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Sat, 17 Oct 2026 02:33:15 +0000
+Subject: [PATCH 18/23] fix(aux): resolve service tiers across auxiliary paths
+
+---
+ agent/auxiliary_client.py                     |  30 +---
+ agent/background_review.py                    |   9 +-
+ agent/curator.py                              |   4 +-
+ agent/review_engine.py                        |  15 +-
+ cli-config.yaml.example                       |   2 +-
+ hermes_cli/models.py                          | 106 ------------
+ hermes_cli/models_service_tiers.py            | 132 +++++++++++++++
+ tests/agent/test_auxiliary_client.py          |  40 ++---
+ tests/agent/test_auxiliary_service_tier.py    | 159 ++++++++++++++++++
+ .../test_background_review_cost_controls.py   |  19 ++-
+ tests/agent/test_curator.py                   |   8 +-
+ tests/agent/test_review_engine.py             |  35 ++++
+ tests/tools/test_delegate_fallback_matrix.py  |  33 ++++
+ tools/delegate_tool.py                        |  19 ++-
+ website/docs/user-guide/configuration.md      |   6 +-
+ 15 files changed, 447 insertions(+), 170 deletions(-)
+ create mode 100644 hermes_cli/models_service_tiers.py
+ create mode 100644 tests/agent/test_auxiliary_service_tier.py
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 930f191092..705293e9b9 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -6405,24 +6405,11 @@ def _with_custom_endpoint_extra_body(
+ def _get_task_extra_body(task: str) -> dict[str, Any]:
+     """Shallow copy of ``auxiliary.<task>.extra_body`` with ``reasoning_effort`` folded into
+     ``reasoning`` unless one is configured (more specific wins). MoA tasks are excluded: their
+-    reasoning depth is per-slot in the preset. ``auxiliary.<task>.service_tier`` is a shorthand
+-    for the top-level service-tier request field (OpenRouter ``flex`` / ``priority`` only).
+-    Explicit ``extra_body.service_tier`` wins over the shorthand; first-party routes omit it."""
++    reasoning depth is per-slot in the preset. Service tiers are resolved separately after the
++    actual route and fallback model are known."""
+     task_config = _get_auxiliary_task_config(task)
+     raw = task_config.get("extra_body")
+     result = dict(raw) if isinstance(raw, dict) else {}
+-    if "service_tier" not in result:
+-        configured_tier = task_config.get("service_tier")
+-        if configured_tier not in (None, ""):
+-            from hermes_constants import parse_service_tier
+-            tier = parse_service_tier(configured_tier)
+-            if tier in {"flex", "priority"}:
+-                result["service_tier"] = tier
+-            else:
+-                logger.warning(
+-                    "auxiliary.%s.service_tier %r is not supported (flex or priority) — ignoring",
+-                    task, configured_tier,
+-                )
+     if "reasoning" in result:
+         return result
+     effort = task_config.get("reasoning_effort")
+@@ -6804,13 +6791,12 @@ def _build_call_kwargs(
+     if "response_format" in merged_extra:
+         from agent.auxiliary_structured_output import without_unsupported_response_format
+         merged_extra = without_unsupported_response_format(merged_extra, provider_norm, effective_base, model, task)
+-    if merged_extra:
+-        from hermes_cli.models import apply_aux_service_tier_overrides
+-
+-        lifted = apply_aux_service_tier_overrides(
+-            {"extra_body": merged_extra}, None, model=model, provider=provider, base_url=effective_base, task=task)
+-        kwargs.update({key: lifted[key] for key in ("service_tier", "speed") if key in lifted})
+-        merged_extra = lifted.get("extra_body") or {}
++    from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides
++    lifted = apply_aux_service_tier_overrides(
++        {"extra_body": merged_extra} if merged_extra else {}, _get_auxiliary_task_config(task) if task else None,
++        model=model, provider=provider, base_url=effective_base, task=task)
++    kwargs.update({key: lifted[key] for key in ("service_tier", "speed") if key in lifted})
++    merged_extra = lifted.get("extra_body") or {}
+     if merged_extra:
+         kwargs["extra_body"] = merged_extra
+     # Anthropic Messages adapters take reasoning via a private kwarg that plain OpenAI SDK clients
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 1a2c1fd61b..285ec7d2ad 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -247,6 +247,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
+     parent): the parent's live runtime with ``routed=False`` (codex_app_server -> codex_responses
+     downgrade applied). When ``auxiliary.background_review.{provider,model}`` names a different
+     concrete model, resolve that runtime and set ``routed=True``."""
++    from agent.fast_mode import strip_inherited_framework_baked_overrides
+     parent_runtime = agent._current_main_runtime()
+     parent_api_mode = parent_runtime.get("api_mode") or None
+     parent = {
+@@ -254,7 +255,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
+         "api_key": parent_runtime.get("api_key") or None, "base_url": parent_runtime.get("base_url") or None,
+         "api_mode": "codex_responses" if parent_api_mode == "codex_app_server" else parent_api_mode,
+         "credential_pool": getattr(agent, "_credential_pool", None),
+-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
++        "request_overrides": strip_inherited_framework_baked_overrides(agent.request_overrides, agent),
+         "max_tokens": getattr(agent, "max_tokens", None), "command": getattr(agent, "acp_command", None),
+         "args": list(getattr(agent, "acp_args", []) or []), "routed": False,
+     }
+@@ -265,7 +266,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
+     if not (task_provider and task_provider != "auto" and task_model) or (
+         task_provider == (agent.provider or "") and task_model == (agent.model or "")  # same as parent
+     ):
+-        from hermes_cli.models import apply_aux_service_tier_overrides
++        from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides
+ 
+         parent["request_overrides"] = apply_aux_service_tier_overrides(
+             parent["request_overrides"],
+@@ -283,7 +284,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
+             requested=task_provider, target_model=task_model,
+             explicit_api_key=task_api_key, explicit_base_url=task_base_url,
+         )
+-        from hermes_cli.models import apply_aux_service_tier_overrides
++        from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides
+ 
+         routed = {
+             "provider": rp.get("provider") or task_provider, "model": rp.get("model") or task_model,
+@@ -999,7 +1000,7 @@ def build_cache_parity_fork(
+     if not _routed and write_origin == "background_review":
+         _warn_ignored_reasoning_effort(agent, task_cfg)
+     review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
+-    from hermes_cli.models import bind_aux_slot_service_tier
++    from hermes_cli.models_service_tiers import bind_aux_slot_service_tier
+ 
+     bind_aux_slot_service_tier(review_agent, _rt.get("_aux_slot"))
+     review_agent._block_service_tier_escalation = True
+diff --git a/agent/curator.py b/agent/curator.py
+index 015a27fb26..102f3b580d 100644
+--- a/agent/curator.py
++++ b/agent/curator.py
+@@ -1065,7 +1065,7 @@ def _resolve_review_provider() -> tuple:
+     overrides, provider, model_name, binding = {}, None, "", None
+     try:
+         from hermes_cli.config import load_config_readonly
+-        from hermes_cli.models import apply_aux_service_tier_overrides, bind_aux_slot_service_tier
++        from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides, bind_aux_slot_service_tier
+         from hermes_cli.runtime_provider import resolve_runtime_provider
+         cfg = load_config_readonly()
+         binding = _resolve_review_runtime(cfg)
+@@ -1100,7 +1100,7 @@ def _run_llm_review(prompt: str) -> dict[str, Any]:
+     result_meta: dict[str, Any] = _llm_meta("")
+     try:
+         from run_agent import AIAgent
+-        from hermes_cli.models import bind_aux_slot_service_tier
++        from hermes_cli.models_service_tiers import bind_aux_slot_service_tier
+     except Exception as e:
+         result_meta["error"] = result_meta["summary"] = f"AIAgent import failed: {e}"
+         return result_meta
+diff --git a/agent/review_engine.py b/agent/review_engine.py
+index c43a5f83b6..12e81ca4cc 100644
+--- a/agent/review_engine.py
++++ b/agent/review_engine.py
+@@ -137,8 +137,7 @@ def build_review_task(snapshot: list[dict[str, str]], user_prompt: str = "", loa
+ 
+ 
+ def _load_review_credentials_cfg() -> Optional[dict[str, Any]]:
+-    """``auxiliary.review`` as a delegation-credentials dict, or None when unconfigured (provider auto/empty
+-    and no model/base_url) so the reviewer inherits the parent's credentials."""
++    """Resolve ``auxiliary.review`` routing, request-body and tier settings, or None when fully unconfigured."""
+     try:
+         from hermes_cli.config import load_config_readonly
+         review = (load_config_readonly().get("auxiliary") or {}).get("review") or {}
+@@ -150,7 +149,17 @@ def _load_review_credentials_cfg() -> Optional[dict[str, Any]]:
+     cfg = {k: str(review.get(k) or "").strip() for k in ("provider", "model", "base_url", "api_key", "api_mode")}
+     if cfg["provider"].lower() == "auto":
+         cfg["provider"] = ""
+-    if not (cfg["provider"] or cfg["model"] or cfg["base_url"]):
++    extra_body = review.get("extra_body")
++    if isinstance(extra_body, dict) and extra_body:
++        cfg["request_overrides"] = {"extra_body": dict(extra_body)}
++    tier_configured = review.get("service_tier") not in (None, "") or (
++        isinstance(extra_body, dict) and extra_body.get("service_tier") not in (None, "")
++    )
++    if tier_configured:
++        cfg["_aux_slot"] = {
++            key: review[key] for key in ("service_tier", "extra_body") if key in review
++        }
++    if not (cfg["provider"] or cfg["model"] or cfg["base_url"] or cfg.get("request_overrides") or cfg.get("_aux_slot")):
+         return None
+     return cfg
+ 
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index bf123a0f1a..05c745bb96 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -984,7 +984,7 @@ prompt_caching:
+ #     enabled: true            # false = skip automatic forks (/refine still works)
+ #     provider: "auto"         # or pin a cheaper model (see memory.md)
+ #     model: ""
+-#     # service_tier: "flex"   # OpenRouter-only; extra_body.service_tier wins
++#     # service_tier: "flex"   # Route-aware Fast Mode tier; extra_body.service_tier wins
+ 
+ # =============================================================================
+ # Persistent Memory
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index afd3f50f42..28fa6c2e3b 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1340,112 +1340,6 @@ def resolve_service_tier_overrides(
+     return None
+ 
+ 
+-_aux_service_tier_ignored: set[str] = set()
+-
+-
+-def _warn_aux_service_tier_ignored(
+-    task: Optional[str], raw: Any, provider: Optional[str], base_url: Optional[str],
+-) -> None:
+-    """One warning per aux task that set a first-party ``service_tier`` shortcut."""
+-    key = str(task or "").strip() or str(provider or base_url or "aux")
+-    if key in _aux_service_tier_ignored:
+-        return
+-    _aux_service_tier_ignored.add(key)
+-    logger.warning(
+-        "auxiliary%s.service_tier is OpenRouter-only; ignoring %r for %s",
+-        f".{task}" if task else "",
+-        raw,
+-        provider or base_url or "this route",
+-    )
+-
+-
+-def apply_aux_service_tier_overrides(
+-    overrides: dict[str, Any] | None,
+-    slot: dict[str, Any] | None,
+-    *,
+-    model: Optional[str],
+-    provider: Optional[str],
+-    base_url: Optional[str],
+-    task: Optional[str] = None,
+-) -> dict[str, Any]:
+-    """Lift an auxiliary slot's ``service_tier`` onto top-level request kwargs.
+-
+-    Precedence: ``extra_body.service_tier`` (already-merged overrides, then
+-    ``slot.extra_body``) > slot ``service_tier``. OpenRouter
+-    ``flex`` / ``priority`` become a top-level ``service_tier``; first-party
+-    routes omit the key (main-chat /fast mapping is not applied). Call after
+-    the slot's runtime is known.
+-    """
+-    merged = dict(overrides or {})
+-    extra_src = merged.get("extra_body")
+-    had_dict_extra = isinstance(extra_src, dict)
+-    extra = dict(extra_src) if had_dict_extra else {}
+-    extra_tier = extra.get("service_tier") if had_dict_extra else None
+-    slot_extra = slot.get("extra_body") if isinstance(slot, dict) else None
+-    slot_extra_tier = slot_extra.get("service_tier") if isinstance(slot_extra, dict) else None
+-    slot_tier = slot.get("service_tier") if isinstance(slot, dict) else None
+-    # * extra_body.service_tier (already-merged, then slot) beats slot.service_tier.
+-    if extra_tier not in (None, ""):
+-        raw = extra_tier
+-    elif slot_extra_tier not in (None, ""):
+-        raw = slot_extra_tier
+-    else:
+-        raw = slot_tier
+-    if raw in (None, ""):
+-        return merged
+-    if had_dict_extra:
+-        extra.pop("service_tier", None)
+-        if extra:
+-            merged["extra_body"] = extra
+-        else:
+-            merged.pop("extra_body", None)
+-    if not _is_openrouter_service_tier_route(provider, base_url):
+-        _warn_aux_service_tier_ignored(task, raw, provider, base_url)
+-        return merged
+-    mapped = resolve_service_tier_overrides(
+-        model, raw, provider=provider, base_url=base_url,
+-    )
+-    merged.pop("service_tier", None)
+-    merged.pop("speed", None)
+-    if mapped:
+-        merged.update(mapped)
+-    return merged
+-
+-
+-def aux_slot_configures_service_tier(slot: dict[str, Any] | None) -> bool:
+-    """True when the aux slot names a ``service_tier`` (top-level or extra_body)."""
+-    if not isinstance(slot, dict):
+-        return False
+-    extra = slot.get("extra_body")
+-    extra_tier = extra.get("service_tier") if isinstance(extra, dict) else None
+-    return extra_tier not in (None, "") or slot.get("service_tier") not in (None, "")
+-
+-
+-def bind_aux_slot_service_tier(agent: Any, slot: dict[str, Any] | None) -> None:
+-    """Make the aux-resolved tier the authority for this agent's wire keys.
+-
+-    Uses the constructed agent's own ``request_overrides`` (already lifted by
+-    :func:`apply_aux_service_tier_overrides`). Pins the slot tier (including
+-    first-party omit) so global ``agent.service_tier`` cannot re-resolve over
+-    it. Marks the mapped keys as framework-baked so they are not treated as
+-    raw user intent. No-op when the slot does not configure a tier.
+-    """
+-    if not aux_slot_configures_service_tier(slot):
+-        return
+-    from hermes_constants import parse_service_tier
+-    from agent.fast_mode import TIER_WIRE_KEYS, set_framework_baked_tier_keys
+-
+-    overrides = getattr(agent, "request_overrides", None)
+-    mapped = {
+-        key: overrides[key]
+-        for key in TIER_WIRE_KEYS
+-        if isinstance(overrides, dict) and key in overrides
+-    }
+-    agent.service_tier = parse_service_tier(mapped.get("service_tier"))
+-    agent._service_tier_session_pinned = True
+-    set_framework_baked_tier_keys(agent, mapped or None)
+-
+-
+ def _first_exchangeable_copilot_token(raw_tokens) -> str:
+     """Exchange stored GitHub tokens in order; the first that validates AND exchanges wins (every
+     entry is tried so a later valid token survives an earlier malformed one)."""
+diff --git a/hermes_cli/models_service_tiers.py b/hermes_cli/models_service_tiers.py
+new file mode 100644
+index 0000000000..d5b45c89f3
+--- /dev/null
++++ b/hermes_cli/models_service_tiers.py
+@@ -0,0 +1,132 @@
++"""Auxiliary service-tier resolution and binding."""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++_aux_service_tier_ignored: set[str] = set()
++
++
++def _warn_aux_service_tier_ignored(
++    task: Optional[str], raw: Any, provider: Optional[str], base_url: Optional[str],
++) -> None:
++    """Warn once per auxiliary task when its tier is unsupported on the resolved route."""
++    key = str(task or "").strip() or str(provider or base_url or "aux")
++    if key in _aux_service_tier_ignored:
++        return
++    _aux_service_tier_ignored.add(key)
++    logger.warning(
++        "auxiliary%s.service_tier=%r is unsupported on %s; omitting the tier",
++        f".{task}" if task else "", raw, provider or base_url or "this route",
++    )
++
++
++def apply_aux_service_tier_overrides(
++    overrides: dict[str, Any] | None,
++    slot: dict[str, Any] | None,
++    *,
++    model: Optional[str],
++    provider: Optional[str],
++    base_url: Optional[str],
++    task: Optional[str] = None,
++) -> dict[str, Any]:
++    """Resolve auxiliary tier sources against the actual route and map supported wire fields.
++
++    Precedence: explicit request/slot ``extra_body.service_tier`` > slot
++    ``service_tier`` > per-model agent tier > global agent tier. Explicit
++    disabled values stop fallback. Auto/cold are bounded main-turn windows,
++    so auxiliary calls do not inherit them.
++    """
++    merged = dict(overrides or {})
++    extra_src = merged.get("extra_body")
++    had_dict_extra = isinstance(extra_src, dict)
++    extra = dict(extra_src) if had_dict_extra else {}
++    extra_tier = extra.get("service_tier") if had_dict_extra else None
++    slot_extra = slot.get("extra_body") if isinstance(slot, dict) else None
++    slot_extra_tier = slot_extra.get("service_tier") if isinstance(slot_extra, dict) else None
++    slot_tier = slot.get("service_tier") if isinstance(slot, dict) else None
++    if extra_tier not in (None, ""):
++        raw = extra_tier
++    elif slot_extra_tier not in (None, ""):
++        raw = slot_extra_tier
++    else:
++        raw = slot_tier
++
++    from hermes_constants import (
++        SERVICE_TIER_BOUNDED_VALUES, SERVICE_TIER_DISABLED_VALUES,
++        parse_service_tier, resolve_service_tier_source,
++    )
++
++    configured = False
++    tier = None
++    if raw not in (None, ""):
++        normalized = str(raw).strip().lower()
++        tier = parse_service_tier(raw)
++        configured = tier is not None or normalized in SERVICE_TIER_DISABLED_VALUES
++        if not configured:
++            logger.warning("Invalid auxiliary%s service_tier %r — falling back to agent tier",
++                           f".{task}" if task else "", raw)
++            if had_dict_extra:
++                extra.pop("service_tier", None)
++                if extra:
++                    merged["extra_body"] = extra
++                else:
++                    merged.pop("extra_body", None)
++    if not configured:
++        try:
++            from hermes_cli.config import load_config_readonly
++            agent_cfg = load_config_readonly().get("agent") or {}
++            tier, configured = resolve_service_tier_source(agent_cfg, model)
++        except Exception:
++            logger.debug("Could not resolve agent service tier for auxiliary request", exc_info=True)
++    if not configured:
++        return merged
++
++    if had_dict_extra:
++        extra.pop("service_tier", None)
++        if extra:
++            merged["extra_body"] = extra
++        else:
++            merged.pop("extra_body", None)
++    merged.pop("service_tier", None)
++    merged.pop("speed", None)
++    if tier in SERVICE_TIER_BOUNDED_VALUES:
++        return merged
++    from hermes_cli.models import resolve_service_tier_overrides
++    mapped = resolve_service_tier_overrides(model, tier, provider=provider, base_url=base_url) if tier else None
++    if tier and not mapped:
++        _warn_aux_service_tier_ignored(task, tier, provider, base_url)
++    if mapped:
++        merged.update(mapped)
++    return merged
++
++
++def aux_slot_configures_service_tier(slot: dict[str, Any] | None) -> bool:
++    """True when the auxiliary slot names a tier at top-level or in ``extra_body``."""
++    if not isinstance(slot, dict):
++        return False
++    extra = slot.get("extra_body")
++    extra_tier = extra.get("service_tier") if isinstance(extra, dict) else None
++    return extra_tier not in (None, "") or slot.get("service_tier") not in (None, "")
++
++
++def bind_aux_slot_service_tier(agent: Any, slot: dict[str, Any] | None) -> None:
++    """Pin an already-mapped auxiliary slot tier so the agent fallback cannot replace it."""
++    if not aux_slot_configures_service_tier(slot):
++        return
++    from hermes_constants import parse_service_tier
++    from agent.fast_mode import TIER_WIRE_KEYS, set_framework_baked_tier_keys
++
++    overrides = getattr(agent, "request_overrides", None)
++    mapped = {
++        key: overrides[key]
++        for key in TIER_WIRE_KEYS
++        if isinstance(overrides, dict) and key in overrides
++    }
++    agent.service_tier = parse_service_tier(mapped.get("service_tier"))
++    if agent.service_tier is None and mapped.get("speed") == "fast":
++        agent.service_tier = "priority"
++    agent._service_tier_session_pinned = True
++    set_framework_baked_tier_keys(agent, mapped or None)
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index 4565715791..b0efb51ca7 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -2727,30 +2727,30 @@ class TestAuxiliaryTaskExtraBody:
+         assert kwargs["extra_body"]["reasoning"] == {"effort": "none"}
+         assert kwargs["extra_body"]["metadata"] == {"source": "test"}
+ 
+-
+-    def test_task_service_tier_shortcut_lifts_on_openrouter(self):
++    def test_task_service_tier_shortcut_lifts_on_openrouter(self, monkeypatch):
+         from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
+ 
+         config = {"auxiliary": {"compression": {"service_tier": "flex"}}}
+-        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+-            body = _get_task_extra_body("compression")
+-        assert body["service_tier"] == "flex"
++        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
++        body = _get_task_extra_body("compression")
++        assert "service_tier" not in body
+         kwargs = _build_call_kwargs(
+             provider="openrouter",
+             model="openai/gpt-5",
+             messages=[{"role": "user", "content": "hi"}],
+             extra_body=body,
+             base_url="https://openrouter.ai/api/v1",
++            task="compression",
+         )
+         assert kwargs["service_tier"] == "flex"
+         assert "service_tier" not in (kwargs.get("extra_body") or {})
+ 
+-    def test_task_service_tier_flex_ignored_on_first_party(self):
++    def test_task_service_tier_flex_maps_on_first_party_openai(self, monkeypatch):
+         from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
+ 
+         config = {"auxiliary": {"compression": {"service_tier": "flex"}}}
+-        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+-            body = _get_task_extra_body("compression")
++        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
++        body = _get_task_extra_body("compression")
+         kwargs = _build_call_kwargs(
+             provider="openai",
+             model="gpt-5.4",
+@@ -2759,16 +2759,16 @@ class TestAuxiliaryTaskExtraBody:
+             base_url="https://api.openai.com/v1",
+             task="compression",
+         )
+-        assert "service_tier" not in kwargs
++        assert kwargs["service_tier"] == "flex"
+         assert "speed" not in kwargs
+         assert "service_tier" not in (kwargs.get("extra_body") or {})
+ 
+-    def test_task_service_tier_priority_ignored_on_first_party_openai(self):
++    def test_task_service_tier_priority_maps_on_first_party_openai(self, monkeypatch):
+         from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
+ 
+         config = {"auxiliary": {"compression": {"service_tier": "priority"}}}
+-        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+-            body = _get_task_extra_body("compression")
++        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
++        body = _get_task_extra_body("compression")
+         kwargs = _build_call_kwargs(
+             provider="openai",
+             model="gpt-5.4",
+@@ -2777,16 +2777,16 @@ class TestAuxiliaryTaskExtraBody:
+             base_url="https://api.openai.com/v1",
+             task="compression",
+         )
+-        assert "service_tier" not in kwargs
++        assert kwargs["service_tier"] == "priority"
+         assert "speed" not in kwargs
+         assert "service_tier" not in (kwargs.get("extra_body") or {})
+ 
+-    def test_task_service_tier_priority_ignored_on_first_party_anthropic(self):
++    def test_task_service_tier_priority_maps_on_supported_anthropic(self, monkeypatch):
+         from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
+ 
+         config = {"auxiliary": {"compression": {"service_tier": "priority"}}}
+-        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+-            body = _get_task_extra_body("compression")
++        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
++        body = _get_task_extra_body("compression")
+         kwargs = _build_call_kwargs(
+             provider="anthropic",
+             model="claude-opus-5",
+@@ -2796,15 +2796,15 @@ class TestAuxiliaryTaskExtraBody:
+             task="compression",
+         )
+         assert "service_tier" not in kwargs
+-        assert "speed" not in kwargs
++        assert kwargs["speed"] == "fast"
+         assert "service_tier" not in (kwargs.get("extra_body") or {})
+ 
+-    def test_task_service_tier_priority_lifts_on_openrouter(self):
++    def test_task_service_tier_priority_lifts_on_openrouter(self, monkeypatch):
+         from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
+ 
+         config = {"auxiliary": {"compression": {"service_tier": "priority"}}}
+-        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+-            body = _get_task_extra_body("compression")
++        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
++        body = _get_task_extra_body("compression")
+         kwargs = _build_call_kwargs(
+             provider="openrouter",
+             model="openai/gpt-5",
+diff --git a/tests/agent/test_auxiliary_service_tier.py b/tests/agent/test_auxiliary_service_tier.py
+new file mode 100644
+index 0000000000..186d6ce52b
+--- /dev/null
++++ b/tests/agent/test_auxiliary_service_tier.py
+@@ -0,0 +1,159 @@
++"""Service-tier source precedence and auxiliary request mapping contracts."""
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++@pytest.mark.parametrize(("agent_cfg", "slot", "expected"), [
++    ({"service_tier": "priority"}, {}, "priority"),
++    ({"service_tier": "priority", "service_tier_overrides": {"gpt-5.4": "flex"}}, {}, "flex"),
++    ({"service_tier": "priority"}, {"service_tier": "flex"}, "flex"),
++    ({"service_tier": "priority"}, {"service_tier": "priority", "extra_body": {"service_tier": "flex"}}, "flex"),
++    ({"service_tier": "priority"}, {"service_tier": "normal"}, None),
++    ({"service_tier": "priority"}, {"service_tier": "default"}, None),
++    ({"service_tier": "priority"}, {"service_tier": "off"}, None),
++    ({"service_tier": "priority"}, {"service_tier": ""}, "priority"),
++    ({"service_tier": "priority"}, {"service_tier": "auto"}, None),
++    ({"service_tier": "priority"}, {"service_tier": "cold"}, None),
++    ({"service_tier": "priority"}, {"service_tier": "invalid"}, "priority"),
++    ({"service_tier": "invalid"}, {}, None),
++    ({"service_tier": "auto"}, {}, None),
++    ({"service_tier": "cold"}, {}, None),
++    ({"service_tier": "priority", "service_tier_overrides": {"gpt-5.4": "normal"}}, {}, None),
++    ({"service_tier": "priority", "service_tier_overrides": {"gpt-5.4": "invalid"}}, {}, "priority"),
++])
++def test_aux_service_tier_sources_resolve_for_actual_openai_route(agent_cfg, slot, expected):
++    from agent.auxiliary_client import _build_call_kwargs, _get_task_extra_body
++
++    config = {"agent": agent_cfg, "auxiliary": {"compression": slot}}
++    with patch("hermes_cli.config.load_config_readonly", return_value=config):
++        body = _get_task_extra_body("compression")
++        kwargs = _build_call_kwargs(
++            provider="openai", model="gpt-5.4", messages=[{"role": "user", "content": "hi"}],
++            extra_body=body, base_url="https://api.openai.com/v1", task="compression",
++        )
++    assert kwargs.get("service_tier") == expected
++    assert "speed" not in kwargs
++    assert "service_tier" not in (kwargs.get("extra_body") or {})
++
++
++def test_agent_tier_applies_without_auxiliary_task_name(monkeypatch):
++    from agent.auxiliary_client import _build_call_kwargs
++
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"agent": {"service_tier": "priority"}})
++    kwargs = _build_call_kwargs(
++        provider="openai", model="gpt-5.4", messages=[{"role": "user", "content": "hi"}],
++        base_url="https://api.openai.com/v1",
++    )
++    assert kwargs["service_tier"] == "priority"
++
++
++def test_fallback_request_resolves_tier_for_its_actual_model(monkeypatch):
++    from agent import auxiliary_client as aux
++
++    cfg = {
++        "agent": {"service_tier": "priority", "service_tier_overrides": {"openai/gpt-5": "flex"}},
++        "auxiliary": {"compression": {}},
++    }
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
++    monkeypatch.setattr(aux, "_replan_synchronous_cache_sections", lambda messages, tools, **_k: (messages, tools or []))
++
++    def fallback_kwargs(model):
++        return aux._fallback_request_kwargs(
++            aux._FallbackDestination("openrouter", "https://openrouter.ai/api/v1", None, model),
++            task="compression", messages=[{"role": "user", "content": "hi"}], tools=None,
++            temperature=None, max_tokens=None, effective_timeout=30,
++            effective_extra_body={}, reasoning_config=None, fallback_entry={}, task_config={},
++            apply_fast_lane=False,
++        )
++
++    assert fallback_kwargs("openai/gpt-5")["service_tier"] == "flex"
++    assert fallback_kwargs("meta-llama/llama-3.1-8b-instruct")["service_tier"] == "priority"
++
++
++def test_aux_service_tier_uses_real_profile_config_and_plugin_inheritance(tmp_path, monkeypatch):
++    import hermes_yaml as yaml
++    from agent.auxiliary_client import _build_call_kwargs
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    (home / "config.yaml").write_text(yaml.safe_dump({
++        "agent": {"service_tier": "priority"},
++        "auxiliary": {"inherited_base": {"service_tier": "flex"}},
++    }), encoding="utf-8")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(
++        "hermes_cli.plugins.get_plugin_auxiliary_tasks",
++        lambda: [{"key": "inherited_task", "defaults": {}, "inherit_from": "inherited_base"}],
++    )
++
++    kwargs = _build_call_kwargs(
++        provider="openai", model="gpt-5.4", messages=[{"role": "user", "content": "hi"}],
++        base_url="https://api.openai.com/v1", task="inherited_task",
++    )
++    assert kwargs["service_tier"] == "flex"
++
++
++@pytest.mark.parametrize(
++    ("provider", "model", "base_url"),
++    [("openai", "gpt-5.4", "https://api.openai.com/v1"),
++     ("openrouter", "openai/gpt-5", "https://openrouter.ai/api/v1")],
++)
++def test_aux_service_tier_reaches_sync_async_and_stream_request_kwargs(monkeypatch, provider, model, base_url):
++    from agent import auxiliary_client as aux
++
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"agent": {"service_tier": "priority"}})
++    client = MagicMock()
++    client.base_url = base_url
++    monkeypatch.setattr(
++        aux, "_resolve_task_provider_model",
++        lambda *_a: (provider, model, client.base_url, "key", None),
++    )
++    monkeypatch.setattr(
++        aux, "_resolve_call_client",
++        lambda *_a, **_k: aux._ResolvedAuxRoute(client, model, provider, provider),
++    )
++
++    def prepare(async_mode):
++        return aux._prepare_aux_request(
++            "title_generation", provider=provider, model=model, base_url=client.base_url,
++            api_key="key", main_runtime={}, messages=[{"role": "user", "content": "hi"}],
++            temperature=None, max_tokens=None, tools=None, timeout=None, extra_body=None,
++            reasoning_config=None, extra_headers=None, api_mode=None, route_info=None,
++            async_mode=async_mode,
++        )
++
++    sync_request = prepare(False)
++    assert sync_request.kwargs["service_tier"] == "priority"
++    assert prepare(True).kwargs["service_tier"] == "priority"
++
++    sent = {}
++    monkeypatch.setattr(aux, "_plan_aux_call", lambda *_a, **_k: (sync_request, {}, {}))
++    monkeypatch.setattr(
++        aux, "_relay_sync_stream", lambda _client, kwargs, **_k: (sent.update(kwargs), iter(()))[1],
++    )
++    aux._call_llm_impl(task="title_generation", messages=[], stream=True)
++    assert sent["service_tier"] == "priority"
++    assert sent["stream"] is True
++
++
++def test_anthropic_slot_tier_survives_framework_binding():
++    from agent.fast_mode import effective_request_overrides
++    from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides, bind_aux_slot_service_tier
++
++    slot = {"service_tier": "priority"}
++    with patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"service_tier": "flex"}}):
++        mapped = apply_aux_service_tier_overrides(
++            {}, slot, model="claude-opus-5", provider="anthropic",
++            base_url="https://api.anthropic.com", task="review",
++        )
++    assert mapped["speed"] == "fast"
++    agent = SimpleNamespace(
++        request_overrides=mapped, model="claude-opus-5", provider="anthropic",
++        base_url="https://api.anthropic.com", service_tier=None,
++    )
++    bind_aux_slot_service_tier(agent, slot)
++    assert agent.service_tier == "priority"
++    assert effective_request_overrides(agent)["speed"] == "fast"
+diff --git a/tests/agent/test_background_review_cost_controls.py b/tests/agent/test_background_review_cost_controls.py
+index 19f73956a2..4adf4a1a7a 100644
+--- a/tests/agent/test_background_review_cost_controls.py
++++ b/tests/agent/test_background_review_cost_controls.py
+@@ -86,6 +86,15 @@ def test_unrouted_runtime_keeps_parent_pool_and_overrides():
+     assert rt["credential_pool"] == "parent-pool"
+     assert rt["request_overrides"] == {"service_tier": "priority"}
+     assert rt["max_tokens"] == 4096
++def test_unrouted_runtime_drops_framework_baked_parent_tier():
++    agent = _FakeAgent()
++    agent.request_overrides = {"service_tier": "priority"}
++    agent._framework_baked_tier_keys = frozenset({"service_tier"})
++    with patch("hermes_cli.config.load_config", return_value={}), patch("hermes_cli.config.load_config_readonly", return_value={}):
++        rt = br._resolve_review_runtime(agent)
++    assert "service_tier" not in rt["request_overrides"]
++
++
+ 
+ 
+ def test_unrouted_runtime_applies_aux_service_tier_on_openrouter():
+@@ -135,30 +144,30 @@ def test_routed_runtime_applies_aux_service_tier_on_openrouter():
+     assert rt["request_overrides"].get("service_tier") == "priority"
+ 
+ 
+-def test_aux_service_tier_ignored_on_first_party_review_runtime():
++def test_aux_service_tier_maps_on_first_party_review_runtime():
+     agent = _FakeAgent()
+     cfg = {"auxiliary": {"background_review": {"service_tier": "flex"}}}
+     with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+         "hermes_cli.config.load_config_readonly", return_value=cfg
+     ):
+         rt = br._resolve_review_runtime(agent)
+-    assert "service_tier" not in rt["request_overrides"]
++    assert rt["request_overrides"].get("service_tier") == "flex"
+     assert "speed" not in rt["request_overrides"]
+ 
+ 
+-def test_aux_service_tier_priority_ignored_on_first_party_review_runtime():
++def test_aux_service_tier_priority_maps_on_first_party_review_runtime():
+     agent = _FakeAgent()
+     cfg = {"auxiliary": {"background_review": {"service_tier": "priority"}}}
+     with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+         "hermes_cli.config.load_config_readonly", return_value=cfg
+     ):
+         rt = br._resolve_review_runtime(agent)
+-    assert "service_tier" not in rt["request_overrides"]
++    assert rt["request_overrides"].get("service_tier") == "priority"
+     assert "speed" not in rt["request_overrides"]
+ 
+ 
+ def test_apply_aux_honors_slot_extra_body_over_slot_tier():
+-    from hermes_cli.models import apply_aux_service_tier_overrides
++    from hermes_cli.models_service_tiers import apply_aux_service_tier_overrides
+ 
+     out = apply_aux_service_tier_overrides(
+         {},
+diff --git a/tests/agent/test_curator.py b/tests/agent/test_curator.py
+index 6974c1fba7..3fc7e895a8 100644
+--- a/tests/agent/test_curator.py
++++ b/tests/agent/test_curator.py
+@@ -794,7 +794,7 @@ def test_review_provider_applies_aux_service_tier_priority(curator_env, monkeypa
+     assert overrides.get("service_tier") == "priority"
+ 
+ 
+-def test_review_provider_ignores_aux_service_tier_on_first_party(curator_env, monkeypatch):
++def test_review_provider_maps_aux_service_tier_on_first_party(curator_env, monkeypatch):
+     curator = curator_env["curator"]
+     cfg = {
+         "model": {"provider": "openai", "default": "gpt-5.4"},
+@@ -818,11 +818,11 @@ def test_review_provider_ignores_aux_service_tier_on_first_party(curator_env, mo
+         },
+     )
+     _rp, _model, _provider, overrides = curator._resolve_review_provider()
+-    assert "service_tier" not in overrides
++    assert overrides.get("service_tier") == "flex"
+     assert "speed" not in overrides
+ 
+ 
+-def test_review_provider_ignores_aux_priority_on_first_party(curator_env, monkeypatch):
++def test_review_provider_maps_aux_priority_on_first_party(curator_env, monkeypatch):
+     curator = curator_env["curator"]
+     cfg = {
+         "model": {"provider": "openai", "default": "gpt-5.4"},
+@@ -846,7 +846,7 @@ def test_review_provider_ignores_aux_priority_on_first_party(curator_env, monkey
+         },
+     )
+     _rp, _model, _provider, overrides = curator._resolve_review_provider()
+-    assert "service_tier" not in overrides
++    assert overrides.get("service_tier") == "priority"
+     assert "speed" not in overrides
+ 
+ 
+diff --git a/tests/agent/test_review_engine.py b/tests/agent/test_review_engine.py
+index bb388f10ef..0e213f008a 100644
+--- a/tests/agent/test_review_engine.py
++++ b/tests/agent/test_review_engine.py
+@@ -128,6 +128,41 @@ def test_load_review_credentials_cfg_auto_means_inherit(monkeypatch):
+     )
+     assert re_mod._load_review_credentials_cfg() is None
+ 
++
++@pytest.mark.parametrize("review", [
++    {"service_tier": "priority"},
++    {"extra_body": {"service_tier": "flex", "store": False}},
++])
++def test_load_review_credentials_cfg_keeps_tier_only_aux_slot(monkeypatch, review):
++    monkeypatch.setattr(
++        "hermes_cli.config.load_config_readonly",
++        lambda: {"auxiliary": {"review": review}},
++    )
++    cfg = re_mod._load_review_credentials_cfg()
++    assert cfg["_aux_slot"] == review
++    assert cfg.get("request_overrides") == (
++        {"extra_body": review["extra_body"]} if "extra_body" in review else None
++    )
++
++
++def test_start_review_passes_tier_only_slot_to_delegation(monkeypatch):
++    captured = {}
++    monkeypatch.setattr(
++        "hermes_cli.config.load_config_readonly",
++        lambda: {"auxiliary": {"review": {"service_tier": "priority"}}},
++    )
++
++    def fake_delegate_task(**kwargs):
++        captured.update(kwargs)
++        return json.dumps({"status": "dispatched", "delegation_id": "review-test"})
++
++    monkeypatch.setattr("tools.delegate_tool.delegate_task", fake_delegate_task)
++    result = start_review(
++        _fake_parent(), [{"role": "user", "content": "review this"}],
++    )
++    assert result["status"] == "dispatched"
++    assert captured["credentials_cfg"]["_aux_slot"] == {"service_tier": "priority"}
++
+ def test_load_review_credentials_cfg_missing_section(monkeypatch):
+     monkeypatch.setattr(
+         "hermes_cli.config.load_config_readonly", lambda: {"auxiliary": {}}
+diff --git a/tests/tools/test_delegate_fallback_matrix.py b/tests/tools/test_delegate_fallback_matrix.py
+index d6393fa822..91e997920d 100644
+--- a/tests/tools/test_delegate_fallback_matrix.py
++++ b/tests/tools/test_delegate_fallback_matrix.py
+@@ -70,6 +70,39 @@ def test_pin_is_derived_from_provider_base_url_or_model(overrides, expected):
+     assert _spawn_kwargs(_parent(list(PARENT_CHAIN)), {}, **overrides)["fallback_model"] == expected
+ 
+ 
++def test_review_auxiliary_slot_is_mapped_and_bound_after_child_route_resolution(monkeypatch):
++    from hermes_cli import models_service_tiers
++
++    parent = _parent([])
++    child = MagicMock()
++    child.model = "gpt-5.4"
++    child.provider = "openai"
++    child._current_main_runtime.return_value = {"base_url": "https://api.openai.com/v1"}
++    captured = {}
++
++    def apply(overrides, slot, **route):
++        captured["apply"] = (slot, route)
++        return {"service_tier": "priority"}
++
++    with patch("tools.delegate_tool._load_config", return_value={}), \
++         patch("run_agent.AIAgent", return_value=child), \
++         patch.object(models_service_tiers, "aux_slot_configures_service_tier", return_value=True), \
++         patch.object(models_service_tiers, "apply_aux_service_tier_overrides", side_effect=apply), \
++         patch.object(models_service_tiers, "bind_aux_slot_service_tier", side_effect=lambda agent, slot: captured.update(bind=(agent, slot))):
++        _build_child_agent(
++            task_index=0, goal="review", context=None, toolsets=None, model=None,
++            max_iterations=10, parent_agent=parent, task_count=1,
++            auxiliary_slot={"service_tier": "priority"},
++        )
++
++    assert captured["apply"] == (
++        {"service_tier": "priority"},
++        {"model": "gpt-5.4", "provider": "openai", "base_url": "https://api.openai.com/v1", "task": "review"},
++    )
++    assert child.request_overrides == {"service_tier": "priority"}
++    assert captured["bind"] == (child, {"service_tier": "priority"})
++
++
+ def test_declared_chain_flows_through_real_profile_config_loader(
+     tmp_path, monkeypatch
+ ):
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 31baa95cd4..7c121e5b2b 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -210,6 +210,7 @@ def _build_child_agent(
+     # ACP transport overrides from trusted delegation config.
+     override_acp_command: Optional[str] = None,
+     override_acp_args: Optional[list[str]] = None,
++    auxiliary_slot: Optional[dict[str, Any]] = None,
+     # Configuration block that owns the selected provider/model route. Internal
+     # callers such as /review pass auxiliary.review here so fallback policy is
+     # not accidentally read from the general delegation block.
+@@ -301,6 +302,19 @@ def _build_child_agent(
+                     release_or_close(child_session_db)
+             raise
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
++    if isinstance(auxiliary_slot, dict):
++        from hermes_cli.models_service_tiers import (
++            apply_aux_service_tier_overrides, aux_slot_configures_service_tier,
++            bind_aux_slot_service_tier,
++        )
++        if aux_slot_configures_service_tier(auxiliary_slot):
++            runtime = child._current_main_runtime()
++            child.request_overrides = apply_aux_service_tier_overrides(
++                child.request_overrides, auxiliary_slot,
++                model=child.model, provider=child.provider,
++                base_url=runtime.get("base_url"), task="review",
++            )
++            bind_aux_slot_service_tier(child, auxiliary_slot)
+     _apply_child_cache_ttl(child)
+     if child_session_db is not None:
+         child._owns_session_db = True  # released by the child's close(), never by the parent
+@@ -424,6 +438,7 @@ def _build_children(
+     task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], creds: dict[str, Any], *,
+     top_role: str, max_iterations: int, parent_agent, routing_cfg: dict[str, Any],
+     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
++    auxiliary_slot: Optional[dict[str, Any]] = None,
+ ) -> tuple[list[tuple], Optional[str]]:
+     """Build every child on the main thread (construction is not thread-safe);
+     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
+@@ -441,7 +456,8 @@ def _build_children(
+                 task_index=i, goal=t["goal"], context=_child_context,
+                 toolsets=None,  # always inherit the parent's toolsets
+                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
++                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
++                auxiliary_slot=auxiliary_slot, **overrides,
+             )
+         except ValueError as exc:
+             return [], str(exc)
+@@ -586,6 +602,7 @@ def delegate_task(
+     children, err = _build_children(
+         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
++        auxiliary_slot=credentials_cfg.get("_aux_slot") if credentials_cfg else None,
+     )
+     if err:
+         return tool_error(err)
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index ae8ef79757..988feacdb7 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1478,12 +1478,14 @@ Every model slot in Hermes — auxiliary tasks, compression, fallback — uses t
+ | `model` | Which model to request | provider's default |
+ | `base_url` | Custom OpenAI-compatible endpoint (overrides provider) | not set |
+ 
+-Auxiliary task blocks additionally accept a `reasoning_effort` knob and an OpenRouter-only `service_tier` shortcut:
++Auxiliary task blocks additionally accept `reasoning_effort` and a route-aware `service_tier` override:
+ 
+ | Key | What it does | Default |
+ |-----|-------------|---------|
+ | `reasoning_effort` | Thinking level for that task's LLM calls: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | not set (provider default) |
+-| `service_tier` | OpenRouter queue: `flex` or `priority`. Applied after the slot's runtime resolves. First-party routes ignore it. | not set |
++| `service_tier` | Static tier for that task, mapped through the same provider/model capability checks as [Fast Mode](#fast-mode). If unset, `agent.service_tier_overrides` for the resolved model, then `agent.service_tier`, apply. | not set |
++
++Tier precedence is `auxiliary.<task>.extra_body.service_tier` > `auxiliary.<task>.service_tier` > per-model agent override > global agent tier. An explicit `normal`/`default` disables lower-priority tiers; empty means unset. Unsupported provider/model combinations omit the derived tier. `auto` and `cold` are main-turn windows and do not create an auxiliary-call tier; temporary session `/fast` pins are not inherited by ordinary child, cron, or background work. A task-level setting still beats agent-level fallback, so a background task can remain standard while the main session uses a premium tier.
+ 
+ This is the per-task counterpart of the global `agent.reasoning_effort`: run compression at `low` or vision at `none` to cut side-task latency and cost when your main model is an expensive reasoning model, without touching your main chat behavior. It applies to auxiliary-client tasks such as `vision`, `compression`, `title_generation`, and `curator`, across all three auxiliary wire formats (chat completions, Codex Responses, Anthropic Messages). An explicit `extra_body.reasoning` on the same task wins over the shorthand. A caller that turns thinking off for its own call (title generation does — a 64-token title has no room for reasoning) wins over both: the task-level effort is dropped for that request instead of being sent beside the provider's thinking-off field.
+ 
+-- 
+2.54.0
+
