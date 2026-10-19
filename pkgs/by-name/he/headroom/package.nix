@@ -18,7 +18,6 @@
 {
   lib,
   stdenv,
-  python3Packages,
   makeWrapper,
   writeText,
   fetchurl,
@@ -29,11 +28,12 @@
   difftastic,
   scc,
   git,
-  headroomSource,
+  headroom-source,
   headroom-py,
+  headroom-python-pkgs,
   headroom-proxy,
   rtk,
-  codebaseMemoryMcp,
+  codebase-memory-mcp,
   gitHooks,
   treefmtEval,
   mkShell,
@@ -44,22 +44,8 @@
   prek,
 }:
 let
-  inherit (python3Packages) python;
-  py = python3Packages;
-  treefmt = treefmtEval ./treefmt.nix;
-  git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce ../../../..;
-    package = prek;
-    hooks = {
-      convco.enable = true;
-      treefmt = {
-        enable = true;
-        package = treefmt.config.build.wrapper;
-        settings.fail-on-change = true;
-      };
-    };
-  };
+  inherit (headroom-python-pkgs) python;
+  py = headroom-python-pkgs;
   ortDylib = "${onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
 
   # The `headroom = headroom.cli:main` console-script body (a shebang is
@@ -73,7 +59,7 @@ let
   '';
 
   buildInfo = writeText "headroom-build-info.py" ''
-    BUILD_VERSION = "${headroomSource.version}"
+    BUILD_VERSION = "${headroom-source.version}"
   '';
 
   # Provide every subprocess tool on PATH; CBM and the other tools are Nix-built.
@@ -81,7 +67,7 @@ let
     inherit ast-grep scc;
     difft = difftastic;
     inherit rtk;
-    codebase-memory-mcp = codebaseMemoryMcp;
+    inherit codebase-memory-mcp;
   };
 
   # All applicable optional extras except dev, including extras not selected by
@@ -295,8 +281,8 @@ let
 
   headroom = py.buildPythonPackage {
     pname = "headroom";
-    inherit (headroomSource) version;
-    src = headroomSource.testSrc;
+    inherit (headroom-source) version;
+    src = headroom-source;
 
     # The extension is copied from headroom-py, not rebuilt, so there is no
     # pyproject/maturin build step — install the source tree ourselves.
@@ -460,6 +446,23 @@ let
       platforms = lib.platforms.unix;
     };
   };
+
+  treefmt = treefmtEval ./treefmt.nix;
+
+  git-hooks = gitHooks.run {
+    src = ./.;
+    rootSrc = lib.mkForce ../../../..;
+    package = prek;
+    hooks = {
+      convco.enable = true;
+      treefmt = {
+        enable = true;
+        package = treefmt.config.build.wrapper;
+        settings.fail-on-change = true;
+      };
+    };
+  };
+
   devShell = mkShell {
     inputsFrom = [
       headroom-proxy

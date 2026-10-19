@@ -1,11 +1,9 @@
 {
   rustPlatform,
   cacert,
-  coverageRustPlatform,
-  coverageCacert,
   cargo-llvm-cov,
   llvm,
-  coveragePython,
+  python3,
   gitHooks,
   treefmtEval,
   runCommand,
@@ -20,17 +18,17 @@
 let
   version = "0.1.0";
   treefmt = treefmtEval ./treefmt.nix;
-  coverage = coverageRustPlatform.buildRustPackage {
+  coverage = rustPlatform.buildRustPackage {
     pname = "gh-token-manager-coverage";
     inherit version;
     src = ./.;
     cargoLock.lockFile = ./Cargo.lock;
     doCheck = false;
     nativeBuildInputs = [
-      coverageCacert
+      cacert
       cargo-llvm-cov
       llvm
-      coveragePython
+      python3
     ];
     LLVM_COV = "${llvm}/bin/llvm-cov";
     LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
@@ -85,7 +83,7 @@ let
       cacert
       cargo-llvm-cov
       llvm
-      coveragePython
+      python3
     ]
     ++ git-hooks.enabledPackages
     ++ [ treefmt.config.build.wrapper ];

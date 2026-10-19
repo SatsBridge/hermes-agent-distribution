@@ -1,17 +1,26 @@
 # Headroom 0.41 requires newer Python dependencies than nixos-26.05 provides.
 # Keep them on nixpkgs-unstable's Python 3.13 set so compiled extensions share
 # one interpreter; override only versions that still miss upstream's floors.
-{ pkgs, unstable }:
+{
+  fetchFromGitHub,
+  lib,
+  python3Packages,
+  python313Packages,
+  rustPlatform,
+  protobuf_29,
+  abseil-cpp,
+  onnx,
+}:
 let
   # AutoGen requires protobuf 5.29; ONNX 1.23 requires protobuf 6.31+.
   # Keep ONNX on the compatible source release rather than weakening either constraint.
-  onnxSource = unstable.python313Packages.fetchPypi {
+  onnxSource = python313Packages.fetchPypi {
     pname = "onnx";
     version = "1.22.0";
     hash = "sha256-70DAqvC2Q4V+qTBvx+3c4X6vn7BAfkgB8fxXWEQ6OOA=";
   };
 in
-unstable.python313Packages.overrideScope (
+python313Packages.overrideScope (
   final: prev:
   let
     # Keep Python and C++ protobuf runtimes aligned at 5.29 for AutoGen/ONNX.
@@ -23,8 +32,8 @@ unstable.python313Packages.overrideScope (
         hash = "sha256-2p7mpUJLazD9XkXF6mY671QMqV+a2Z0eiH6BnN+bhyM=";
       };
       propagatedNativeBuildInputs = [
-        unstable.protobuf_29
-        unstable.abseil-cpp
+        protobuf_29
+        abseil-cpp
       ];
       doCheck = false;
       postInstall = ''
@@ -34,17 +43,22 @@ unstable.python313Packages.overrideScope (
       '';
     });
 
-    onnxCpp = unstable.onnx.overrideAttrs (old: {
+    onnxCpp = onnx.overrideAttrs (old: {
       version = "1.22.0";
       src = onnxSource;
       buildInputs = [
-        unstable.protobuf_29
-        unstable.abseil-cpp
-        unstable.python3Packages.protobuf
+        abseil-cpp
+        protobuf
+        protobuf_29
       ];
       cmakeFlags = old.cmakeFlags ++ [ "-DCMAKE_CXX_STANDARD=20" ];
+      env = old.env // {
+        PYTHONPATH = python3Packages.makePythonPath (
+          builtins.attrValues { inherit (python3Packages) protobuf scikit-build-core; }
+        );
+      };
       preBuild = ''
-        export PATH=${unstable.protobuf_29}/bin:$PATH
+        export PATH=${protobuf_29}/bin:$PATH
       ''
       + old.preBuild;
       postPatch = ''
@@ -136,13 +150,13 @@ unstable.python313Packages.overrideScope (
     # Match uv.lock; LiteLLM's bundled price map is part of runtime semantics.
     litellm = prev.litellm.overridePythonAttrs (old: rec {
       version = "1.101.0";
-      src = pkgs.fetchFromGitHub {
+      src = fetchFromGitHub {
         owner = "BerriAI";
         repo = "litellm";
         tag = "v${version}";
         hash = "sha256-rYsMMuk3/DgSJclKrK354m9mJli3Ug2gR16+mIx0LDY=";
       };
-      cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+      cargoDeps = rustPlatform.fetchCargoVendor {
         pname = "litellm";
         inherit version src;
         cargoRoot = "litellm-rust";
@@ -335,8 +349,8 @@ unstable.python313Packages.overrideScope (
       meta = {
         description = "Tree-sitter language parsers built from source";
         homepage = "https://github.com/Goldziher/tree-sitter-language-pack";
-        license = pkgs.lib.licenses.mit;
-        platforms = pkgs.lib.platforms.linux;
+        license = lib.licenses.mit;
+        platforms = lib.platforms.linux;
       };
     };
   }

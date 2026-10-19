@@ -11,7 +11,7 @@
   lib,
   python3Packages,
   writeText,
-  headroomSource,
+  headroom-source,
   gitHooks,
   treefmtEval,
   mkShell,
@@ -19,17 +19,7 @@
 }:
 let
   inherit (python3Packages) python;
-  treefmt = treefmtEval ./treefmt.nix;
-  git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce ../../../..;
-    package = prek;
-    hooks.treefmt = {
-      enable = true;
-      package = treefmt.config.build.wrapper;
-      settings.fail-on-change = true;
-    };
-  };
+
   # The Python environment the Hermes host loads the plugin under: it must carry
   # httpx (the plugin's only third-party import). Bound here so the same
   # interpreter both backs propagatedBuildInputs and drives the install check.
@@ -90,8 +80,8 @@ let
   '';
   headroom-hermes-plugin = stdenvNoCC.mkDerivation {
     pname = "headroom-hermes-plugin";
-    inherit (headroomSource) version;
-    inherit (headroomSource) src;
+    inherit (headroom-source) version;
+    inherit (headroom-source) src;
 
     # Bring httpx onto PYTHONPATH via a .pth-free wrapper: the plugin is imported
     # by the Hermes process, so record the dependency in passthru and expose a
@@ -162,6 +152,20 @@ let
       platforms = lib.platforms.all;
     };
   };
+
+  treefmt = treefmtEval ./treefmt.nix;
+
+  git-hooks = gitHooks.run {
+    src = ./.;
+    rootSrc = lib.mkForce ../../../..;
+    package = prek;
+    hooks.treefmt = {
+      enable = true;
+      package = treefmt.config.build.wrapper;
+      settings.fail-on-change = true;
+    };
+  };
+
   devShell = mkShell {
     inputsFrom = [ headroom-hermes-plugin ];
     packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];

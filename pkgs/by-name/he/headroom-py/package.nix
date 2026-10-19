@@ -15,14 +15,14 @@
 {
   lib,
   writeText,
-  python3Packages,
+  headroom-python-pkgs,
   rustPlatform,
   pkg-config,
   cmake,
   perl,
   onnxruntime,
   stdenv,
-  headroomSource,
+  headroom-source,
   gitHooks,
   treefmtEval,
   mkShell,
@@ -55,11 +55,11 @@ let
     print("headroom-py: _core loads OK")
   '';
 
-  headroom-py = python3Packages.buildPythonPackage {
+  headroom-py = headroom-python-pkgs.buildPythonPackage {
     pname = "headroom-py";
-    inherit (headroomSource) version;
+    inherit (headroom-source) version;
     pyproject = true;
-    inherit (headroomSource) src;
+    inherit (headroom-source) src;
 
     nativeBuildInputs = builtins.attrValues {
       inherit (rustPlatform) maturinBuildHook cargoSetupHook;
@@ -67,7 +67,7 @@ let
     };
 
     # Reproducible Cargo vendoring from the committed lockfile.
-    cargoDeps = rustPlatform.importCargoLock { lockFile = "${headroomSource.src}/Cargo.lock"; };
+    cargoDeps = rustPlatform.importCargoLock { lockFile = "${headroom-source.src}/Cargo.lock"; };
 
     # ONNX Runtime that fastembed (linked into _core) dlopens at runtime.
     buildInputs = [ onnxruntime ];
@@ -102,7 +102,7 @@ let
       runHook preInstallCheck
       so=$(find "$out" -name '_core*.so' -print -quit)
       test -n "$so"
-      ${python3Packages.python.interpreter} ${loadCheck} "$so"
+      ${headroom-python-pkgs.python.interpreter} ${loadCheck} "$so"
       runHook postInstallCheck
     '';
 
@@ -110,7 +110,6 @@ let
     # full package's tree without hunting for it.
     passthru = {
       coreLib = "_core.abi3.so";
-      inherit python3Packages;
       inherit treefmt git-hooks devShell;
     };
 

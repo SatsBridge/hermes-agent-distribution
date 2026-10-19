@@ -19,35 +19,23 @@
   onnxruntime,
   stdenv,
   libiconv,
-  headroomSource,
+  headroom-source,
   gitHooks,
   treefmtEval,
   mkShell,
   prek,
 }:
 let
-  treefmt = treefmtEval ./treefmt.nix;
-  git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce ../../../..;
-    package = prek;
-    hooks.treefmt = {
-      enable = true;
-      package = treefmt.config.build.wrapper;
-      settings.fail-on-change = true;
-    };
-  };
   # ONNX Runtime shared library that `ort` dlopens at runtime (load-dynamic;
   # see patches/0001). Wired at build, test, and run time.
   ortDylib = "${lib.getLib onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
 
   commonArgs = {
     pname = "headroom-proxy";
-    inherit (headroomSource) version;
-    inherit (headroomSource) src;
-
+    inherit (headroom-source) version;
+    inherit (headroom-source) src;
     cargoLock = {
-      lockFile = "${headroomSource.src}/Cargo.lock";
+      lockFile = "${headroom-source.src}/Cargo.lock";
     };
 
     buildAndTestSubdir = "crates/headroom-proxy";
@@ -69,32 +57,18 @@ let
 
     # ort load-dynamic: resolve libonnxruntime without a network fetch.
     env.ORT_DYLIB_PATH = ortDylib;
-  };
 
-  clippyCheck = rustPlatform.buildRustPackage (
-    commonArgs
-    // {
-      pname = "headroom-proxy-clippy";
-      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ clippy ];
-      buildPhase = ''
-        runHook preBuild
-        cargo clippy --release -p headroom-proxy --all-targets -- --deny warnings
-        runHook postBuild
-      '';
-      doCheck = false;
-      installPhase = "touch $out";
-    }
-  );
+    # `e2e_real` spawns the Python proxy and hits live provider APIs; it
+    # self-skips without HEADROOM_E2E=1 but is excluded here so the target is
+    # not even considered. Every hermetic wiremock-backed integration test in
+    # the crate still runs.
+    checkFlags = [ "--skip=e2e_real" ];
+
+  };
   headroom-proxy = rustPlatform.buildRustPackage (
     commonArgs
     // {
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ makeWrapper ];
-
-      # `e2e_real` spawns the Python proxy and hits live provider APIs; it
-      # self-skips without HEADROOM_E2E=1 but is excluded here so the target is
-      # not even considered. Every hermetic wiremock-backed integration test in
-      # the crate still runs.
-      checkFlags = [ "--skip=e2e_real" ];
 
       # Wrap the binary so it always finds libonnxruntime regardless of the
       # caller's environment.
@@ -105,9 +79,12 @@ let
       '';
 
       passthru = {
-        inherit headroomSource;
-        clippy = clippyCheck;
-        inherit treefmt git-hooks devShell;
+        inherit
+          clippy
+          treefmt
+          git-hooks
+          devShell
+          ;
       };
 
       meta = {
@@ -118,6 +95,20 @@ let
       };
     }
   );
+
+  treefmt = treefmtEval ./treefmt.nix;
+
+  git-hooks = gitHooks.run {
+    src = ./.;
+    rootSrc = lib.mkForce ../../../..;
+    package = prek;
+    hooks.treefmt = {
+      enable = true;
+      package = treefmt.config.build.wrapper;
+      settings.fail-on-change = true;
+    };
+  };
+
   devShell = mkShell {
     inputsFrom = [ headroom-proxy ];
     packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];
