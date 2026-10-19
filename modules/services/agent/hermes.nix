@@ -582,7 +582,7 @@ let
                         ]
                       } &
                     ''}
-                    wait
+                    wait -n
                   '';
                 }
               );
@@ -604,7 +604,9 @@ let
                 };
               }
             );
-            mnemosyneConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-mnemosyne-config.yaml" agentCfg.settings.memory.nix-managed-mnemosyne-hermes;
+            mnemosyneConfig = (pkgs.formats.yaml { }).generate
+              "${agentStateId}-mnemosyne-config.yaml"
+              (agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { });
           in
           [
             "d %S/private 0700 - - - -"
@@ -624,8 +626,6 @@ let
             "L+ ${hermesAgentStatePath}/config.yaml - - - - ${config}"
             "d ${hermesAgentStatePath}/mnemosyne 2700 - - - -"
             "L+ ${hermesAgentStatePath}/mnemosyne/config.yaml - - - - ${mnemosyneConfig}"
-            "L+ ${hermesAgentStatePath}/SOUL.md - - - - ${./../../../souls/${agentCfg.fullName}/SOUL.md}"
-            "L+ ${hermesAgentStatePath}/profile.yaml - - - - ${./../../../souls/${agentCfg.fullName}/profile.yaml}"
             "L+ ${hermesAgentStatePath}/profiles - - - - ${
               pkgs.linkFarm "hermes-${name}-profiles" (
                 builtins.map ({ name, fullName, ... }: {

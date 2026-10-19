@@ -1,7 +1,7 @@
 {
   lib,
   stdenv,
-  python3Unstable,
+  python3,
   rustPlatform,
   fetchFromGitHub,
   fetchPypi,
@@ -10,11 +10,9 @@
   olm,
   versionCheckHook,
   writeText,
-  #versionCheckHomeHook,
   cosign,
   tirith,
   mnemosyne,
-  mnemosyne-hermes,
   agent-browser,
   playwright,
   # replace to https://github.com/arman-bd/chromiumfish
@@ -24,7 +22,6 @@
 }:
 
 let
-  python3 = python3Unstable;
   # Native (PyO3) runtime for hermes' Relay lifecycle and shared metrics.
   # PyPI ships wheels only, so build from source with maturin.
   # Version is kept in range of hermes' pyproject constraint by update.py.
@@ -419,14 +416,6 @@ let
   # Upstream extras only warn-and-disable at runtime when missing (#4175), so
   # ship every extra nixpkgs has. Not yet packaged: honcho, daytona, dingtalk,
   # feishu.
-  # libolm is marked insecure in nixpkgs but mautrix[encryption] needs it for
-  # Matrix E2EE.
-  clearedOlm = olm.overrideAttrs (old: {
-    meta = old.meta // {
-      knownVulnerabilities = [ ];
-    };
-  });
-
   # nixpkgs' firecrawl-py 2.8.0 builds from the firecrawl monorepo tag v2.8.0,
   # whose python-sdk pyproject declares a different SDK version, so the new
   # pythonMetadataCheckPhase fails. Skip the check until nixpkgs fixes the
@@ -492,7 +481,7 @@ let
       # [matrix] — nixpkgs mautrix lacks the encryption extra, so add its
       # crypto deps explicitly.
       mautrix
-      (python-olm.override { olm = clearedOlm; })
+      (python-olm.override { inherit olm; })
       unpaddedbase64
       pycryptodome
       base58
@@ -524,7 +513,6 @@ let
     propagate = [
       tiktoken
       mnemosyne
-      mnemosyne-hermes
     ];
   };
 
@@ -718,7 +706,6 @@ python3.pkgs.buildPythonApplication {
   doInstallCheck = true;
   nativeInstallCheckInputs = [
     versionCheckHook
-    #versionCheckHomeHook
   ];
   versionCheckProgramArg = [ "--version" ];
 
