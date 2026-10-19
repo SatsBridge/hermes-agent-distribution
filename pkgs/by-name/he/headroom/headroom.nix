@@ -34,11 +34,55 @@
   headroom-proxy,
   rtk,
   codebaseMemoryMcp,
+  gitHooks,
+  treefmtEval,
+  mkShell,
+  rustc,
+  cargo,
+  maturin,
+  uv,
+  prek,
 }:
 let
   inherit (python3Packages) python;
   py = python3Packages;
-
+  treefmt = treefmtEval ./treefmt.nix;
+  hookSource = builtins.path {
+    path = ../../../..;
+    name = "headroom-hooks";
+    filter =
+      path: _:
+      let
+        root = toString ../../../..;
+        pathString = toString path;
+        relative = if pathString == root then "" else lib.removePrefix "${root}/" pathString;
+        packageDirs = [
+          "pkgs/by-name/he/headroom"
+          "pkgs/by-name/he/headroom-hermes-plugin"
+          "pkgs/by-name/he/headroom-proxy"
+          "pkgs/by-name/he/headroom-py"
+        ];
+      in
+      relative == ""
+      || relative == "headroom-nix"
+      || lib.hasPrefix "headroom-nix/" relative
+      || relative == "pkgs"
+      || relative == "pkgs/by-name"
+      || relative == "pkgs/by-name/he"
+      || builtins.any (dir: relative == dir || lib.hasPrefix "${dir}/" relative) packageDirs;
+  };
+  git-hooks = gitHooks.run {
+    src = hookSource;
+    package = prek;
+    hooks = {
+      convco.enable = true;
+      treefmt = {
+        enable = true;
+        package = treefmt.config.build.wrapper;
+        settings.fail-on-change = true;
+      };
+    };
+  };
   ortDylib = "${onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
 
   # The `headroom = headroom.cli:main` console-script body (a shebang is
@@ -271,166 +315,191 @@ let
     "-m"
     "not slow and not real_llm and not live"
   ];
-in
-py.buildPythonPackage {
-  pname = "headroom";
-  inherit (headroomSource) version;
-  src = headroomSource.testSrc;
 
-  # The extension is copied from headroom-py, not rebuilt, so there is no
-  # pyproject/maturin build step — install the source tree ourselves.
-  format = "other";
+  headroom = py.buildPythonPackage {
+    pname = "headroom";
+    inherit (headroomSource) version;
+    src = headroomSource.testSrc;
 
-  nativeBuildInputs = [ makeWrapper ];
+    # The extension is copied from headroom-py, not rebuilt, so there is no
+    # pyproject/maturin build step — install the source tree ourselves.
+    format = "other";
 
-  dependencies = runtimeDeps;
+    nativeBuildInputs = [ makeWrapper ];
 
-  # `format = "other"` gives us the default stdenv phases; there is nothing to
-  # configure or compile here (the extension is prebuilt in headroom-py and the
-  # Python code is installed verbatim), so those phases are skipped. The custom
-  # installPhase below does all the work.
-  dontConfigure = true;
-  dontBuild = true;
+    dependencies = runtimeDeps;
 
-  # Extra wrapper arguments applied by wrapPythonProgramsHook (which also injects
-  # the propagated dependencies onto PYTHONPATH): the offline CLI tools on PATH
-  # and libonnxruntime for the compiled core.
-  # Keep LiteLLM on its bundled map; a refresh would violate the offline runtime.
-  makeWrapperArgs = [
-    # Prevent a caller's Python path from shadowing the pinned package set.
-    "--unset"
-    "PYTHONPATH"
-    "--prefix"
-    "PATH"
-    ":"
-    (lib.makeBinPath bundledTools)
-    "--set-default"
-    "LITELLM_LOCAL_MODEL_COST_MAP"
-    "True"
-    "--set"
-    "HEADROOM_BINARIES_OFFLINE"
-    "1"
-    "--set"
-    "DO_NOT_TRACK"
-    "1"
-    "--set-default"
-    "ORT_DYLIB_PATH"
-    ortDylib
-  ];
+    # `format = "other"` gives us the default stdenv phases; there is nothing to
+    # configure or compile here (the extension is prebuilt in headroom-py and the
+    # Python code is installed verbatim), so those phases are skipped. The custom
+    # installPhase below does all the work.
+    dontConfigure = true;
+    dontBuild = true;
 
-  # Install the pure-Python `headroom/` package and its data files verbatim,
-  # then drop the prebuilt compiled extension in beside them and write the
-  # `headroom` console-script (pyproject: `headroom = headroom.cli:main`).
-  # wrapPythonProgramsHook wraps that script in postFixup, adding the runtime
-  # dependencies (propagated) and the makeWrapperArgs above.
-  installPhase = ''
-    runHook preInstall
+    # Extra wrapper arguments applied by wrapPythonProgramsHook (which also injects
+    # the propagated dependencies onto PYTHONPATH): the offline CLI tools on PATH
+    # and libonnxruntime for the compiled core.
+    # Keep LiteLLM on its bundled map; a refresh would violate the offline runtime.
+    makeWrapperArgs = [
+      # Prevent a caller's Python path from shadowing the pinned package set.
+      "--unset"
+      "PYTHONPATH"
+      "--prefix"
+      "PATH"
+      ":"
+      (lib.makeBinPath bundledTools)
+      "--set-default"
+      "LITELLM_LOCAL_MODEL_COST_MAP"
+      "True"
+      "--set"
+      "HEADROOM_BINARIES_OFFLINE"
+      "1"
+      "--set"
+      "DO_NOT_TRACK"
+      "1"
+      "--set-default"
+      "ORT_DYLIB_PATH"
+      ortDylib
+    ];
 
-    site="$out/${python.sitePackages}"
-    mkdir -p "$site"
-    cp -r headroom "$site/"
-    cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
-      "$site/headroom/${headroom-py.passthru.coreLib}"
-    cp ${buildInfo} "$site/headroom/_build_info.py"
+    # Install the pure-Python `headroom/` package and its data files verbatim,
+    # then drop the prebuilt compiled extension in beside them and write the
+    # `headroom` console-script (pyproject: `headroom = headroom.cli:main`).
+    # wrapPythonProgramsHook wraps that script in postFixup, adding the runtime
+    # dependencies (propagated) and the makeWrapperArgs above.
+    installPhase = ''
+      runHook preInstall
 
-    mkdir -p "$out/bin"
-    # The console-script body from pyproject (`headroom = headroom.cli:main`),
-    # with the interpreter shebang patched in. wrapPythonProgramsHook then wraps
-    # it with the propagated deps' PYTHONPATH and makeWrapperArgs.
-    {
-      echo "#!${python.interpreter}"
-      cat ${launcher}
-    } > "$out/bin/headroom"
-    chmod +x "$out/bin/headroom"
+      site="$out/${python.sitePackages}"
+      mkdir -p "$site"
+      cp -r headroom "$site/"
+      cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
+        "$site/headroom/${headroom-py.passthru.coreLib}"
+      cp ${buildInfo} "$site/headroom/_build_info.py"
 
-    runHook postInstall
-  '';
+      mkdir -p "$out/bin"
+      # The console-script body from pyproject (`headroom = headroom.cli:main`),
+      # with the interpreter shebang patched in. wrapPythonProgramsHook then wraps
+      # it with the propagated deps' PYTHONPATH and makeWrapperArgs.
+      {
+        echo "#!${python.interpreter}"
+        cat ${launcher}
+      } > "$out/bin/headroom"
+      chmod +x "$out/bin/headroom"
 
-  # Full offline test run against the installed source with the real dependency
-  # set. Only individual network / process-spawn cases are deselected, each with
-  # a reason above.
-  # Test-only dependencies; these do not enter the runtime closure.
-  nativeCheckInputs =
-    builtins.attrValues {
-      inherit (py)
-        pytest
-        pytest-asyncio
-        packaging
-        respx
-        socksio
+      runHook postInstall
+    '';
+
+    # Full offline test run against the installed source with the real dependency
+    # set. Only individual network / process-spawn cases are deselected, each with
+    # a reason above.
+    # Test-only dependencies; these do not enter the runtime closure.
+    nativeCheckInputs =
+      builtins.attrValues {
+        inherit (py)
+          pytest
+          pytest-asyncio
+          packaging
+          respx
+          socksio
+          ;
+      }
+      ++ bundledTools
+      ++ [ git ];
+    checkPhase = ''
+      runHook preCheck
+
+      # pytest collects from the unpacked source root, where the in-tree
+      # `headroom/` (no compiled extension) shadows the installed one. Drop the
+      # prebuilt `_core` in beside the sources so `import headroom._core` resolves.
+      cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
+        headroom/${headroom-py.passthru.coreLib}
+
+      export TIKTOKEN_CACHE_DIR=${tiktokenCache}
+      # nixpkgs sets HOME=/homeless-shelter (non-writable); several tests write
+      # under $HOME (rtk/wrap setup, memory db). Point it at a writable temp dir.
+      export HOME=$(mktemp -d)
+      export USER=hermes LOGNAME=hermes
+      # nixpkgs' stdenv forces SSL_CERT_FILE=/no-cert-file.crt for hermeticity.
+      # The proxy startup builds an httpx.AsyncClient, and httpx reads that var to
+      # seed its SSL context — a nonexistent path makes ssl.create_default_context
+      # raise FileNotFoundError, breaking every proxy-startup test (which use
+      # TestClient / wiremock, not real network). Point it at a real CA bundle so
+      # the context builds; no test makes an outbound TLS connection.
+      export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
+      export NIX_SSL_CERT_FILE=$SSL_CERT_FILE
+      export LITELLM_LOCAL_MODEL_COST_MAP=True
+      export ORT_DYLIB_PATH=${ortDylib}
+      # The proxy's /readyz and /health probe the configured upstream API with a
+      # HEAD request at startup; with no network in the sandbox that probe fails
+      # and the health checks report "unhealthy" (503). This is Headroom's own
+      # documented opt-out for environments that can't reach the upstream — it
+      # only suppresses the network probe, every other health component still
+      # reports for real. Tests that exercise the probe itself override this per
+      # test via monkeypatch (setenv/delenv), so the global default is safe.
+      export HEADROOM_SKIP_UPSTREAM_CHECK=1
+      # Model artifacts are not vendored; prevent HuggingFace clients from retrying egress.
+      export HF_HUB_OFFLINE=1
+      export TRANSFORMERS_OFFLINE=1
+      # difft/scc/rtk/ast-grep resolve from PATH (no GitHub fetch). Belt-and-braces:
+      # if any code path still tries to fetch a binary, fail closed instead of
+      # reaching the network — the sandbox has none anyway.
+      export PATH=${lib.makeBinPath bundledTools}:$PATH
+      export HEADROOM_BINARIES_OFFLINE=1
+
+      ${python.interpreter} ${./check-extra-dependencies.py}
+
+      # Preserve the Nix upstream-health opt-out; test-local HEADROOM flags stay scrubbed.
+      substituteInPlace tests/conftest.py \
+        --replace-fail 'if key.startswith("HEADROOM_"):' \
+                       'if key.startswith("HEADROOM_") and key != "HEADROOM_SKIP_UPSTREAM_CHECK":'
+
+      ${py.python.interpreter} -m pytest -p no:cacheprovider -q \
+        ${lib.escapeShellArgs deselectArgs}
+
+      runHook postCheck
+    '';
+
+    pythonImportsCheck = [
+      "headroom"
+      "headroom._core"
+      "headroom._build_info"
+    ];
+
+    passthru = {
+      proxy = headroom-proxy;
+      inherit
+        tiktokenCache
+        treefmt
+        git-hooks
+        devShell
         ;
-    }
-    ++ bundledTools
-    ++ [ git ];
-  checkPhase = ''
-    runHook preCheck
+    };
 
-    # pytest collects from the unpacked source root, where the in-tree
-    # `headroom/` (no compiled extension) shadows the installed one. Drop the
-    # prebuilt `_core` in beside the sources so `import headroom._core` resolves.
-    cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
-      headroom/${headroom-py.passthru.coreLib}
-
-    export TIKTOKEN_CACHE_DIR=${tiktokenCache}
-    # nixpkgs sets HOME=/homeless-shelter (non-writable); several tests write
-    # under $HOME (rtk/wrap setup, memory db). Point it at a writable temp dir.
-    export HOME=$(mktemp -d)
-    export USER=hermes LOGNAME=hermes
-    # nixpkgs' stdenv forces SSL_CERT_FILE=/no-cert-file.crt for hermeticity.
-    # The proxy startup builds an httpx.AsyncClient, and httpx reads that var to
-    # seed its SSL context — a nonexistent path makes ssl.create_default_context
-    # raise FileNotFoundError, breaking every proxy-startup test (which use
-    # TestClient / wiremock, not real network). Point it at a real CA bundle so
-    # the context builds; no test makes an outbound TLS connection.
-    export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
-    export NIX_SSL_CERT_FILE=$SSL_CERT_FILE
-    export LITELLM_LOCAL_MODEL_COST_MAP=True
-    export ORT_DYLIB_PATH=${ortDylib}
-    # The proxy's /readyz and /health probe the configured upstream API with a
-    # HEAD request at startup; with no network in the sandbox that probe fails
-    # and the health checks report "unhealthy" (503). This is Headroom's own
-    # documented opt-out for environments that can't reach the upstream — it
-    # only suppresses the network probe, every other health component still
-    # reports for real. Tests that exercise the probe itself override this per
-    # test via monkeypatch (setenv/delenv), so the global default is safe.
-    export HEADROOM_SKIP_UPSTREAM_CHECK=1
-    # Model artifacts are not vendored; prevent HuggingFace clients from retrying egress.
-    export HF_HUB_OFFLINE=1
-    export TRANSFORMERS_OFFLINE=1
-    # difft/scc/rtk/ast-grep resolve from PATH (no GitHub fetch). Belt-and-braces:
-    # if any code path still tries to fetch a binary, fail closed instead of
-    # reaching the network — the sandbox has none anyway.
-    export PATH=${lib.makeBinPath bundledTools}:$PATH
-    export HEADROOM_BINARIES_OFFLINE=1
-
-    ${python.interpreter} ${./check-extra-dependencies.py}
-
-    # Preserve the Nix upstream-health opt-out; test-local HEADROOM flags stay scrubbed.
-    substituteInPlace tests/conftest.py \
-      --replace-fail 'if key.startswith("HEADROOM_"):' \
-                     'if key.startswith("HEADROOM_") and key != "HEADROOM_SKIP_UPSTREAM_CHECK":'
-
-    ${py.python.interpreter} -m pytest -p no:cacheprovider -q \
-      ${lib.escapeShellArgs deselectArgs}
-
-    runHook postCheck
-  '';
-
-  pythonImportsCheck = [
-    "headroom"
-    "headroom._core"
-    "headroom._build_info"
-  ];
-
-  passthru = {
-    proxy = headroom-proxy;
-    inherit tiktokenCache;
+    meta = {
+      description = "Headroom context-optimization layer for LLM apps (Python + Rust core)";
+      homepage = "https://github.com/headroomlabs-ai/headroom";
+      mainProgram = "headroom";
+      platforms = lib.platforms.unix;
+    };
   };
-
-  meta = {
-    description = "Headroom context-optimization layer for LLM apps (Python + Rust core)";
-    homepage = "https://github.com/headroomlabs-ai/headroom";
-    mainProgram = "headroom";
-    platforms = lib.platforms.unix;
+  devShell = mkShell {
+    inputsFrom = [
+      headroom-proxy
+      headroom
+    ];
+    packages =
+      git-hooks.enabledPackages
+      ++ builtins.attrValues {
+        inherit
+          rustc
+          cargo
+          maturin
+          uv
+          ;
+      }
+      ++ [ treefmt.config.build.wrapper ];
+    inherit (git-hooks) shellHook;
   };
-}
+in
+headroom

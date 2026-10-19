@@ -39,29 +39,6 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system}.extend self.overlays.default;
-          treefmt = (treefmt-nix.lib.evalModule pkgs ./headroom-nix/nix/treefmt.nix).config.build.wrapper;
-          headroomHookSource = builtins.path {
-            path = ./.;
-            name = "headroom-hooks";
-            filter =
-              path: _:
-              let
-                relative = nixpkgs.lib.removePrefix "${toString ./.}/" (toString path);
-                packageDirs = [
-                  "pkgs/by-name/he/headroom"
-                  "pkgs/by-name/he/headroom-hermes-plugin"
-                  "pkgs/by-name/he/headroom-proxy"
-                  "pkgs/by-name/he/headroom-py"
-                ];
-              in
-              relative == ""
-              || relative == "headroom-nix"
-              || nixpkgs.lib.hasPrefix "headroom-nix/" relative
-              || relative == "pkgs"
-              || relative == "pkgs/by-name"
-              || relative == "pkgs/by-name/he"
-              || builtins.any (dir: relative == dir || nixpkgs.lib.hasPrefix "${dir}/" relative) packageDirs;
-          };
           independentPkgs = import nixpkgs {
             inherit system;
             overlays = [ self.overlays.default ];
@@ -101,45 +78,32 @@
                 python3Packages = overridePythonPackages;
               }).name == "python-package-override-probe";
             assert
-              (independentPkgs.headroom.override {
-                headroomSource = overrideSource;
-              }).name == "python3.13-headroom-override-probe";
+              (independentPkgs.headroom.override { headroomSource = overrideSource; }).name
+              == "python3.13-headroom-override-probe";
             assert
-              (independentPkgs.headroom-hermes-plugin.override {
-                headroomSource = overrideSource;
-              }).name == "headroom-hermes-plugin-override-probe";
+              (independentPkgs.headroom-hermes-plugin.override { headroomSource = overrideSource; }).name
+              == "headroom-hermes-plugin-override-probe";
             assert
-              (independentPkgs.gh-token-manager.override {
-                rustPlatform = overrideRustPlatform;
-              }).name == "rust-platform-0.1.0";
+              (independentPkgs.gh-token-manager.override { rustPlatform = overrideRustPlatform; }).name
+              == "rust-platform-0.1.0";
             assert
-              (independentPkgs.gh-token-manager.override {
-                cacert = independentPkgs.hello;
-              }).drvPath != independentPkgs.gh-token-manager.drvPath;
+              (independentPkgs.gh-token-manager.override { cacert = independentPkgs.hello; }).drvPath
+              != independentPkgs.gh-token-manager.drvPath;
             assert
-              (independentPkgs.headroom-proxy.override {
-                onnxruntime = independentPkgs.hello;
-              }).drvPath != independentPkgs.headroom-proxy.drvPath;
+              (independentPkgs.headroom-proxy.override { onnxruntime = independentPkgs.hello; }).drvPath
+              != independentPkgs.headroom-proxy.drvPath;
             assert
-              (independentPkgs.headroom.override {
-                rtk = independentPkgs.hello;
-              }).drvPath != independentPkgs.headroom.drvPath;
+              (independentPkgs.headroom.override { rtk = independentPkgs.hello; }).drvPath
+              != independentPkgs.headroom.drvPath;
             assert finalOverridePkgs.headroom-proxy.drvPath != independentPkgs.headroom-proxy.drvPath;
             assert finalOverridePkgs.headroom.drvPath != independentPkgs.headroom.drvPath;
             assert finalOverridePkgs.gh-token-manager.drvPath != independentPkgs.gh-token-manager.drvPath;
+            assert independentPkgs.lib.isDerivation
+              independentPkgs.headroom.passthru.treefmt.config.build.wrapper;
+            assert independentPkgs.lib.isDerivation independentPkgs.headroom.passthru.git-hooks;
+            assert independentPkgs.lib.isDerivation independentPkgs.headroom.passthru.devShell;
+            assert independentPkgs.headroom.passthru.devShell.drvPath != independentPkgs.headroom.drvPath;
             pkgs.runCommand "headroom-overlay-regression" { } "touch $out";
-          gitHooks = git-hooks.lib.${system}.run {
-            src = headroomHookSource;
-            package = pkgs.prek;
-            hooks = {
-              convco.enable = true;
-              treefmt = {
-                enable = true;
-                package = treefmt;
-                settings.fail-on-change = true;
-              };
-            };
-          };
         in
         {
           packages = {
@@ -174,43 +138,21 @@
               headroom-hermes-plugin
               ;
             clippy = pkgs.headroom-proxy.passthru.clippy;
-            git-hooks = gitHooks;
+            git-hooks = pkgs.headroom.passthru.git-hooks;
             headroom-overlay = overlayRegression;
-          };
-          devShell = pkgs.mkShell {
-            inputsFrom = [
-              pkgs.headroom-proxy
-              pkgs.headroom
-            ];
-            packages =
-              gitHooks.enabledPackages
-              ++ builtins.attrValues {
-                inherit (pkgs)
-                  rustc
-                  cargo
-                  maturin
-                  uv
-                  ;
-              }
-              ++ [ treefmt ];
-            inherit (gitHooks) shellHook;
           };
         };
     in
     {
       packages = forAllSystems (
-        system:
-        (headroomFor system).packages
-        // {
-          default = self.packages.${system}.gh-token-manager;
-        }
+        system: (headroomFor system).packages // { default = self.packages.${system}.gh-token-manager; }
       );
       apps = forAllSystems (system: {
         inherit ((headroomFor system).apps) headroom headroom-proxy;
       });
       devShells = forAllSystems (system: {
         gh-token-manager = self.packages.${system}.gh-token-manager.passthru.devShell;
-        headroom = (headroomFor system).devShell;
+        headroom = self.packages.${system}.headroom.passthru.devShell;
       });
       checks = forAllSystems (
         system:
@@ -284,6 +226,8 @@
             };
             headroom = final // {
               inherit headroomSource python3Packages codebaseMemoryMcp;
+              gitHooks = git-hooks.lib.${system};
+              treefmtEval = module: treefmt-nix.lib.evalModule final module;
               onnxruntime = onnxruntime;
               rtk = selectedRtk;
             };

@@ -17,6 +17,14 @@
   headroom-proxy,
   headroom-py,
   headroomSource,
+  gitHooks,
+  treefmtEval,
+  mkShell,
+  rustc,
+  cargo,
+  maturin,
+  uv,
+  prek,
 }:
 
 import ./headroom.nix {
@@ -39,5 +47,13 @@ import ./headroom.nix {
     headroom-proxy
     rtk
     codebaseMemoryMcp
+    gitHooks
+    treefmtEval
+    mkShell
+    rustc
+    cargo
+    maturin
+    uv
+    prek
     ;
 }
