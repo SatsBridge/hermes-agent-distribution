@@ -7,7 +7,7 @@ the parent flake.
 
 None of Headroom's source lives here. The flake fetches and builds a pinned
 release with `fetchFromGitHub`. The release, commit, and source hash are pinned
-in `headroom-nix/nix/headroom-source.nix`.
+in `pkgs/by-name/he/headroom-proxy/headroom-source.nix`.
 
 ## The packages
 
@@ -78,3 +78,8 @@ it under `share/doc/`.
 - `nix flake check` builds every package, runs their test suites and clippy, and
   checks formatting. This is what CI runs.
 - Commit messages follow Conventional Commits (a `convco` git hook enforces it).
+
+Package derivations follow nixpkgs' `pkgs/by-name` layout. The source pin and
+proxy patches live with `headroom-proxy`; the Python dependency overrides live
+with `headroom-py`; the CLI and Hermes plugin each have their own package
+directory. The parent flake imports nixpkgs' pinned by-name overlay generator.

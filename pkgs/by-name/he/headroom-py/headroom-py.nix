@@ -9,7 +9,7 @@
 # no runtime dependencies and no `pythonRelaxDeps`/`pythonRemoveDeps` fix-ups.
 #
 # The point of the split is caching: the slow Rust compile lands in this small,
-# self-contained derivation, and `nix/headroom.nix` copies the `.so` out of it
+# self-contained derivation, and `headroom.nix` copies the `.so` out of it
 # instead of recompiling.
 {
   lib,
@@ -90,9 +90,12 @@ python3Packages.buildPythonPackage {
     runHook postInstallCheck
   '';
 
-  # The compiled extension's filename, so nix/headroom.nix can copy it into the
+  # The compiled extension's filename, so headroom.nix can copy it into the
   # full package's tree without hunting for it.
-  passthru.coreLib = "_core.abi3.so";
+  passthru = {
+    coreLib = "_core.abi3.so";
+    inherit python3Packages;
+  };
 
   meta = {
     description = "Headroom compiled Rust core (headroom._core) as a Python distribution";

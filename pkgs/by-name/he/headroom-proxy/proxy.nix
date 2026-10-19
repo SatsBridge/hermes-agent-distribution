@@ -90,7 +90,10 @@ rustPlatform.buildRustPackage (
       ${python3}/bin/python3 -c 'import ctypes; ctypes.CDLL("${ortDylib}")'
     '';
 
-    passthru.clippy = clippyCheck;
+    passthru = {
+      inherit headroomSource;
+      clippy = clippyCheck;
+    };
 
     meta = {
       description = "Headroom transparent reverse proxy (Rust, axum)";

@@ -44,18 +44,74 @@
         };
       headroomFor =
         system:
-        import ./headroom-nix/nix {
-          pkgs = nixpkgs.legacyPackages.${system};
-          unstable = nixpkgs-unstable.legacyPackages.${system};
-          codebaseMemory = codebase-memory-mcp.packages.${system}.default.overrideAttrs (_: {
-            version = "0.11.0";
-            src = codebase-memory-mcp.outPath;
-            # Keep the embedded binary version aligned with this flake pin.
-            CFLAGS_EXTRA = "-DCBM_VERSION=\\\"0.11.0\\\"";
-          });
-          lib = nixpkgs.lib;
-          inherit system treefmt-nix;
-          inherit git-hooks;
+        let
+          pkgs = nixpkgs.legacyPackages.${system}.extend self.overlays.default;
+          treefmt = (treefmt-nix.lib.evalModule pkgs ./headroom-nix/nix/treefmt.nix).config.build.wrapper;
+          gitHooks = git-hooks.lib.${system}.run {
+            src = ./headroom-nix;
+            package = pkgs.prek;
+            hooks = {
+              convco.enable = true;
+              treefmt = {
+                enable = true;
+                package = treefmt;
+                settings.fail-on-change = true;
+              };
+            };
+          };
+        in
+        {
+          packages = {
+            inherit (pkgs)
+              headroom-proxy
+              headroom-py
+              headroom
+              headroom-hermes-plugin
+              ;
+            default = pkgs.headroom;
+          };
+          apps = {
+            headroom-proxy = {
+              type = "app";
+              program = nixpkgs.lib.getExe pkgs.headroom-proxy;
+            };
+            headroom = {
+              type = "app";
+              program = nixpkgs.lib.getExe pkgs.headroom;
+            };
+            default = {
+              type = "app";
+              program = nixpkgs.lib.getExe pkgs.headroom;
+            };
+          };
+          checks = {
+            inherit (pkgs)
+              headroom-proxy
+              headroom-py
+              headroom
+              headroom-hermes-plugin
+              ;
+            clippy = pkgs.headroom-proxy.passthru.clippy;
+            git-hooks = gitHooks;
+          };
+          devShell = pkgs.mkShell {
+            inputsFrom = [
+              pkgs.headroom-proxy
+              pkgs.headroom
+            ];
+            packages =
+              gitHooks.enabledPackages
+              ++ builtins.attrValues {
+                inherit (pkgs)
+                  rustc
+                  cargo
+                  maturin
+                  uv
+                  ;
+              }
+              ++ [ treefmt ];
+            inherit (gitHooks) shellHook;
+          };
         };
       treefmtEval = forAllSystems (
         system:
@@ -93,15 +149,33 @@
         }
       );
       formatter = forAllSystems (system: treefmtEval.${system}.config.build.wrapper);
-      overlays.default = final: _prev: {
-        gh-token-manager = self.packages.${final.stdenv.hostPlatform.system}.gh-token-manager;
-        inherit ((headroomFor final.stdenv.hostPlatform.system).packages)
-          headroom-proxy
-          headroom-py
-          headroom
-          headroom-hermes-plugin
-          ;
-      };
+      overlays.default =
+        final: prev:
+        let
+          system = final.stdenv.hostPlatform.system;
+          unstable = nixpkgs-unstable.legacyPackages.${system};
+          codebaseMemoryMcp = codebase-memory-mcp.packages.${system}.default.overrideAttrs (_: {
+            version = "0.11.0";
+            src = codebase-memory-mcp.outPath;
+            # Keep the embedded binary version aligned with this flake pin.
+            CFLAGS_EXTRA = "-DCBM_VERSION=\\\"0.11.0\\\"";
+          });
+          byNameOverlay = import "${nixpkgs}/pkgs/top-level/by-name-overlay.nix" ./pkgs/by-name;
+          packageScope = final // {
+            callPackage = final.lib.callPackageWith (
+              final
+              // {
+                inherit unstable codebaseMemoryMcp;
+                onnxruntime = unstable.onnxruntime;
+                rtk = unstable.rtk;
+              }
+            );
+          };
+        in
+        (byNameOverlay packageScope prev)
+        // {
+          gh-token-manager = self.packages.${system}.gh-token-manager;
+        };
       githubActions = nix-github-actions.lib.mkGithubMatrix {
         checks = nixpkgs.lib.getAttrs [ "x86_64-linux" "aarch64-linux" ] self.checks;
       };

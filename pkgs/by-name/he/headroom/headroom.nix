@@ -1,7 +1,7 @@
 # headroom: the full Python distribution and `headroom` CLI.
 #
 # Composition over recompile. The slow Rust compile already happened in
-# nix/headroom-py.nix, which carries just `headroom/_core.abi3.so`. This package
+# headroom-py.nix, which carries just `headroom/_core.abi3.so`. This package
 # installs the pure-Python `headroom/` tree straight from source, drops that
 # prebuilt `_core.abi3.so` in beside it, and layers on every optional-extra
 # runtime dependency so the CLI and all non-dev features work fully OFFLINE.
@@ -329,8 +329,8 @@ py.buildPythonPackage {
     site="$out/${python.sitePackages}"
     mkdir -p "$site"
     cp -r headroom "$site/"
-    cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.coreLib} \
-      "$site/headroom/${headroom-py.coreLib}"
+    cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
+      "$site/headroom/${headroom-py.passthru.coreLib}"
     cp ${buildInfo} "$site/headroom/_build_info.py"
 
     mkdir -p "$out/bin"
@@ -368,8 +368,8 @@ py.buildPythonPackage {
     # pytest collects from the unpacked source root, where the in-tree
     # `headroom/` (no compiled extension) shadows the installed one. Drop the
     # prebuilt `_core` in beside the sources so `import headroom._core` resolves.
-    cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.coreLib} \
-      headroom/${headroom-py.coreLib}
+    cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
+      headroom/${headroom-py.passthru.coreLib}
 
     export TIKTOKEN_CACHE_DIR=${tiktokenCache}
     # nixpkgs sets HOME=/homeless-shelter (non-writable); several tests write
