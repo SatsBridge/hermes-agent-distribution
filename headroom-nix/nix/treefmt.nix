@@ -1,7 +1,7 @@
 # treefmt-nix configuration shared by `nix fmt`, the treefmt git hook, and the
 # devShell. Every formatter listed in the packaging brief is enabled here.
 _: {
-  projectRootFile = "nix/treefmt.nix";
+  projectRootFile = "headroom-nix/nix/treefmt.nix";
 
   programs = {
     # Nix
