@@ -30,6 +30,26 @@
     }@inputs:
     let
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      hermesModuleVm = nixpkgs-unstable.lib.nixosSystem {
+        modules = [
+          "${nixpkgs-unstable}/nixos/modules/virtualisation/qemu-vm.nix"
+          ./nixos/hermes-module-vm.nix
+          { nixpkgs.overlays = [ self.overlays.default ]; }
+        ];
+        system = "x86_64-linux";
+      };
+      hermesModuleVmConfigCheck = nixpkgs-unstable.legacyPackages.x86_64-linux.runCommand "hermes-module-vm-config-check" { } ''
+        test ${toString hermesModuleVm.config.virtualisation.memorySize} -le 1024
+        test ${toString hermesModuleVm.config.virtualisation.diskSize} -le 1024
+        test ${if hermesModuleVm.config.virtualisation.useNixStoreImage then "false" else "true"} = true
+        test ${if builtins.hasAttr "nix-store" hermesModuleVm.config.virtualisation.sharedDirectories then "false" else "true"} = true
+        test ${if hermesModuleVm.config.fileSystems."/nix/.ro-store".fsType == "9p" then "true" else "false"} = true
+        test ${if nixpkgs-unstable.lib.elem "ro" hermesModuleVm.config.fileSystems."/nix/.ro-store".options then "true" else "false"} = true
+        test ${if builtins.any (option: nixpkgs-unstable.lib.hasInfix "mount_tag=nix-store" option && nixpkgs-unstable.lib.hasInfix "readonly=on" option) hermesModuleVm.config.virtualisation.qemu.options then "true" else "false"} = true
+        test ${if hermesModuleVm.config.services.hermes-specialised-agent.enable && !hermesModuleVm.config.services.hermes-specialised-agent.agents.vm.enable then "true" else "false"} = true
+        test ${if builtins.hasAttr "hermes-module-vm-smoke" hermesModuleVm.config.systemd.services then "true" else "false"} = true
+        touch "$out"
+      '';
       packagesFor =
         system:
         let
@@ -94,13 +114,18 @@
         let
           packageChecks = (packagesFor system).checks;
         in
-        packageChecks // { formatting = (rootTreefmtFor system).config.build.check self; }
+        packageChecks
+        // { formatting = (rootTreefmtFor system).config.build.check self; }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          hermes-module-vm-config = hermesModuleVmConfigCheck;
+        }
       );
       devShells = forAllSystems (system: (packagesFor system).devShells);
       formatter = forAllSystems (system: (rootTreefmtFor system).config.build.wrapper);
       githubActions = nix-github-actions.lib.mkGithubMatrix {
         checks = nixpkgs.lib.getAttrs systems self.checks;
       };
+      nixosConfigurations.hermes-module-vm = hermesModuleVm;
       overlays.default =
         final: prev:
         let
