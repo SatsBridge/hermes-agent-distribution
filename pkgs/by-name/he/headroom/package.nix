@@ -16,32 +16,32 @@
 # dependency set. Only individual sandbox-incompatible or variant-inapplicable
 # tests are deselected, with reasons below.
 {
-  lib,
-  stdenv,
-  makeWrapper,
-  writeText,
-  fetchurl,
-  runCommand,
-  cacert,
-  onnxruntime,
   ast-grep,
+  cacert,
+  cargo,
+  codebase-memory-mcp,
   difftastic,
-  scc,
+  fetchurl,
   git,
-  headroom-source,
+  gitHooks,
+  headroom-proxy,
   headroom-py,
   headroom-python-pkgs,
-  headroom-proxy,
-  rtk,
-  codebase-memory-mcp,
-  gitHooks,
-  treefmtEval,
-  mkShell,
-  rustc,
-  cargo,
+  headroom-source,
+  lib,
+  makeWrapper,
   maturin,
-  uv,
+  mkShell,
+  onnxruntime,
   prek,
+  rtk,
+  runCommand,
+  rustc,
+  scc,
+  stdenv,
+  treefmtEval,
+  uv,
+  writeText,
 }:
 let
   inherit (headroom-python-pkgs) python;
@@ -430,13 +430,9 @@ let
     ];
 
     passthru = {
+      inherit devShell git-hooks;
       proxy = headroom-proxy;
-      inherit
-        tiktokenCache
-        treefmt
-        git-hooks
-        devShell
-        ;
+      inherit tiktokenCache treefmt;
     };
 
     meta = {

@@ -13,20 +13,20 @@
 # the `.so` out of it
 # instead of recompiling.
 {
-  lib,
-  writeText,
-  headroom-python-pkgs,
-  rustPlatform,
-  pkg-config,
   cmake,
-  perl,
-  onnxruntime,
-  stdenv,
-  headroom-source,
   gitHooks,
-  treefmtEval,
+  headroom-python-pkgs,
+  headroom-source,
+  lib,
   mkShell,
+  onnxruntime,
+  perl,
+  pkg-config,
   prek,
+  rustPlatform,
+  stdenv,
+  treefmtEval,
+  writeText,
 }:
 let
   treefmt = treefmtEval ./treefmt.nix;
@@ -110,7 +110,7 @@ let
     # full package's tree without hunting for it.
     passthru = {
       coreLib = "_core.abi3.so";
-      inherit treefmt git-hooks devShell;
+      inherit devShell git-hooks treefmt;
     };
 
     meta = {

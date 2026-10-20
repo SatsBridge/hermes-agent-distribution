@@ -8,22 +8,22 @@
 #
 # The clippy lint is exposed via `passthru.clippy` for the flake's checks.
 {
-  lib,
-  rustPlatform,
-  pkg-config,
   cmake,
-  perl,
-  makeWrapper,
   clippy,
-  python3,
-  onnxruntime,
-  stdenv,
-  libiconv,
-  headroom-source,
   gitHooks,
-  treefmtEval,
+  headroom-source,
+  lib,
+  libiconv,
+  makeWrapper,
   mkShell,
+  onnxruntime,
+  perl,
+  pkg-config,
   prek,
+  python3,
+  rustPlatform,
+  stdenv,
+  treefmtEval,
 }:
 let
   # ONNX Runtime shared library that `ort` dlopens at runtime (load-dynamic;
@@ -81,9 +81,9 @@ let
       passthru = {
         inherit
           clippy
-          treefmt
-          git-hooks
           devShell
+          git-hooks
+          treefmt
           ;
       };
 

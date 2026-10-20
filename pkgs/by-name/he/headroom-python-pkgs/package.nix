@@ -2,14 +2,14 @@
 # Keep them on nixpkgs-unstable's Python 3.13 set so compiled extensions share
 # one interpreter; override only versions that still miss upstream's floors.
 {
+  abseil-cpp,
   fetchFromGitHub,
   lib,
-  python3Packages,
-  python313Packages,
-  rustPlatform,
-  protobuf_29,
-  abseil-cpp,
   onnx,
+  protobuf_29,
+  python313Packages,
+  python3Packages,
+  rustPlatform,
 }:
 let
   # AutoGen requires protobuf 5.29; ONNX 1.23 requires protobuf 6.31+.
@@ -71,13 +71,13 @@ python313Packages.overrideScope (
     # These upstream extras are not packaged in nixpkgs yet; use pinned sdists.
     sourcePackage =
       {
-        pname,
-        pypiName ? pname,
-        version,
-        hash,
         buildSystem ? prev.setuptools,
         buildSystems ? [ buildSystem ],
         dependencies ? [ ],
+        hash,
+        pname,
+        pypiName ? pname,
+        version,
       }:
       prev.buildPythonPackage {
         inherit pname version dependencies;

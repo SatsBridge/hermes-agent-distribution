@@ -1,19 +1,19 @@
 {
-  rustPlatform,
   cacert,
-  cargo-llvm-cov,
-  llvm,
-  python3,
-  gitHooks,
-  treefmtEval,
-  runCommand,
-  lib,
-  prek,
   cargo,
-  rustc,
+  cargo-llvm-cov,
   clippy,
-  rustfmt,
+  gitHooks,
+  lib,
+  llvm,
   mkShell,
+  prek,
+  python3,
+  runCommand,
+  rustPlatform,
+  rustc,
+  rustfmt,
+  treefmtEval,
 }:
 let
   version = "0.1.0";
@@ -101,9 +101,9 @@ rustPlatform.buildRustPackage {
   passthru = {
     inherit
       coverage
+      devShell
       git-hooks
       treefmt
-      devShell
       ;
   };
 }

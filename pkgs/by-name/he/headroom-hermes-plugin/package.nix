@@ -7,15 +7,15 @@
 # share/hermes/plugins/, with a wrapper env exposing httpx (its only third-party
 # import; `tools.registry` is provided by the Hermes runtime that loads it).
 {
-  stdenvNoCC,
-  lib,
-  python3Packages,
-  writeText,
-  headroom-source,
   gitHooks,
-  treefmtEval,
+  headroom-source,
+  lib,
   mkShell,
   prek,
+  python3Packages,
+  stdenvNoCC,
+  treefmtEval,
+  writeText,
 }:
 let
   inherit (python3Packages) python;
@@ -144,7 +144,7 @@ let
       runHook postInstallCheck
     '';
 
-    passthru = { inherit treefmt git-hooks devShell; };
+    passthru = { inherit devShell git-hooks treefmt; };
 
     meta = {
       description = "Hermes-Agent CCR retrieve plugin for the Headroom proxy";

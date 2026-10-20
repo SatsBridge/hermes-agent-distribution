@@ -10,31 +10,26 @@
     git-hooks.url = "github:cachix/git-hooks.nix";
     git-hooks.inputs.flake-compat.follows = "flake-compat";
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     nix-github-actions.url = "github:nix-community/nix-github-actions";
     nix-github-actions.inputs.nixpkgs.follows = "nixpkgs";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
     {
-      self,
       git-hooks,
+      nix-github-actions,
       nixpkgs,
       nixpkgs-unstable,
-      nix-github-actions,
+      self,
       treefmt-nix,
       ...
     }@inputs:
     let
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-      ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      rootTreefmtFor = system: treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} ./treefmt.nix;
       packagesFor =
         system:
         let
@@ -46,46 +41,51 @@
               type = "app";
               program = nixpkgs.lib.getExe pkgs.gh-token-manager;
             };
-            headroom-proxy = {
-              type = "app";
-              program = nixpkgs.lib.getExe pkgs.headroom-proxy;
-            };
             headroom = {
               type = "app";
               program = nixpkgs.lib.getExe pkgs.headroom;
             };
+            headroom-proxy = {
+              type = "app";
+              program = nixpkgs.lib.getExe pkgs.headroom-proxy;
+            };
           };
           checks = {
             inherit (pkgs)
-              headroom-proxy
-              headroom-py
               headroom
               headroom-hermes-plugin
+              headroom-proxy
+              headroom-py
               ;
-            git-hooks-gh-token-manager-coverage = pkgs.gh-token-manager.coverage;
             git-hooks-gh-token-manager = pkgs.gh-token-manager.git-hooks;
+            git-hooks-gh-token-manager-coverage = pkgs.gh-token-manager.coverage;
+            git-hooks-git-hooks-headroom-hermes-plugin = pkgs.headroom-hermes-plugin.git-hooks;
+            git-hooks-headroom = pkgs.headroom.git-hooks;
             git-hooks-headroom-proxy = pkgs.headroom-proxy.git-hooks;
             git-hooks-headroom-py = pkgs.headroom-py.git-hooks;
-            git-hooks-headroom = pkgs.headroom.git-hooks;
-            git-hooks-git-hooks-headroom-hermes-plugin = pkgs.headroom-hermes-plugin.git-hooks;
           };
           packages = {
             inherit (pkgs)
               gh-token-manager
-              headroom-proxy
-              headroom-py
               headroom
               headroom-hermes-plugin
+              headroom-proxy
+              headroom-py
               ;
           };
           devShells = {
             gh-token-manager = pkgs.gh-token-manager.devShell;
-            headroom-proxy = pkgs.headroom-proxy.devShell;
-            headroom-py = pkgs.headroom-py.devShell;
             headroom = pkgs.headroom.devShell;
             headroom-hermes-plugin = pkgs.headroom-hermes-plugin.devShell;
+            headroom-proxy = pkgs.headroom-proxy.devShell;
+            headroom-py = pkgs.headroom-py.devShell;
           };
         };
+      rootTreefmtFor = system: treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} ./treefmt.nix;
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
     in
     {
       apps = forAllSystems (system: (packagesFor system).apps);

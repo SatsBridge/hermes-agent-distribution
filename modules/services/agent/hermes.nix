@@ -7,8 +7,8 @@
 let
   inherit (lib)
     concatStringsSep
-    getName
     filterAttrs
+    getName
     mapAttrsToList
     mkEnableOption
     mkIf
@@ -60,8 +60,6 @@ let
     {
       options = {
         enable = mkEnableOption "Hermes Agent gateway service";
-        package = mkPackageOption pkgs "hermes-agent" { };
-        fullName = mkOption { type = types.str; };
         extraArgs = mkOption {
           type = types.listOf types.str;
           default = [ ];
@@ -87,6 +85,9 @@ let
             ]
           '';
         };
+        fullName = mkOption { type = types.str; };
+        headroomPort = mkOption { type = types.port; };
+        package = mkPackageOption pkgs "hermes-agent" { };
         settings = mkOption {
           type = deepConfigType;
           default = { };
@@ -103,7 +104,6 @@ let
             }
           '';
         };
-        headroomPort = mkOption { type = types.port; };
       };
     };
   mkAgentTemplate =
@@ -625,7 +625,7 @@ let
           "L+ ${hermesAgentStatePath}/mnemosyne/config.yaml - - - - ${mnemosyneConfig}"
           "L+ ${hermesAgentStatePath}/profiles - - - - ${
             pkgs.linkFarm "hermes-${name}-profiles" (
-              map ({ name, fullName, ... }: {
+              map ({ fullName, name, ... }: {
                 name = fullName;
                 path = "/var/lib/${name}/.hermes";
               }) (builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames)
@@ -640,12 +640,12 @@ let
 in
 {
   options.services.hermes-specialised-agent = {
-    enable = mkEnableOption "Hermes Agent gateway services";
-    mainAgent = mkOption { type = types.str; };
     agents = mkOption {
       type = types.attrsOf (types.submodule agentOpts);
       default = { };
     };
+    enable = mkEnableOption "Hermes Agent gateway services";
+    mainAgent = mkOption { type = types.str; };
   };
   config = {
     assertions = [
