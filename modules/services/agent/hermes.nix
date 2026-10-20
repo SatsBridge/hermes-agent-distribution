@@ -259,16 +259,16 @@ let
             InaccessiblePaths = "";
             KeyringMode = "private";
             LockPersonality = true;
-            NotifyAccess = "none";
-            NoNewPrivileges = true;
             #MemoryDenyWriteExecute = true;
             MemoryKSM = true;
             MountAPIVFS = true;
+            NoNewPrivileges = true;
+            NotifyAccess = "none";
             #PrivateBPF = true;
             PrivateDevices = true;
-            #PrivateNetwork = true;
             PrivateIPC = true;
             PrivateMounts = true;
+            #PrivateNetwork = true;
             #PrivatePIDs = true;
             PrivateTmp = true;
             # TODO: PrivateUsers = "self" after https://github.com/systemd/systemd/issues/41994
@@ -307,12 +307,12 @@ let
             StateDirectoryMode = "2700";
             SupplementaryGroups = [ sharedStateId ];
             SystemCallArchitectures = "native";
+            SystemCallErrorNumber = "EPERM";
             SystemCallFilter = [
               "@system-service"
               "~@resources"
               "~@privileged"
             ];
-            SystemCallErrorNumber = "EPERM";
             Type = "exec";
             UMask = "0007";
             User = agentStateSystemdId;
@@ -461,16 +461,16 @@ let
               Group = publicStateFixerSystemdId;
               KeyringMode = "private";
               LockPersonality = true;
-              NotifyAccess = "none";
-              NoNewPrivileges = true;
               MemoryDenyWriteExecute = true;
               MemoryKSM = true;
               MountAPIVFS = true;
+              NoNewPrivileges = true;
+              NotifyAccess = "none";
               #PrivateBPF = true;
               PrivateDevices = true;
-              PrivateNetwork = true;
               PrivateIPC = true;
               PrivateMounts = true;
+              PrivateNetwork = true;
               #PrivatePIDs = true;
               PrivateTmp = true;
               # TODO: PrivateUsers = "self" after https://github.com/systemd/systemd/issues/41994
@@ -495,12 +495,12 @@ let
               SetLoginEnvironment = false;
               SupplementaryGroups = [ sharedStateId ];
               SystemCallArchitectures = "native";
+              SystemCallErrorNumber = "EPERM";
               SystemCallFilter = [
                 "@system-service"
                 "~@resources"
                 "~@privileged"
               ];
-              SystemCallErrorNumber = "EPERM";
               Type = "exec";
               UMask = "0077";
               User = publicStateFixerSystemdId;
@@ -639,14 +639,6 @@ let
   sharedStatePath = "%S/${sharedStateId}";
 in
 {
-  options.services.hermes-specialised-agent = {
-    agents = mkOption {
-      type = types.attrsOf (types.submodule agentOpts);
-      default = { };
-    };
-    enable = mkEnableOption "Hermes Agent gateway services";
-    mainAgent = mkOption { type = types.str; };
-  };
   config = {
     assertions = [
       {
@@ -665,5 +657,13 @@ in
       ]
     );
     users.groups.hermes-shared = { };
+  };
+  options.services.hermes-specialised-agent = {
+    agents = mkOption {
+      type = types.attrsOf (types.submodule agentOpts);
+      default = { };
+    };
+    enable = mkEnableOption "Hermes Agent gateway services";
+    mainAgent = mkOption { type = types.str; };
   };
 }

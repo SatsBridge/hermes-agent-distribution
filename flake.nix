@@ -38,16 +38,16 @@
         {
           apps = {
             gh-token-manager = {
-              type = "app";
               program = nixpkgs.lib.getExe pkgs.gh-token-manager;
+              type = "app";
             };
             headroom = {
-              type = "app";
               program = nixpkgs.lib.getExe pkgs.headroom;
+              type = "app";
             };
             headroom-proxy = {
-              type = "app";
               program = nixpkgs.lib.getExe pkgs.headroom-proxy;
+              type = "app";
             };
           };
           checks = {
@@ -113,8 +113,8 @@
             {
               # Keep the embedded binary version aligned with this flake pin.
               CFLAGS_EXTRA = "-DCBM_VERSION=\\\"${version}\\\"";
-              inherit version;
               src = inputs.codebase-memory-mcp.outPath;
+              inherit version;
             }
           );
           packageScope = final // {

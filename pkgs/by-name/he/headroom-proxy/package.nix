@@ -26,58 +26,58 @@
   treefmtEval,
 }:
 let
-  # ONNX Runtime shared library that `ort` dlopens at runtime (load-dynamic;
-  # see patches/0001). Wired at build, test, and run time.
-  ortDylib = "${lib.getLib onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
-
   commonArgs = {
-    pname = "headroom-proxy";
-    inherit (headroom-source) version;
-    inherit (headroom-source) src;
+    buildAndTestSubdir = "crates/headroom-proxy";
+    buildInputs = [ onnxruntime ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];
     cargoLock = {
       lockFile = "${headroom-source.src}/Cargo.lock";
     };
-
-    buildAndTestSubdir = "crates/headroom-proxy";
-    checkType = "debug";
-
-    strictDeps = true;
-
-    nativeBuildInputs = [
-      pkg-config
-      cmake # aws-lc-rs / rusqlite build tooling
-      perl # aws-lc-rs codegen
-    ];
-
-    buildInputs = [ onnxruntime ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];
-
-    # cmake is only present for aws-lc-rs/rusqlite codegen; the crate has no
-    # CMakeLists.txt, so stop the cmake hook from trying to configure one.
-    dontUseCmakeConfigure = true;
-
-    # ort load-dynamic: resolve libonnxruntime without a network fetch.
-    env.ORT_DYLIB_PATH = ortDylib;
-
     # `e2e_real` spawns the Python proxy and hits live provider APIs; it
     # self-skips without HEADROOM_E2E=1 but is excluded here so the target is
     # not even considered. Every hermetic wiremock-backed integration test in
     # the crate still runs.
     checkFlags = [ "--skip=e2e_real" ];
-
+    checkType = "debug";
+    # cmake is only present for aws-lc-rs/rusqlite codegen; the crate has no
+    # CMakeLists.txt, so stop the cmake hook from trying to configure one.
+    dontUseCmakeConfigure = true;
+    # ort load-dynamic: resolve libonnxruntime without a network fetch.
+    env.ORT_DYLIB_PATH = ortDylib;
+    nativeBuildInputs = [
+      pkg-config
+      cmake # aws-lc-rs / rusqlite build tooling
+      perl # aws-lc-rs codegen
+    ];
+    pname = "headroom-proxy";
+    inherit (headroom-source) src;
+    strictDeps = true;
+    inherit (headroom-source) version;
+  };
+  devShell = mkShell {
+    inputsFrom = [ headroom-proxy ];
+    packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];
+    inherit (git-hooks) shellHook;
+  };
+  git-hooks = gitHooks.run {
+    hooks.treefmt = {
+      enable = true;
+      package = treefmt.config.build.wrapper;
+      settings.fail-on-change = true;
+    };
+    package = prek;
+    rootSrc = lib.mkForce ../../../..;
+    src = ./.;
   };
   headroom-proxy = rustPlatform.buildRustPackage (
     commonArgs
     // {
+      meta = {
+        description = "Headroom transparent reverse proxy (Rust, axum)";
+        homepage = "https://github.com/headroomlabs-ai/headroom";
+        mainProgram = "headroom-proxy";
+        platforms = lib.platforms.unix;
+      };
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ makeWrapper ];
-
-      # Wrap the binary so it always finds libonnxruntime regardless of the
-      # caller's environment.
-      postInstall = ''
-        wrapProgram $out/bin/headroom-proxy \
-          --set-default ORT_DYLIB_PATH "${ortDylib}"
-        ${python3}/bin/python3 -c 'import ctypes; ctypes.CDLL("${ortDylib}")'
-      '';
-
       passthru = {
         inherit
           clippy
@@ -86,33 +86,18 @@ let
           treefmt
           ;
       };
-
-      meta = {
-        description = "Headroom transparent reverse proxy (Rust, axum)";
-        homepage = "https://github.com/headroomlabs-ai/headroom";
-        mainProgram = "headroom-proxy";
-        platforms = lib.platforms.unix;
-      };
+      # Wrap the binary so it always finds libonnxruntime regardless of the
+      # caller's environment.
+      postInstall = ''
+        wrapProgram $out/bin/headroom-proxy \
+          --set-default ORT_DYLIB_PATH "${ortDylib}"
+        ${python3}/bin/python3 -c 'import ctypes; ctypes.CDLL("${ortDylib}")'
+      '';
     }
   );
-
+  # ONNX Runtime shared library that `ort` dlopens at runtime (load-dynamic;
+  # see patches/0001). Wired at build, test, and run time.
+  ortDylib = "${lib.getLib onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
   treefmt = treefmtEval ./treefmt.nix;
-
-  git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce ../../../..;
-    package = prek;
-    hooks.treefmt = {
-      enable = true;
-      package = treefmt.config.build.wrapper;
-      settings.fail-on-change = true;
-    };
-  };
-
-  devShell = mkShell {
-    inputsFrom = [ headroom-proxy ];
-    packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];
-    inherit (git-hooks) shellHook;
-  };
 in
 headroom-proxy

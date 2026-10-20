@@ -18,17 +18,31 @@
   writeText,
 }:
 let
-  inherit (python3Packages) python;
+  # Install-check interpreter: the runtime env plus pyyaml (to read plugin.yaml)
+  # for the structural verification. Kept separate from propagatedBuildInputs so
+  # pyyaml is a test-only input, never leaked onto the plugin's runtime path.
+  checkPython = python.withPackages (ps: builtins.attrValues { inherit (ps) httpx pyyaml; });
+  devShell = mkShell {
+    inputsFrom = [ headroom-hermes-plugin ];
+    packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];
+    inherit (git-hooks) shellHook;
+  };
+  git-hooks = gitHooks.run {
+    hooks.treefmt = {
+      enable = true;
+      package = treefmt.config.build.wrapper;
+      settings.fail-on-change = true;
+    };
+    package = prek;
+    rootSrc = lib.mkForce ../../../..;
+    src = ./.;
+  };
 
   # The Python environment the Hermes host loads the plugin under: it must carry
   # httpx (the plugin's only third-party import). Bound here so the same
   # interpreter both backs propagatedBuildInputs and drives the install check.
   pluginPython = python.withPackages (ps: [ ps.httpx ]);
-
-  # Install-check interpreter: the runtime env plus pyyaml (to read plugin.yaml)
-  # for the structural verification. Kept separate from propagatedBuildInputs so
-  # pyyaml is a test-only input, never leaked onto the plugin's runtime path.
-  checkPython = python.withPackages (ps: builtins.attrValues { inherit (ps) httpx pyyaml; });
+  inherit (python3Packages) python;
 
   # tools.registry is provided by the Hermes runtime that loads the plugin. This
   # stub stands in for it during the install check so the module imports without
@@ -79,29 +93,6 @@ let
     print("headroom-hermes-plugin: public surface OK")
   '';
   headroom-hermes-plugin = stdenvNoCC.mkDerivation {
-    pname = "headroom-hermes-plugin";
-    inherit (headroom-source) version;
-    inherit (headroom-source) src;
-
-    # Bring httpx onto PYTHONPATH via a .pth-free wrapper: the plugin is imported
-    # by the Hermes process, so record the dependency in passthru and expose a
-    # ready-to-use PYTHONPATH fragment consumers can source.
-    propagatedBuildInputs = [ pluginPython ];
-
-    dontConfigure = true;
-    dontBuild = true;
-
-    installPhase = ''
-      runHook preInstall
-      dest="$out/share/hermes/plugins"
-      mkdir -p "$dest"
-      cp -r plugins/hermes/headroom_retrieve "$dest/"
-      # A README next to the plugin so `nix run`/manual installers find the
-      # enable instructions without going back to the source tree.
-      install -Dm644 plugins/hermes/README.md "$out/share/doc/headroom-hermes-plugin/README.md"
-      runHook postInstall
-    '';
-
     # The plugin ships no test suite of its own (it is a copy-only directory), so
     # the "tests" for this component are structural verification against the
     # installed tree — the same guarantees a maturin `pythonImportsCheck` gives a
@@ -114,7 +105,8 @@ let
     #      headroom_retrieve tool, and the module exposes register()/the handler/
     #      the schema once `tools.registry` (host-provided) is stubbed in.
     doInstallCheck = true;
-    nativeInstallCheckInputs = [ checkPython ];
+    dontBuild = true;
+    dontConfigure = true;
     installCheckPhase = ''
       runHook preInstallCheck
 
@@ -143,33 +135,32 @@ let
 
       runHook postInstallCheck
     '';
-
-    passthru = { inherit devShell git-hooks treefmt; };
-
+    installPhase = ''
+      runHook preInstall
+      dest="$out/share/hermes/plugins"
+      mkdir -p "$dest"
+      cp -r plugins/hermes/headroom_retrieve "$dest/"
+      # A README next to the plugin so `nix run`/manual installers find the
+      # enable instructions without going back to the source tree.
+      install -Dm644 plugins/hermes/README.md "$out/share/doc/headroom-hermes-plugin/README.md"
+      runHook postInstall
+    '';
     meta = {
       description = "Hermes-Agent CCR retrieve plugin for the Headroom proxy";
       homepage = "https://github.com/headroomlabs-ai/headroom";
       platforms = lib.platforms.all;
     };
+    nativeInstallCheckInputs = [ checkPython ];
+    passthru = { inherit devShell git-hooks treefmt; };
+    pname = "headroom-hermes-plugin";
+    # Bring httpx onto PYTHONPATH via a .pth-free wrapper: the plugin is imported
+    # by the Hermes process, so record the dependency in passthru and expose a
+    # ready-to-use PYTHONPATH fragment consumers can source.
+    propagatedBuildInputs = [ pluginPython ];
+    inherit (headroom-source) src;
+    inherit (headroom-source) version;
   };
 
   treefmt = treefmtEval ./treefmt.nix;
-
-  git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce ../../../..;
-    package = prek;
-    hooks.treefmt = {
-      enable = true;
-      package = treefmt.config.build.wrapper;
-      settings.fail-on-change = true;
-    };
-  };
-
-  devShell = mkShell {
-    inputsFrom = [ headroom-hermes-plugin ];
-    packages = git-hooks.enabledPackages ++ [ treefmt.config.build.wrapper ];
-    inherit (git-hooks) shellHook;
-  };
 in
 headroom-hermes-plugin
