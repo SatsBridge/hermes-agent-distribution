@@ -1,5 +1,4 @@
-{ lib, pkgs, ... }:
-{
+{ lib, pkgs, ... }: {
   imports = import ../modules/module-list.nix;
 
   services.hermes-specialised-agent = {
@@ -32,7 +31,11 @@
         device = "nix-store";
         fsType = "9p";
         neededForBoot = true;
-        options = [ "trans=virtio" "version=9p2000.L" "ro" ];
+        options = [
+          "trans=virtio"
+          "version=9p2000.L"
+          "ro"
+        ];
       };
       "/nix/store" = {
         device = "/nix/.ro-store";
@@ -42,13 +45,19 @@
     };
   };
 
-  boot.initrd.availableKernelModules = [ "9p" "9pnet_virtio" ];
+  boot.initrd.availableKernelModules = [
+    "9p"
+    "9pnet_virtio"
+  ];
 
   systemd.services.hermes-module-vm-smoke = {
     description = "Check the Hermes VM resource and read-only 9p store limits";
     after = [ "local-fs.target" ];
     wantedBy = [ "multi-user.target" ];
-    path = [ pkgs.gawk pkgs.util-linux ];
+    path = [
+      pkgs.gawk
+      pkgs.util-linux
+    ];
     serviceConfig = {
       Type = "oneshot";
       StandardOutput = "tty";

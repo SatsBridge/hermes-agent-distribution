@@ -14,7 +14,7 @@ The guest disk limit does not limit host-side Nix builds, the Nix store, or
 qcow2 metadata/physical allocation.
 
 ```sh
-nix --extra-experimental-features 'nix-command flakes' build .#checks.x86_64-linux.hermes-module-vm-config
+nix --extra-experimental-features 'nix-command flakes' build .#hermes-module-vm-config-check
 nixos-rebuild build-vm --flake .#hermes-module-vm
 ```
 
