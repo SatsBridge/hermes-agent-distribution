@@ -359,9 +359,9 @@ let
       accelerate
       # [agno], [strands], [autogen], [voice-train], and [bedrock]
       agno
+      anthropic
       # [anyllm]
       any-llm-sdk
-      anthropic
       autogen-agentchat
       awscrt
       boto3
