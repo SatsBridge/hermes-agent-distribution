@@ -116,13 +116,13 @@ python313Packages.overrideScope (
 
     anthropic = prev.anthropic.overridePythonAttrs (old: rec {
       dependencies = (old.dependencies or [ ]) ++ [ final.distro ];
-      doCheck = false;
+      doCheck = false; # The sdist omits a hashed snapshot fixture required by one test.
       src = prev.fetchPypi {
         hash = "sha256-4Mrmo2iYbVz233Q9+7G5UZ5qnu6cbJQq2BIcCzRBb/4=";
         pname = "anthropic";
         inherit version;
       };
-      version = "0.76.0"; # The sdist omits a hashed snapshot fixture required by one test.
+      version = "0.76.0";
     });
 
     any-llm-sdk = sourcePackage {

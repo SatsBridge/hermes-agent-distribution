@@ -356,26 +356,31 @@ let
   ]
   ++ builtins.attrValues {
     inherit (py)
-      # [proxy]
       accelerate
+      # [agno], [strands], [autogen], [voice-train], and [bedrock]
       agno
-      anthropic
+      # [anyllm]
       any-llm-sdk
-      autogen-agentchat # httpx[http2] extra — required by the proxy's HTTP/2 client
+      anthropic
+      autogen-agentchat
       awscrt
       boto3
       botocore
+      # core (from pyproject [project.dependencies])
       click
       datasets
+      # [proxy]
       fastapi
       gunicorn
-      h2
-      # transformers 5.x (nixpkgs) needs huggingface-hub >=1.5.
+      h2 # httpx[http2] extra — required by the proxy's HTTP/2 client
+      # [vector] and [memory-stack]
       hnswlib
       httpx
+      # transformers 5.x (nixpkgs) needs huggingface-hub >=1.5.
       huggingface-hub
+      # [reports]
       jinja2
-      # core (from pyproject [project.dependencies])
+      # [langchain] and [langgraph]
       langchain-core
       langchain-openai
       langgraph
@@ -383,44 +388,39 @@ let
       mcp
       mem0ai
       neo4j
+      # [relevance]
       numpy
-      # [code]
       onnxruntime
       openai
-      # [vector] and [memory-stack]
+      # [spreadsheet]
       openpyxl
+      # [otel]
       opentelemetry-api
       opentelemetry-exporter-otlp-proto-http
       opentelemetry-sdk
-      # [relevance]
       orjson
       # [image]
       pillow
       pydantic
       pyyaml
-      # [reports]
       qdrant-client
-      # [otel]
       rapidocr
       rich
-      # [spreadsheet]
-      scikit-learn
-      sentence-transformers
-      # [html]
-      sentencepiece
       # [evals]
+      scikit-learn
+      # [memory]
+      sentence-transformers
+      sentencepiece
       sqlite-vec
       strands-agents
       tiktoken
-      # [memory]
       tomlkit
-      # [anyllm]
       torch
-      # [langchain] and [langgraph]
+      # [html]
       trafilatura
       transformers
+      # [code]
       tree-sitter
-      # [agno], [strands], [autogen], [voice-train], and [bedrock]
       tree-sitter-language-pack
       truststore
       uvicorn
