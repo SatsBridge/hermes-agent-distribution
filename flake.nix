@@ -51,22 +51,13 @@
             };
           };
           checks = {
-            inherit (pkgs)
-              headroom
-              headroom-hermes-plugin
-              headroom-proxy
-              headroom-py
-              ;
             git-hooks-gh-token-manager = pkgs.gh-token-manager.git-hooks;
             git-hooks-gh-token-manager-coverage = pkgs.gh-token-manager.coverage;
             git-hooks-git-hooks-headroom-hermes-plugin = pkgs.headroom-hermes-plugin.git-hooks;
             git-hooks-headroom = pkgs.headroom.git-hooks;
             git-hooks-headroom-proxy = pkgs.headroom-proxy.git-hooks;
             git-hooks-headroom-py = pkgs.headroom-py.git-hooks;
-          };
-          packages = {
             inherit (pkgs)
-              gh-token-manager
               headroom
               headroom-hermes-plugin
               headroom-proxy
@@ -79,6 +70,15 @@
             headroom-hermes-plugin = pkgs.headroom-hermes-plugin.devShell;
             headroom-proxy = pkgs.headroom-proxy.devShell;
             headroom-py = pkgs.headroom-py.devShell;
+          };
+          packages = {
+            inherit (pkgs)
+              gh-token-manager
+              headroom
+              headroom-hermes-plugin
+              headroom-proxy
+              headroom-py
+              ;
           };
         };
       rootTreefmtFor = system: treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} ./treefmt.nix;
@@ -104,17 +104,17 @@
       overlays.default =
         final: prev:
         let
-          system = final.stdenv.hostPlatform.system;
+          byNameOverlay = import "${nixpkgs-unstable}/pkgs/top-level/by-name-overlay.nix" ./pkgs/by-name;
           codebase-memory-mcp = inputs.codebase-memory-mcp.packages.${system}.default.overrideAttrs (
             _:
             let
               version = "0.11.0";
             in
             {
-              inherit version;
-              src = inputs.codebase-memory-mcp.outPath;
               # Keep the embedded binary version aligned with this flake pin.
               CFLAGS_EXTRA = "-DCBM_VERSION=\\\"${version}\\\"";
+              inherit version;
+              src = inputs.codebase-memory-mcp.outPath;
             }
           );
           packageScope = final // {
@@ -123,7 +123,7 @@
             gitHooks = git-hooks.lib.${system};
             treefmtEval = module: treefmt-nix.lib.evalModule final module;
           };
-          byNameOverlay = import "${nixpkgs-unstable}/pkgs/top-level/by-name-overlay.nix" ./pkgs/by-name;
+          system = final.stdenv.hostPlatform.system;
         in
         byNameOverlay packageScope prev;
       packages = forAllSystems (system: (packagesFor system).packages);

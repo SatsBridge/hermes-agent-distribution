@@ -16,48 +16,50 @@
   treefmtEval,
 }:
 let
-  version = "0.1.0";
-  treefmt = treefmtEval ./treefmt.nix;
   coverage = rustPlatform.buildRustPackage {
-    pname = "gh-token-manager-coverage";
-    inherit version;
-    src = ./.;
     cargoLock.lockFile = ./Cargo.lock;
     doCheck = false;
+    inherit version;
+    installPhase = ''
+      mkdir -p "$out"
+      cp coverage/report.json "$out/coverage.json"
+    '';
+    LLVM_COV = "${llvm}/bin/llvm-cov";
+    LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
     nativeBuildInputs = [
       cacert
       cargo-llvm-cov
       llvm
       python3
     ];
-    LLVM_COV = "${llvm}/bin/llvm-cov";
-    LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
-    RUSTC_BOOTSTRAP = "1";
+    pname = "gh-token-manager-coverage";
     postBuild = ''
       mkdir -p coverage
       cargo llvm-cov --manifest-path Cargo.toml --offline --branch --json \
         --output-path coverage/report.json
       python3 check_coverage.py coverage/report.json
     '';
-    installPhase = ''
-      mkdir -p "$out"
-      cp coverage/report.json "$out/coverage.json"
-    '';
+    RUSTC_BOOTSTRAP = "1";
+    src = ./.;
+  };
+  devShell = mkShell {
+    LLVM_COV = "${llvm}/bin/llvm-cov";
+    LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
+    packages = [
+      cargo
+      rustc
+      clippy
+      rustfmt
+      cacert
+      cargo-llvm-cov
+      llvm
+      python3
+    ]
+    ++ git-hooks.enabledPackages
+    ++ [ treefmt.config.build.wrapper ];
+    inherit (git-hooks) shellHook;
   };
   git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce (
-      runCommand "gh-token-manager-hook-source" { } ''
-        mkdir -p "$out"
-        cp -r ${../../../..}/. "$out/"
-        cp ${./Cargo.lock} "$out/Cargo.lock"
-      ''
-    );
-    package = prek;
-    settings.rust = {
-      cargoManifestPath = "pkgs/by-name/gh/gh-token-manager/Cargo.toml";
-      check.cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
-    };
     hooks = {
       clippy = {
         enable = true;
@@ -73,31 +75,27 @@ let
         settings.fail-on-change = true;
       };
     };
+    package = prek;
+    rootSrc = lib.mkForce (
+      runCommand "gh-token-manager-hook-source" { } ''
+        mkdir -p "$out"
+        cp -r ${../../../..}/. "$out/"
+        cp ${./Cargo.lock} "$out/Cargo.lock"
+      ''
+    );
+    settings.rust = {
+      cargoManifestPath = "pkgs/by-name/gh/gh-token-manager/Cargo.toml";
+      check.cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+    };
+    src = ./.;
   };
-  devShell = mkShell {
-    packages = [
-      cargo
-      rustc
-      clippy
-      rustfmt
-      cacert
-      cargo-llvm-cov
-      llvm
-      python3
-    ]
-    ++ git-hooks.enabledPackages
-    ++ [ treefmt.config.build.wrapper ];
-    LLVM_COV = "${llvm}/bin/llvm-cov";
-    LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
-    inherit (git-hooks) shellHook;
-  };
+  treefmt = treefmtEval ./treefmt.nix;
+  version = "0.1.0";
 in
 rustPlatform.buildRustPackage {
-  pname = "gh-token-manager";
-  inherit version;
-  src = ./.;
-  nativeBuildInputs = [ cacert ];
   cargoLock.lockFile = ./Cargo.lock;
+  inherit version;
+  nativeBuildInputs = [ cacert ];
   passthru = {
     inherit
       coverage
@@ -106,4 +104,6 @@ rustPlatform.buildRustPackage {
       treefmt
       ;
   };
+  pname = "gh-token-manager";
+  src = ./.;
 }

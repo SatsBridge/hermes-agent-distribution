@@ -62,8 +62,8 @@ let
     inherit (headroom-source) src;
 
     nativeBuildInputs = builtins.attrValues {
-      inherit (rustPlatform) maturinBuildHook cargoSetupHook;
-      inherit pkg-config cmake perl;
+      inherit (rustPlatform) cargoSetupHook maturinBuildHook;
+      inherit cmake perl pkg-config;
     };
 
     # Reproducible Cargo vendoring from the committed lockfile.

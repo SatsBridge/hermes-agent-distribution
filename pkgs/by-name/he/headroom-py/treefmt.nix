@@ -1,15 +1,15 @@
 _: {
   projectRootFile = "pkgs/by-name/he/headroom-py/package.nix";
   programs = {
+    deadnix.enable = true;
+    nixf-diagnose.enable = true;
     nixfmt = {
       enable = true;
       strict = true;
     };
-    deadnix.enable = true;
-    statix.enable = true;
-    nixf-diagnose.enable = true;
     rumdl-check.enable = true;
     rumdl-format.enable = true;
+    statix.enable = true;
   };
   settings.global.excludes = [ "*.lock" ];
 }

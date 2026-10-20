@@ -8,8 +8,8 @@
 #
 # The clippy lint is exposed via `passthru.clippy` for the flake's checks.
 {
-  cmake,
   clippy,
+  cmake,
   gitHooks,
   headroom-source,
   lib,

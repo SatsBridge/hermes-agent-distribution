@@ -17,27 +17,13 @@ let
     optional
     types
     ;
-  cfg = config.services.hermes-specialised-agent;
+  agentFullNameDuplicatesMessage = lib.concatStringsSep ", " (
+    mapAttrsToList (n: count: "\"${n}\" (${toString count} times)") duplicateAgentFullNamesCounts
+  );
   agentFullNames = mapAttrsToList (name: { enable, fullName, ... }: {
     inherit enable fullName;
     name = "hermes-${name}";
   }) cfg.agents;
-  duplicateAgentFullNamesCounts = filterAttrs (_: count: count > 1) (
-    builtins.foldl' (
-      acc: { fullName, ... }: acc // { ${fullName} = (acc.${fullName} or 0) + 1; }
-    ) { } agentFullNames
-  );
-  agentFullNameDuplicatesMessage = lib.concatStringsSep ", " (
-    mapAttrsToList (n: count: "\"${n}\" (${toString count} times)") duplicateAgentFullNamesCounts
-  );
-  sharedStateId = "hermes-shared";
-  sharedStatePath = "%S/${sharedStateId}";
-  sharedState.tmpfiles.rules = [
-    "d ${sharedStatePath} 2770 root ${sharedStateId} - -"
-    "d ${sharedStatePath}/kanban 2770 root ${sharedStateId} - -"
-    "d ${sharedStatePath}/kanban/logs 2770 root ${sharedStateId} - -"
-    "d ${sharedStatePath}/kanban/workspaces 2770 root ${sharedStateId} - -"
-  ];
   agentOpts =
     { lib, ... }:
     let
@@ -106,12 +92,18 @@ let
         };
       };
     };
+  cfg = config.services.hermes-specialised-agent;
+  duplicateAgentFullNamesCounts = filterAttrs (_: count: count > 1) (
+    builtins.foldl' (
+      acc: { fullName, ... }: acc // { ${fullName} = (acc.${fullName} or 0) + 1; }
+    ) { } agentFullNames
+  );
   mkAgentTemplate =
     let
       agentStateSystemdId = "hermes-%i";
-      publicStateFixerSystemdId = "hermes-%i-pf";
       agentStateSystemdPath = "%S/${agentStateSystemdId}";
       hermesAgentStateSystemdPath = "${agentStateSystemdPath}/.hermes";
+      publicStateFixerSystemdId = "hermes-%i-pf";
     in
     mkIf cfg.enable {
       services = {
@@ -121,17 +113,13 @@ let
           description = "Hermes Agent Gateway";
           enableDefaultPath = false;
           environment = {
-            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-            SSH_AUTH_SOCK = "%t/${agentStateSystemdId}/ssh-agent.socket";
-            HOME = agentStateSystemdPath;
-            HERMES_HOME = hermesAgentStateSystemdPath;
-            HERMES_KANBAN_HOME = sharedStatePath;
-            RTK_TELEMETRY_DISABLED = "1";
             HEADROOM_BEACON = "off";
-            HEADROOM_TELEMETRY = "on";
             #HEADROOM_OTEL_METRICS_ENABLED = "1";
             HEADROOM_SAVINGS_PROFILE = "coding";
-            PONYTAIL_DEFAULT_MODE = "ultra";
+            HEADROOM_TELEMETRY = "on";
+            HERMES_HOME = hermesAgentStateSystemdPath;
+            HERMES_KANBAN_HOME = sharedStatePath;
+            HOME = agentStateSystemdPath;
             MNEMOSYNE_AUTO_MIGRATE = "1";
             MNEMOSYNE_AUTO_SLEEP_ENABLED = "1";
             MNEMOSYNE_CROSS_SESSION = "1";
@@ -195,24 +183,28 @@ let
             MNEMOSYNE_WM_MAX_ITEMS = "50000";
             MNEMOSYNE_WM_TTL_HOURS = "720";
             MNEMOSYNE_WRITE_CLASSIFIER = "strict";
+            PONYTAIL_DEFAULT_MODE = "ultra";
+            RTK_TELEMETRY_DISABLED = "1";
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+            SSH_AUTH_SOCK = "%t/${agentStateSystemdId}/ssh-agent.socket";
           };
           path = builtins.attrValues {
             inherit (pkgs)
+              ast-grep
               bash
               coreutils
-              findutils
-              gnugrep
-              ast-grep
-              ripgrep
-              gnused
               diffutils
-              util-linux
-              nix
+              findutils
               git
-              openssh
+              gnugrep
+              gnused
               headroom
               headroom-proxy
               mnemosyne
+              nix
+              openssh
+              ripgrep
+              util-linux
               ;
           };
           serviceConfig = {
@@ -493,8 +485,8 @@ let
               ProtectKernelTunables = true;
               ProtectProc = "invisible";
               ProtectSystem = "strict";
-              RemoveIPC = true;
               ReadWritePaths = [ agentStateSystemdPath ];
+              RemoveIPC = true;
               Restart = "always";
               RestrictAddressFamilies = [ "AF_UNIX" ];
               RestrictNamespaces = true;
@@ -637,6 +629,14 @@ let
           plugin: "L+ ${hermesAgentStatePath}/plugins/nix-managed-${getName plugin} - - - - ${plugin}"
         ) agentCfg.extraPlugins;
     };
+  sharedState.tmpfiles.rules = [
+    "d ${sharedStatePath} 2770 root ${sharedStateId} - -"
+    "d ${sharedStatePath}/kanban 2770 root ${sharedStateId} - -"
+    "d ${sharedStatePath}/kanban/logs 2770 root ${sharedStateId} - -"
+    "d ${sharedStatePath}/kanban/workspaces 2770 root ${sharedStateId} - -"
+  ];
+  sharedStateId = "hermes-shared";
+  sharedStatePath = "%S/${sharedStateId}";
 in
 {
   options.services.hermes-specialised-agent = {
