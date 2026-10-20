@@ -37,61 +37,6 @@ let
     rootSrc = lib.mkForce ../../../..;
     src = ./.;
   };
-
-  # The Python environment the Hermes host loads the plugin under: it must carry
-  # httpx (the plugin's only third-party import). Bound here so the same
-  # interpreter both backs propagatedBuildInputs and drives the install check.
-  pluginPython = python.withPackages (ps: [ ps.httpx ]);
-  inherit (python3Packages) python;
-
-  # tools.registry is provided by the Hermes runtime that loads the plugin. This
-  # stub stands in for it during the install check so the module imports without
-  # a live host; it is a test fixture, never installed.
-  toolsRegistryStub = writeText "tools-registry-stub.py" ''
-    def tool_error(msg):
-        return {"error": msg}
-
-
-    def tool_result(data):
-        return {"result": data}
-  '';
-
-  # Structural verification of the installed plugin — the "tests" for a
-  # copy-only component. Passed HEADROOM_PLUGIN_DIR by the install check.
-  verifyScript = writeText "verify-headroom-hermes-plugin.py" ''
-    import os
-    import pathlib
-
-    import yaml
-
-    import headroom_retrieve as hr
-
-    plugindir = pathlib.Path(hr.__file__).parent
-
-    manifest = yaml.safe_load((plugindir / "plugin.yaml").read_text())
-    assert manifest["name"] == "headroom_retrieve", manifest
-    assert "headroom_retrieve" in manifest["provides_tools"], manifest
-
-    assert callable(hr.register), "register() missing"
-    assert callable(hr._handle_headroom_retrieve), "handler missing"
-    assert (
-        hr.HEADROOM_RETRIEVE_SCHEMA["name"] == "headroom_retrieve"
-    ), hr.HEADROOM_RETRIEVE_SCHEMA
-
-    # register(ctx) must register a tool named headroom_retrieve with a handler.
-    captured = {}
-
-
-    class _Ctx:
-        def register_tool(self, **kw):
-            captured.update(kw)
-
-
-    hr.register(_Ctx())
-    assert captured.get("name") == "headroom_retrieve", captured
-    assert callable(captured.get("handler")), captured
-    print("headroom-hermes-plugin: public surface OK")
-  '';
   headroom-hermes-plugin = stdenvNoCC.mkDerivation {
     # The plugin ships no test suite of its own (it is a copy-only directory), so
     # the "tests" for this component are structural verification against the
@@ -161,6 +106,61 @@ let
     inherit (headroom-source) version;
   };
 
+  # The Python environment the Hermes host loads the plugin under: it must carry
+  # httpx (the plugin's only third-party import). Bound here so the same
+  # interpreter both backs propagatedBuildInputs and drives the install check.
+  pluginPython = python.withPackages (ps: [ ps.httpx ]);
+  inherit (python3Packages) python;
+
+  # tools.registry is provided by the Hermes runtime that loads the plugin. This
+  # stub stands in for it during the install check so the module imports without
+  # a live host; it is a test fixture, never installed.
+  toolsRegistryStub = writeText "tools-registry-stub.py" ''
+    def tool_error(msg):
+        return {"error": msg}
+
+
+    def tool_result(data):
+        return {"result": data}
+  '';
+
   treefmt = treefmtEval ./treefmt.nix;
+
+  # Structural verification of the installed plugin — the "tests" for a
+  # copy-only component. Passed HEADROOM_PLUGIN_DIR by the install check.
+  verifyScript = writeText "verify-headroom-hermes-plugin.py" ''
+    import os
+    import pathlib
+
+    import yaml
+
+    import headroom_retrieve as hr
+
+    plugindir = pathlib.Path(hr.__file__).parent
+
+    manifest = yaml.safe_load((plugindir / "plugin.yaml").read_text())
+    assert manifest["name"] == "headroom_retrieve", manifest
+    assert "headroom_retrieve" in manifest["provides_tools"], manifest
+
+    assert callable(hr.register), "register() missing"
+    assert callable(hr._handle_headroom_retrieve), "handler missing"
+    assert (
+        hr.HEADROOM_RETRIEVE_SCHEMA["name"] == "headroom_retrieve"
+    ), hr.HEADROOM_RETRIEVE_SCHEMA
+
+    # register(ctx) must register a tool named headroom_retrieve with a handler.
+    captured = {}
+
+
+    class _Ctx:
+        def register_tool(self, **kw):
+            captured.update(kw)
+
+
+    hr.register(_Ctx())
+    assert captured.get("name") == "headroom_retrieve", captured
+    assert callable(captured.get("handler")), captured
+    print("headroom-hermes-plugin: public surface OK")
+  '';
 in
 headroom-hermes-plugin

@@ -1,5 +1,4 @@
 _: {
-  projectRootFile = "pkgs/by-name/he/headroom-source/package.nix";
   programs = {
     deadnix.enable = true;
     nixf-diagnose.enable = true;
@@ -11,5 +10,6 @@ _: {
     rumdl-format.enable = true;
     statix.enable = true;
   };
+  projectRootFile = "pkgs/by-name/he/headroom-source/package.nix";
   settings.global.excludes = [ "*.lock" ];
 }

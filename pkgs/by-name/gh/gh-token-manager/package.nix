@@ -17,15 +17,15 @@
 }:
 let
   coverage = rustPlatform.buildRustPackage {
+    LLVM_COV = "${llvm}/bin/llvm-cov";
+    LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
+    RUSTC_BOOTSTRAP = "1";
     cargoLock.lockFile = ./Cargo.lock;
     doCheck = false;
-    inherit version;
     installPhase = ''
       mkdir -p "$out"
       cp coverage/report.json "$out/coverage.json"
     '';
-    LLVM_COV = "${llvm}/bin/llvm-cov";
-    LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
     nativeBuildInputs = [
       cacert
       cargo-llvm-cov
@@ -39,8 +39,8 @@ let
         --output-path coverage/report.json
       python3 check_coverage.py coverage/report.json
     '';
-    RUSTC_BOOTSTRAP = "1";
     src = ./.;
+    inherit version;
   };
   devShell = mkShell {
     LLVM_COV = "${llvm}/bin/llvm-cov";
@@ -94,7 +94,6 @@ let
 in
 rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
-  inherit version;
   nativeBuildInputs = [ cacert ];
   passthru = {
     inherit
@@ -106,4 +105,5 @@ rustPlatform.buildRustPackage {
   };
   pname = "gh-token-manager";
   src = ./.;
+  inherit version;
 }

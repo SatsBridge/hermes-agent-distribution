@@ -44,19 +44,6 @@
   writeText,
 }:
 let
-  inherit (headroom-python-pkgs) python;
-  py = headroom-python-pkgs;
-  ortDylib = "${onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
-
-  # The `headroom = headroom.cli:main` console-script body (a shebang is
-  # prepended at install time).
-  launcher = writeText "headroom-launcher.py" ''
-    import sys
-
-    from headroom.cli import main
-
-    sys.exit(main())
-  '';
 
   buildInfo = writeText "headroom-build-info.py" ''
     BUILD_VERSION = "${headroom-source.version}"
@@ -65,137 +52,38 @@ let
   # Provide every subprocess tool on PATH; CBM and the other tools are Nix-built.
   bundledTools = builtins.attrValues {
     inherit ast-grep scc;
+    inherit codebase-memory-mcp;
     difft = difftastic;
     inherit rtk;
-    inherit codebase-memory-mcp;
   };
 
-  # All applicable optional extras except dev, including extras not selected by
-  # upstream's narrower `[all]`; see check-extra-dependencies.py.
-  runtimeDeps = [
-    py.litellm
-  ]
-  ++ builtins.attrValues {
-    inherit (py)
-      # [proxy]
-      fastapi
-      gunicorn
-      uvicorn
-      httpx
-      h2 # httpx[http2] extra — required by the proxy's HTTP/2 client
-      openai
-      mcp
-      magika
-      zstandard
-      websockets
-      orjson
-      onnxruntime
-      transformers
-      # transformers 5.x (nixpkgs) needs huggingface-hub >=1.5.
-      huggingface-hub
-      torch
-      watchdog
-      sqlite-vec
-      # core (from pyproject [project.dependencies])
-      tiktoken
-      pydantic
-      click
-      rich
-      pyyaml
-      tomlkit
-      truststore
-      opentelemetry-api
-      # [code]
-      tree-sitter
-      tree-sitter-language-pack
-      # [vector] and [memory-stack]
-      hnswlib
-      mem0ai
-      qdrant-client
-      neo4j
-      # [relevance]
-      numpy
-      # [image]
-      pillow
-      sentencepiece
-      rapidocr
-      # [reports]
-      jinja2
-      # [otel]
-      opentelemetry-sdk
-      opentelemetry-exporter-otlp-proto-http
-      # [spreadsheet]
-      openpyxl
-      xlrd
-      # [html]
-      trafilatura
-      # [evals]
-      scikit-learn
-      datasets
-      anthropic
-      # [memory]
-      sentence-transformers
-      # [anyllm]
-      any-llm-sdk
-      # [langchain] and [langgraph]
-      langchain-core
-      langchain-openai
-      langgraph
-      # [agno], [strands], [autogen], [voice-train], and [bedrock]
-      agno
-      strands-agents
-      autogen-agentchat
-      accelerate
-      boto3
-      botocore
-      awscrt
-      ;
-  }
-  # nixpkgs marks fastembed unsupported on aarch64-linux.
-  ++ lib.optionals (stdenv.hostPlatform.system != "aarch64-linux") [ py.fastembed ];
+  # `-k` matches disabled test-name substrings; `--ignore` excludes whole files.
+  # `-m` drops the slow / real-LLM / live-network marked cases.
+  deselectArgs = (map (p: "--ignore=${p}") disabledTestPaths) ++ [
+    "-k"
+    ("not (" + lib.concatStringsSep " or " disabledTests + ")")
+    "-m"
+    "not slow and not real_llm and not live"
+  ];
 
-  # tiktoken downloads its BPE vocab from openaipublic.blob.core.windows.net the
-  # first time an encoding is used. The sandbox has no network, so the ~445
-  # tokenizer-backed unit tests would fail with ConnectionError. Pre-seed
-  # tiktoken's on-disk cache instead: it reads
-  # `$TIKTOKEN_CACHE_DIR/<sha1(url)>` before fetching (tiktoken/load.py). The
-  # vocab files are fetched as fixed-output derivations (content-addressed → the
-  # one place the Nix sandbox permits network), so the check phase stays offline
-  # and the tests run rather than being skipped.
-  tiktokenEncodings = {
-    "r50k_base" = fetchurl {
-      url = "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken";
-      hash = "sha256-MGzSfwPBpxTspxCOA9ZrfcBCq+jCWLRMGZp+2YON2TA=";
-    };
-    "p50k_base" = fetchurl {
-      url = "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken";
-      hash = "sha256-lLXKff9NAHZ7wlb90bJ+Wxc2HXuKX5aFR/nyPrcNIGk=";
-    };
-    "cl100k_base" = fetchurl {
-      url = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken";
-      hash = "sha256-Ijkht27pm96ZW3/3OFE+7xAPtR0YyTWXoRO8/+hlsqc=";
-    };
-    "o200k_base" = fetchurl {
-      url = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken";
-      hash = "sha256-RGqVOMtsNI41FhINfAiwn1fDZJXirP/+WaW/iwz7Gi0=";
-    };
+  devShell = mkShell {
+    inputsFrom = [
+      headroom-proxy
+      headroom
+    ];
+    packages =
+      git-hooks.enabledPackages
+      ++ builtins.attrValues {
+        inherit
+          cargo
+          maturin
+          rustc
+          uv
+          ;
+      }
+      ++ [ treefmt.config.build.wrapper ];
+    inherit (git-hooks) shellHook;
   };
-
-  tiktokenCache = runCommand "tiktoken-cache" { } (
-    ''
-      mkdir -p "$out"
-    ''
-    + lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (
-        name: file:
-        let
-          url = "https://openaipublic.blob.core.windows.net/encodings/${name}.tiktoken";
-          key = builtins.hashString "sha1" url;
-        in
-        ''cp ${file} "$out/${key}"''
-      ) tiktokenEncodings
-    )
-  );
 
   # Exclude individual tests only for sandbox limits, test-harness assumptions,
   # or missing-extra cases that do not apply to the full runtime package.
@@ -270,105 +158,21 @@ let
     "test_hybrid_scoring"
   ];
 
-  # `-k` matches disabled test-name substrings; `--ignore` excludes whole files.
-  # `-m` drops the slow / real-LLM / live-network marked cases.
-  deselectArgs = (map (p: "--ignore=${p}") disabledTestPaths) ++ [
-    "-k"
-    ("not (" + lib.concatStringsSep " or " disabledTests + ")")
-    "-m"
-    "not slow and not real_llm and not live"
-  ];
+  git-hooks = gitHooks.run {
+    hooks = {
+      convco.enable = true;
+      treefmt = {
+        enable = true;
+        package = treefmt.config.build.wrapper;
+        settings.fail-on-change = true;
+      };
+    };
+    package = prek;
+    rootSrc = lib.mkForce ../../../..;
+    src = ./.;
+  };
 
   headroom = py.buildPythonPackage {
-    pname = "headroom";
-    inherit (headroom-source) version;
-    src = headroom-source;
-
-    # The extension is copied from headroom-py, not rebuilt, so there is no
-    # pyproject/maturin build step — install the source tree ourselves.
-    format = "other";
-
-    nativeBuildInputs = [ makeWrapper ];
-
-    dependencies = runtimeDeps;
-
-    # `format = "other"` gives us the default stdenv phases; there is nothing to
-    # configure or compile here (the extension is prebuilt in headroom-py and the
-    # Python code is installed verbatim), so those phases are skipped. The custom
-    # installPhase below does all the work.
-    dontConfigure = true;
-    dontBuild = true;
-
-    # Extra wrapper arguments applied by wrapPythonProgramsHook (which also injects
-    # the propagated dependencies onto PYTHONPATH): the offline CLI tools on PATH
-    # and libonnxruntime for the compiled core.
-    # Keep LiteLLM on its bundled map; a refresh would violate the offline runtime.
-    makeWrapperArgs = [
-      # Prevent a caller's Python path from shadowing the pinned package set.
-      "--unset"
-      "PYTHONPATH"
-      "--prefix"
-      "PATH"
-      ":"
-      (lib.makeBinPath bundledTools)
-      "--set-default"
-      "LITELLM_LOCAL_MODEL_COST_MAP"
-      "True"
-      "--set"
-      "HEADROOM_BINARIES_OFFLINE"
-      "1"
-      "--set"
-      "DO_NOT_TRACK"
-      "1"
-      "--set-default"
-      "ORT_DYLIB_PATH"
-      ortDylib
-    ];
-
-    # Install the pure-Python `headroom/` package and its data files verbatim,
-    # then drop the prebuilt compiled extension in beside them and write the
-    # `headroom` console-script (pyproject: `headroom = headroom.cli:main`).
-    # wrapPythonProgramsHook wraps that script in postFixup, adding the runtime
-    # dependencies (propagated) and the makeWrapperArgs above.
-    installPhase = ''
-      runHook preInstall
-
-      site="$out/${python.sitePackages}"
-      mkdir -p "$site"
-      cp -r headroom "$site/"
-      cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
-        "$site/headroom/${headroom-py.passthru.coreLib}"
-      cp ${buildInfo} "$site/headroom/_build_info.py"
-
-      mkdir -p "$out/bin"
-      # The console-script body from pyproject (`headroom = headroom.cli:main`),
-      # with the interpreter shebang patched in. wrapPythonProgramsHook then wraps
-      # it with the propagated deps' PYTHONPATH and makeWrapperArgs.
-      {
-        echo "#!${python.interpreter}"
-        cat ${launcher}
-      } > "$out/bin/headroom"
-      chmod +x "$out/bin/headroom"
-
-      runHook postInstall
-    '';
-
-    # Full offline test run against the installed source with the real dependency
-    # set. Only individual network / process-spawn cases are deselected, each with
-    # a reason above.
-    # Test-only dependencies; these do not enter the runtime closure.
-    nativeCheckInputs =
-      builtins.attrValues {
-        inherit (py)
-          pytest
-          pytest-asyncio
-          packaging
-          respx
-          socksio
-          ;
-      }
-      ++ bundledTools
-      ++ [ git ];
     checkPhase = ''
       runHook preCheck
 
@@ -423,17 +227,72 @@ let
       runHook postCheck
     '';
 
-    pythonImportsCheck = [
-      "headroom"
-      "headroom._core"
-      "headroom._build_info"
-    ];
+    dependencies = runtimeDeps;
+    dontBuild = true;
 
-    passthru = {
-      inherit devShell git-hooks;
-      proxy = headroom-proxy;
-      inherit tiktokenCache treefmt;
-    };
+    # `format = "other"` gives us the default stdenv phases; there is nothing to
+    # configure or compile here (the extension is prebuilt in headroom-py and the
+    # Python code is installed verbatim), so those phases are skipped. The custom
+    # installPhase below does all the work.
+    dontConfigure = true;
+
+    # The extension is copied from headroom-py, not rebuilt, so there is no
+    # pyproject/maturin build step — install the source tree ourselves.
+    format = "other";
+
+    # Install the pure-Python `headroom/` package and its data files verbatim,
+    # then drop the prebuilt compiled extension in beside them and write the
+    # `headroom` console-script (pyproject: `headroom = headroom.cli:main`).
+    # wrapPythonProgramsHook wraps that script in postFixup, adding the runtime
+    # dependencies (propagated) and the makeWrapperArgs above.
+    installPhase = ''
+      runHook preInstall
+
+      site="$out/${python.sitePackages}"
+      mkdir -p "$site"
+      cp -r headroom "$site/"
+      cp ${headroom-py}/${python.sitePackages}/headroom/${headroom-py.passthru.coreLib} \
+        "$site/headroom/${headroom-py.passthru.coreLib}"
+      cp ${buildInfo} "$site/headroom/_build_info.py"
+
+      mkdir -p "$out/bin"
+      # The console-script body from pyproject (`headroom = headroom.cli:main`),
+      # with the interpreter shebang patched in. wrapPythonProgramsHook then wraps
+      # it with the propagated deps' PYTHONPATH and makeWrapperArgs.
+      {
+        echo "#!${python.interpreter}"
+        cat ${launcher}
+      } > "$out/bin/headroom"
+      chmod +x "$out/bin/headroom"
+
+      runHook postInstall
+    '';
+
+    # Extra wrapper arguments applied by wrapPythonProgramsHook (which also injects
+    # the propagated dependencies onto PYTHONPATH): the offline CLI tools on PATH
+    # and libonnxruntime for the compiled core.
+    # Keep LiteLLM on its bundled map; a refresh would violate the offline runtime.
+    makeWrapperArgs = [
+      # Prevent a caller's Python path from shadowing the pinned package set.
+      "--unset"
+      "PYTHONPATH"
+      "--prefix"
+      "PATH"
+      ":"
+      (lib.makeBinPath bundledTools)
+      "--set-default"
+      "LITELLM_LOCAL_MODEL_COST_MAP"
+      "True"
+      "--set"
+      "HEADROOM_BINARIES_OFFLINE"
+      "1"
+      "--set"
+      "DO_NOT_TRACK"
+      "1"
+      "--set-default"
+      "ORT_DYLIB_PATH"
+      ortDylib
+    ];
 
     meta = {
       description = "Headroom context-optimization layer for LLM apps (Python + Rust core)";
@@ -441,41 +300,182 @@ let
       mainProgram = "headroom";
       platforms = lib.platforms.unix;
     };
+
+    nativeBuildInputs = [ makeWrapper ];
+
+    # Full offline test run against the installed source with the real dependency
+    # set. Only individual network / process-spawn cases are deselected, each with
+    # a reason above.
+    # Test-only dependencies; these do not enter the runtime closure.
+    nativeCheckInputs =
+      builtins.attrValues {
+        inherit (py)
+          packaging
+          pytest
+          pytest-asyncio
+          respx
+          socksio
+          ;
+      }
+      ++ bundledTools
+      ++ [ git ];
+
+    passthru = {
+      inherit devShell git-hooks;
+      proxy = headroom-proxy;
+      inherit tiktokenCache treefmt;
+    };
+    pname = "headroom";
+
+    pythonImportsCheck = [
+      "headroom"
+      "headroom._core"
+      "headroom._build_info"
+    ];
+    src = headroom-source;
+    inherit (headroom-source) version;
   };
 
-  treefmt = treefmtEval ./treefmt.nix;
+  # The `headroom = headroom.cli:main` console-script body (a shebang is
+  # prepended at install time).
+  launcher = writeText "headroom-launcher.py" ''
+    import sys
 
-  git-hooks = gitHooks.run {
-    src = ./.;
-    rootSrc = lib.mkForce ../../../..;
-    package = prek;
-    hooks = {
-      convco.enable = true;
-      treefmt = {
-        enable = true;
-        package = treefmt.config.build.wrapper;
-        settings.fail-on-change = true;
-      };
+    from headroom.cli import main
+
+    sys.exit(main())
+  '';
+  ortDylib = "${onnxruntime}/lib/libonnxruntime${stdenv.hostPlatform.extensions.sharedLibrary}";
+  py = headroom-python-pkgs;
+  inherit (headroom-python-pkgs) python;
+
+  # All applicable optional extras except dev, including extras not selected by
+  # upstream's narrower `[all]`; see check-extra-dependencies.py.
+  runtimeDeps = [
+    py.litellm
+  ]
+  ++ builtins.attrValues {
+    inherit (py)
+      # [proxy]
+      accelerate
+      agno
+      anthropic
+      any-llm-sdk
+      autogen-agentchat # httpx[http2] extra — required by the proxy's HTTP/2 client
+      awscrt
+      boto3
+      botocore
+      click
+      datasets
+      fastapi
+      gunicorn
+      h2
+      # transformers 5.x (nixpkgs) needs huggingface-hub >=1.5.
+      hnswlib
+      httpx
+      huggingface-hub
+      jinja2
+      # core (from pyproject [project.dependencies])
+      langchain-core
+      langchain-openai
+      langgraph
+      magika
+      mcp
+      mem0ai
+      neo4j
+      numpy
+      # [code]
+      onnxruntime
+      openai
+      # [vector] and [memory-stack]
+      openpyxl
+      opentelemetry-api
+      opentelemetry-exporter-otlp-proto-http
+      opentelemetry-sdk
+      # [relevance]
+      orjson
+      # [image]
+      pillow
+      pydantic
+      pyyaml
+      # [reports]
+      qdrant-client
+      # [otel]
+      rapidocr
+      rich
+      # [spreadsheet]
+      scikit-learn
+      sentence-transformers
+      # [html]
+      sentencepiece
+      # [evals]
+      sqlite-vec
+      strands-agents
+      tiktoken
+      # [memory]
+      tomlkit
+      # [anyllm]
+      torch
+      # [langchain] and [langgraph]
+      trafilatura
+      transformers
+      tree-sitter
+      # [agno], [strands], [autogen], [voice-train], and [bedrock]
+      tree-sitter-language-pack
+      truststore
+      uvicorn
+      watchdog
+      websockets
+      xlrd
+      zstandard
+      ;
+  }
+  # nixpkgs marks fastembed unsupported on aarch64-linux.
+  ++ lib.optionals (stdenv.hostPlatform.system != "aarch64-linux") [ py.fastembed ];
+
+  tiktokenCache = runCommand "tiktoken-cache" { } (
+    ''
+      mkdir -p "$out"
+    ''
+    + lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (
+        name: file:
+        let
+          key = builtins.hashString "sha1" url;
+          url = "https://openaipublic.blob.core.windows.net/encodings/${name}.tiktoken";
+        in
+        ''cp ${file} "$out/${key}"''
+      ) tiktokenEncodings
+    )
+  );
+
+  # tiktoken downloads its BPE vocab from openaipublic.blob.core.windows.net the
+  # first time an encoding is used. The sandbox has no network, so the ~445
+  # tokenizer-backed unit tests would fail with ConnectionError. Pre-seed
+  # tiktoken's on-disk cache instead: it reads
+  # `$TIKTOKEN_CACHE_DIR/<sha1(url)>` before fetching (tiktoken/load.py). The
+  # vocab files are fetched as fixed-output derivations (content-addressed → the
+  # one place the Nix sandbox permits network), so the check phase stays offline
+  # and the tests run rather than being skipped.
+  tiktokenEncodings = {
+    "cl100k_base" = fetchurl {
+      hash = "sha256-Ijkht27pm96ZW3/3OFE+7xAPtR0YyTWXoRO8/+hlsqc=";
+      url = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken";
+    };
+    "o200k_base" = fetchurl {
+      hash = "sha256-RGqVOMtsNI41FhINfAiwn1fDZJXirP/+WaW/iwz7Gi0=";
+      url = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken";
+    };
+    "p50k_base" = fetchurl {
+      hash = "sha256-lLXKff9NAHZ7wlb90bJ+Wxc2HXuKX5aFR/nyPrcNIGk=";
+      url = "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken";
+    };
+    "r50k_base" = fetchurl {
+      hash = "sha256-MGzSfwPBpxTspxCOA9ZrfcBCq+jCWLRMGZp+2YON2TA=";
+      url = "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken";
     };
   };
 
-  devShell = mkShell {
-    inputsFrom = [
-      headroom-proxy
-      headroom
-    ];
-    packages =
-      git-hooks.enabledPackages
-      ++ builtins.attrValues {
-        inherit
-          rustc
-          cargo
-          maturin
-          uv
-          ;
-      }
-      ++ [ treefmt.config.build.wrapper ];
-    inherit (git-hooks) shellHook;
-  };
+  treefmt = treefmtEval ./treefmt.nix;
 in
 headroom

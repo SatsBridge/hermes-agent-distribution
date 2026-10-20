@@ -1,5 +1,4 @@
 _: {
-  projectRootFile = "pkgs/by-name/gh/gh-token-manager/package.nix";
 
   programs = {
     deadnix.enable = true;
@@ -11,11 +10,12 @@ _: {
     rumdl-check.enable = true;
     rumdl-format.enable = true;
     rustfmt = {
-      enable = true;
       edition = "2024";
+      enable = true;
     };
     statix.enable = true;
   };
+  projectRootFile = "pkgs/by-name/gh/gh-token-manager/package.nix";
 
   settings.global.excludes = [ "*.lock" ];
 }

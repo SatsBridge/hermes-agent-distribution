@@ -3,19 +3,19 @@
 
   inputs = {
     codebase-memory-mcp = {
-      url = "github:DeusData/codebase-memory-mcp/v0.11.0";
       inputs.nixpkgs.follows = "nixpkgs-unstable";
+      url = "github:DeusData/codebase-memory-mcp/v0.11.0";
     };
     flake-compat.url = "github:NixOS/flake-compat";
-    git-hooks.url = "github:cachix/git-hooks.nix";
     git-hooks.inputs.flake-compat.follows = "flake-compat";
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
-    nix-github-actions.url = "github:nix-community/nix-github-actions";
+    git-hooks.url = "github:cachix/git-hooks.nix";
     nix-github-actions.inputs.nixpkgs.follows = "nixpkgs";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nix-github-actions.url = "github:nix-community/nix-github-actions";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
   };
 
   outputs =

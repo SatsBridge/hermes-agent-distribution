@@ -1,5 +1,4 @@
 _: {
-  projectRootFile = "pkgs/by-name/he/headroom-hermes-plugin/package.nix";
 
   programs = {
     deadnix.enable = true;
@@ -12,6 +11,7 @@ _: {
     rumdl-format.enable = true;
     statix.enable = true;
   };
+  projectRootFile = "pkgs/by-name/he/headroom-hermes-plugin/package.nix";
 
   settings.global.excludes = [ "*.lock" ];
 }

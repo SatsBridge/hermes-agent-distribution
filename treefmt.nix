@@ -1,7 +1,6 @@
 # treefmt-nix configuration shared by `nix fmt`, the treefmt git hook, and the
 # devShell. Every formatter listed in the packaging brief is enabled here.
 _: {
-  projectRootFile = "flake.nix";
 
   programs = {
     actionlint.enable = true;
@@ -29,8 +28,8 @@ _: {
     rumdl-format.enable = true;
     # Rust
     rustfmt = {
-      enable = true;
       edition = "2024";
+      enable = true;
     };
     statix.enable = true;
     # YAML / GitHub Actions
@@ -51,6 +50,7 @@ _: {
     };
     zizmor.enable = true;
   };
+  projectRootFile = "flake.nix";
 
   settings.global.excludes = [
     # Lockfiles and generated data — never hand-formatted.
