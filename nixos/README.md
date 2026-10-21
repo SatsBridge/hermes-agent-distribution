@@ -5,7 +5,9 @@ From the repository root, build a local x86_64-linux NixOS VM from the real
 and `vm-peer`) and their public-state services. QEMU networking is restricted;
 no host Hermes state or credentials are supplied, and the check does not make
 model requests. Default skill downloads are disabled only for this offline
-fixture; the real ownership initialization pre-step remains enabled. The
+fixture. The optional Headroom proxy is disabled to stay within the 1024 MiB
+guest limit; real Hermes gateways, the dashboard, and ownership initialization
+remain enabled. Production Headroom defaults are unchanged. The
 VM-only Nixpkgs configuration explicitly permits the
 known-insecure `olm-3.2.16` Matrix dependency without clearing its vulnerability
 metadata; this exception is not applied to other outputs. The real gateway
@@ -17,6 +19,78 @@ does not copy the store into its root disk. This bypasses NixOS's Linux-host
 virtiofs default because this fixture specifically tests the 9p guest mount.
 The guest disk limit does not limit host-side Nix builds, the Nix store, or
 qcow2 metadata/physical allocation.
+
+## Per-agent network isolation
+
+Each enabled `hermes@NAME.service` keeps effective `PrivateNetwork=yes` and joins
+the namespace of its `hermes-network@NAME.service` companion via
+`JoinsNamespaceOf=`. The companion owns the otherwise isolated namespace, creates
+one veth pair and starts the DNS/localhost port proxies. The nftables input and
+forward rules are declared through `networking.firewall.extraInputRules`,
+`networking.firewall.extraForwardRules`, and an early input guard table; the
+firewall fails closed before a veth is brought up. It fails the agent start if
+veth or DNS setup fails. `hermes-pf@NAME` remains in its own `PrivateNetwork=yes`
+namespace with `RestrictAddressFamilies=AF_UNIX`.
+The short-lived companion setup process is trusted host-networking code and is
+granted `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE` to move the veth
+and configure the host namespace; its DNS and TCP proxy children drop to
+`nobody` before serving requests.
+
+Agent veths use `haN`/`hbN` interfaces, IPv4 subnets from `198.18.0.0/15`, and
+per-agent ULA IPv6 `/80`s under `fd42:198:18::/48`. Startup fails on overlapping
+host addresses/routes. The host resolver is proxied on each veth's host-side
+addresses; TCP/UDP port 53 to those addresses, required IPv6 neighbor/error control,
+and established replies to loopback dashboard proxies are the only accepted
+agent-to-host traffic. New connections to all other host services are dropped.
+Traffic to another Hermes agent subnet is blocked. Outbound IPv4/IPv6 routing
+and NAT use NixOS `networking.nat` with nftables;
+`networking.firewall.filterForward`
+is enabled so forwarding is limited to configured NAT internal interfaces.
+`networking.nat.externalInterface` remains `null`; NixOS therefore masquerades
+agent traffic on any outgoing interface. Set that existing option when egress
+must be restricted to a particular host interface.
+
+This changes host-wide NixOS firewall/NAT behavior: the firewall backend becomes
+nftables, forwarding is enabled for IPv4 and IPv6, and unconfigured forwarded
+traffic is filtered. Existing routed networks must be represented by the
+NixOS firewall/NAT configuration (or explicit nftables forward rules). Existing
+`networking.firewall.extraCommands` or `networking.nat.extraCommands` are
+incompatible with the nftables backends and cause configuration evaluation to
+fail. The host must have no pre-existing routes/addresses overlapping the
+reserved Hermes ranges. IPv6 egress depends on host IPv6 connectivity.
+
+The main agent's dashboard stays bound to namespace loopback and defaults to a
+host mapping `127.0.0.1:9119 -> agent namespace loopback:9119`. The companion
+runs an unprivileged namespace relay and a second unprivileged host proxy; only
+the latter listens on host loopback. Other mappings are declared per agent, for
+example:
+
+```nix
+services.hermes-specialised-agent.agents.vm.portMappings = [
+  { hostPort = 9119; agentPort = 9119; target = "loopback"; }
+];
+```
+
+`portMappings = []` disables the localhost proxy. Host ports must be unique and
+greater than 1024. `target = "veth"` (the default) connects directly to a service
+bound on the namespace interface; `target = "loopback"` relays to a loopback-
+bound service such as the dashboard. Mappings are not exposed on the host's non-loopback
+interfaces; this preserves host-only dashboard access without opening a host
+port to the LAN. The host administrator can still connect directly to the
+agent's veth address. NixOS `networking.nat.forwardPorts` is intentionally not
+used for the dashboard: it forwards from a configured external interface,
+whereas this mapping is a host-loopback-only proxy.
+Host-local application services/webhooks remain unreachable from agents except
+for DNS. The public-state fixer has no network access.
+
+For diagnostics, inspect `systemctl status hermes-network@NAME.service`,
+`readlink /proc/$(systemctl show -p MainPID --value hermes@NAME.service)/ns/net`,
+`ip link show haN`, `nft list table inet hermes-agent-guard`,
+`nft list chain inet nixos-fw input-allow`, `nft list chain inet nixos-fw forward-allow`,
+and `ss -ltnp 'sport = :9119'`. Stop/restart of an agent removes and recreates
+its veth, routes, DNS forwarder, and configured localhost proxies. Firewall
+rules are declarative in the NixOS ruleset, not inserted per invocation. Rollback
+by reverting the module change and rebuilding the NixOS configuration.
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#hermes-module-vm-config-check

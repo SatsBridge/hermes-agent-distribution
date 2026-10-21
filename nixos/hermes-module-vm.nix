@@ -1,11 +1,32 @@
 { lib, pkgs, ... }:
 let
+  vmIpv6HttpServer = pkgs.writeText "hermes-vm-ipv6-http-server.py" ''
+    import http.server
+    import socket
+    import sys
+
+
+    class ThreadingHTTPServerV6(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            super().server_bind()
+
+
+    ThreadingHTTPServerV6((sys.argv[1], int(sys.argv[2])), http.server.SimpleHTTPRequestHandler).serve_forever()
+  '';
   vmAgentRuntimeSmoke = pkgs.writeShellApplication {
     name = "hermes-module-vm-agent-smoke";
     runtimeInputs = [
       pkgs.gawk
       pkgs.acl
       pkgs.coreutils
+      pkgs.curl
+      pkgs.dnsutils
+      pkgs.iproute2
+      pkgs.nftables
+      pkgs.python3
       pkgs.systemd
       pkgs.util-linux
     ];
@@ -15,7 +36,29 @@ let
         hermes@vm-peer.service
         hermes-pf@vm.service
         hermes-pf@vm-peer.service
+        hermes-network@vm.service
+        hermes-network@vm-peer.service
       )
+      agent_units=(hermes@vm.service hermes@vm-peer.service)
+      public_state_units=(hermes-pf@vm.service hermes-pf@vm-peer.service)
+      host_probe_pid=
+      host_probe6_pid=
+      peer_probe_pid=
+      peer_probe6_pid=
+      endpoint_pid=
+      endpoint6_pid=
+
+      cleanup_test_network() {
+        [[ -z "$endpoint_pid" ]] || kill "$endpoint_pid" 2>/dev/null || true
+        [[ -z "$endpoint6_pid" ]] || kill "$endpoint6_pid" 2>/dev/null || true
+        [[ -z "$peer_probe_pid" ]] || kill "$peer_probe_pid" 2>/dev/null || true
+        [[ -z "$peer_probe6_pid" ]] || kill "$peer_probe6_pid" 2>/dev/null || true
+        [[ -z "$host_probe_pid" ]] || kill "$host_probe_pid" 2>/dev/null || true
+        [[ -z "$host_probe6_pid" ]] || kill "$host_probe6_pid" 2>/dev/null || true
+        ip netns del hermes-vm-endpoint 2>/dev/null || true
+        ip link delete dev he0 2>/dev/null || true
+      }
+      trap cleanup_test_network EXIT
 
       diagnose() {
         echo "Hermes VM runtime check failed; unit status follows:" >&2
@@ -24,6 +67,11 @@ let
           timeout 15s journalctl -b -u "$unit" --no-pager -n 80 >&2 || true
         done
         getfacl -p -- /var/lib/hermes-vm /var/lib/hermes-vm/.hermes /var/lib/hermes-vm-peer /var/lib/hermes-vm-peer/.hermes >&2 || true
+        ip -o link show >&2 || true
+        ip -4 route show table all >&2 || true
+        nft list ruleset >&2 || true
+        ss -H -lunpt 'sport = :53' >&2 || true
+        cat /etc/resolv.conf >&2 || true
       }
 
       assert_agents_stable() {
@@ -31,7 +79,7 @@ let
         echo "Checking agent stability for 10 seconds"
         while (( SECONDS < deadline )); do
           current=
-          for unit in hermes@vm.service hermes@vm-peer.service; do
+          for unit in "''${agent_units[@]}"; do
             state=$(timeout 5s systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
             substate=$(timeout 5s systemctl show --property=SubState --value "$unit" 2>/dev/null || true)
             pid=$(timeout 5s systemctl show --property=MainPID --value "$unit" 2>/dev/null || true)
@@ -88,7 +136,7 @@ let
         groups=$(awk '/^Groups:/ { $1 = ""; gsub(/[[:space:]]+/, ","); sub(/^,/, ""); print; exit }' "/proc/$pid/status")
         echo "Checking $agent -> $peer profile as pid=$pid uid=$uid gid=$gid groups=$groups"
         # shellcheck disable=SC2016
-        timeout --kill-after=5s --signal=TERM 30 "${pkgs.util-linux}/bin/nsenter" --target "$pid" --mount --root --wd -- "${pkgs.util-linux}/bin/setpriv" --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --reuid="$uid" --regid="$gid" --groups="$groups" /bin/bash -euc '
+        timeout --kill-after=5s --signal=TERM 30 "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --mount --root --wd -- "${lib.getExe' pkgs.util-linux "setpriv"}" --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --reuid="$uid" --regid="$gid" --groups="$groups" /bin/bash -euc '
             id
             echo "Expected uid:gid:groups=$4:$5:$6; actual=$(id -u):$(id -g):$(id -G)"
             [[ "$(id -u)" == "$4" && "$(id -g)" == "$5" ]] || { echo "Service identity mismatch" >&2; exit 1; }
@@ -102,7 +150,7 @@ let
             if [[ ! -r "$profiles" || ! -x "$profiles" ]]; then
               echo "Cannot enumerate profile directory: $profiles" >&2
               for path in "/var/lib/hermes-$1" "/var/lib/hermes-$1/.hermes" "$profiles"; do
-                "${pkgs.coreutils}/bin/stat" -c "%A %u:%g %n" "$path" >&2 || true
+                "${lib.getExe' pkgs.coreutils "stat"}" -c "%A %u:%g %n" "$path" >&2 || true
               done
               exit 1
             fi
@@ -111,7 +159,7 @@ let
             for profile in "$profiles"/*; do
               if [[ ! -d "$profile" ]]; then
                 echo "Profile entry is not traversable as service identity: $profile" >&2
-                "${pkgs.coreutils}/bin/stat" -c "%A %u:%g %n" "$profile" >&2 || true
+                "${lib.getExe' pkgs.coreutils "stat"}" -c "%A %u:%g %n" "$profile" >&2 || true
                 continue
               fi
               name=''${profile##*/}
@@ -126,20 +174,340 @@ let
           ' -- "$agent" "$peer" "$unit" "$uid" "$gid" "$groups"
       }
 
+      run_as_service() {
+        local mode="$1" pid="$2" uid gid groups
+        shift 2
+        uid=$(awk '/^Uid:/ { print $3; exit }' "/proc/$pid/status")
+        gid=$(awk '/^Gid:/ { print $3; exit }' "/proc/$pid/status")
+        groups=$(awk '/^Groups:/ { $1 = ""; gsub(/[[:space:]]+/, ","); sub(/^,/, ""); print; exit }' "/proc/$pid/status")
+        namespaces=(--net)
+        if [[ "$mode" == root ]]; then namespaces+=(--mount --root --wd); fi
+        timeout --kill-after=2s 15 "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" "''${namespaces[@]}" -- \
+          "${lib.getExe' pkgs.util-linux "setpriv"}" --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+          --reuid="$uid" --regid="$gid" --groups="$groups" "$@"
+      }
+
+      service_pid() {
+        local pid
+        pid=$(timeout 10s systemctl show --property=MainPID --value "$1")
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo "$1 has no live main PID: $pid" >&2; return 1; }
+        printf '%s\n' "$pid"
+      }
+
+      assert_distinct_namespaces() {
+        local host_ns unit pid ns
+        declare -A seen=()
+        host_ns=$(readlink /proc/1/ns/net)
+        seen["$host_ns"]=host
+        echo "Host network namespace: $host_ns"
+        for unit in "''${agent_units[@]}" "''${public_state_units[@]}"; do
+          pid=$(service_pid "$unit")
+          [[ $(systemctl show --property=PrivateNetwork --value "$unit") == yes ]] || {
+            echo "$unit does not have effective PrivateNetwork=yes" >&2
+            return 1
+          }
+          ns=$(readlink "/proc/$pid/ns/net")
+          if [[ -n "''${seen[$ns]:-}" ]]; then
+            echo "Network namespace shared unexpectedly: $unit and ''${seen[$ns]} ($ns)" >&2
+            return 1
+          fi
+          seen["$ns"]="$unit"
+          echo "$unit network namespace: $ns"
+        done
+        [[ "''${#seen[@]}" == 5 ]]
+      }
+
+      assert_namespace_released() {
+        local expected="$1" path namespace
+        for path in /proc/[0-9]*/ns/net /proc/[0-9]*/fd/*; do
+          [[ -e "$path" || -L "$path" ]] || continue
+          namespace=$(readlink "$path" 2>/dev/null || true)
+          if [[ "$namespace" == "$expected" ]]; then
+            echo "Stopped service namespace is still referenced by $path: $expected" >&2
+            return 1
+          fi
+        done
+        echo "No process or open namespace handle retains $expected"
+      }
+
+      start_test_endpoint() {
+        echo "Creating isolated HTTP endpoint namespace"
+        ip netns add hermes-vm-endpoint
+        ip link add he0 type veth peer name he1
+        ip link set he1 netns hermes-vm-endpoint
+        ip address add 198.20.0.1/30 dev he0
+        ip -6 address add fd42:198:20::1/64 dev he0 nodad
+        ip link set he0 up
+        ip -n hermes-vm-endpoint link set lo up
+        ip -n hermes-vm-endpoint address add 198.20.0.2/30 dev he1
+        ip -n hermes-vm-endpoint -6 address add fd42:198:20::2/64 dev he1 nodad
+        ip -n hermes-vm-endpoint link set he1 up
+        ip -n hermes-vm-endpoint route add default via 198.20.0.1
+        ip -n hermes-vm-endpoint -6 route add default via fd42:198:20::1
+        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.python3 "python3"}" -m http.server 18082 --bind 198.20.0.2 >/dev/null 2>&1 &
+        endpoint_pid=$!
+        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.python3 "python3"}" ${vmIpv6HttpServer} fd42:198:20::2 18082 >/dev/null &
+        endpoint6_pid=$!
+        for _ in {1..30}; do
+          if ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :18082' | grep -Fq '198.20.0.2:18082' \
+            && ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :18082' | grep -Fq '[fd42:198:20::2]:18082'; then
+            echo "Controlled endpoint ready in hermes-vm-endpoint at 198.20.0.2 and fd42:198:20::2:18082"
+            return 0
+          fi
+          sleep 0.1
+        done
+        echo "Controlled endpoint failed to listen" >&2
+        return 1
+      }
+
+      check_agent_network() {
+        local unit="$1" peer_if="$2" host_ip="$3" agent_ip="$4" blocked_peer="$5" host_ip6="$6" agent_ip6="$7" blocked_peer6="$8" host_if pid output
+        pid=$(service_pid "$unit") || return 1
+        host_if="ha''${peer_if#hb}"
+        echo "Checking isolated networking for $unit pid=$pid"
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ip"}" -o -4 address show dev "$peer_if" | grep -F "inet $agent_ip/30" || return 1
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ip"}" -o -6 address show dev "$peer_if" | grep -F "inet6 $agent_ip6/80" || return 1
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ip"}" route show default | grep -F "via $host_ip" || return 1
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ip"}" -6 route show default | grep -F "via $host_ip6" || return 1
+        echo "$unit: verifying nftables input/forward rules"
+        nft list chain inet hermes-agent-guard hermes_agent_input_guard | grep -F "iifname \"$host_if\" drop" || return 1
+        nft list chain inet nixos-fw input-allow | grep -F "iifname \"$host_if\" ip saddr $agent_ip ip daddr $host_ip udp dport 53 accept" || return 1
+        nft list chain inet nixos-fw forward-allow | grep -F "iifname \"$host_if\" ip saddr $agent_ip accept" || return 1
+        echo "$unit: probing host IPv4 UDP DNS"
+        output=$("${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.dnsutils "dig"}" +time=2 +tries=1 +short @"$host_ip" hermes-vm.test A) || { echo "$unit IPv4 UDP DNS query failed" >&2; return 1; }
+        [[ "$output" == 198.20.0.2 ]] || { echo "$unit IPv4 UDP DNS answer was: $output" >&2; return 1; }
+        echo "$unit: probing host IPv4 TCP DNS"
+        output=$("${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.dnsutils "dig"}" +tcp +time=2 +tries=1 +short @"$host_ip" hermes-vm.test A) || { echo "$unit IPv4 TCP DNS query failed" >&2; return 1; }
+        [[ "$output" == 198.20.0.2 ]] || { echo "$unit IPv4 TCP DNS answer was: $output" >&2; return 1; }
+        output=$("${lib.getExe' pkgs.dnsutils "dig"}" +time=2 +tries=1 +short @"$host_ip6" hermes-vm.test AAAA) || { echo "Host-local IPv6 DNS proxy query failed" >&2; return 1; }
+        [[ "$output" == fd42:198:20::2 ]] || { echo "Host-local IPv6 DNS proxy answer was: $output" >&2; return 1; }
+        echo "$unit: probing host IPv6 UDP DNS"
+        output=$("${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.dnsutils "dig"}" +time=2 +tries=1 +short @"$host_ip6" hermes-vm.test AAAA) || { echo "$unit IPv6 UDP DNS query failed" >&2; return 1; }
+        [[ "$output" == fd42:198:20::2 ]] || { echo "$unit IPv6 UDP DNS answer was: $output" >&2; return 1; }
+        echo "$unit: probing host IPv6 TCP DNS"
+        output=$("${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.dnsutils "dig"}" +tcp +time=2 +tries=1 +short @"$host_ip6" hermes-vm.test AAAA) || { echo "$unit IPv6 TCP DNS query failed" >&2; return 1; }
+        [[ "$output" == fd42:198:20::2 ]] || { echo "$unit IPv6 TCP DNS answer was: $output" >&2; return 1; }
+        echo "$unit: service-identity name-resolution probes"
+        output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket; print(*sorted({r[4][0] for r in socket.getaddrinfo("hermes-vm.test", None, socket.AF_INET)}), sep="\\n")') || { echo "$unit service-identity A lookup failed" >&2; return 1; }
+        [[ "$output" == *198.20.0.2* ]] || { echo "$unit service-identity A lookup was: $output" >&2; return 1; }
+        output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket; print(*sorted({r[4][0] for r in socket.getaddrinfo("hermes-vm.test", None, socket.AF_INET6)}), sep="\\n")') || { echo "$unit service-identity AAAA lookup failed" >&2; return 1; }
+        [[ "$output" == *fd42:198:20::2* ]] || { echo "$unit service-identity AAAA lookup was: $output" >&2; return 1; }
+        run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --fail --silent --show-error --connect-timeout 2 --max-time 4 http://198.20.0.2:18082/ >/dev/null || return 1
+        run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --fail --silent --show-error --connect-timeout 2 --max-time 4 -g 'http://[fd42:198:20::2]:18082/' >/dev/null || return 1
+        for address in "$host_ip" "$host_other_ip"; do
+          if run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --silent --connect-timeout 1 --max-time 2 "http://$address:18083/" >/dev/null 2>&1; then
+            echo "$unit unexpectedly reached host service at $address:18083" >&2
+            return 1
+          fi
+          echo "Denied $unit -> $address:18083"
+        done
+        for address in "$host_ip6" fd42:198:20::1; do
+          if run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --silent --connect-timeout 1 --max-time 2 -g "http://[$address]:18083/" >/dev/null 2>&1; then
+            echo "$unit unexpectedly reached host IPv6 service at [$address]:18083" >&2
+            return 1
+          fi
+          echo "Denied $unit -> [$address]:18083"
+        done
+        if run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --silent --connect-timeout 1 --max-time 2 "http://$blocked_peer:18084/" >/dev/null 2>&1; then
+          echo "$unit unexpectedly reached peer agent service at $blocked_peer:18084" >&2
+          return 1
+        fi
+        echo "Denied $unit -> peer agent $blocked_peer:18084"
+        if run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --silent --connect-timeout 1 --max-time 2 -g "http://[$blocked_peer6]:18085/" >/dev/null 2>&1; then
+          echo "$unit unexpectedly reached peer agent IPv6 service [$blocked_peer6]:18085" >&2
+          return 1
+        fi
+        echo "Denied $unit -> peer agent IPv6 [$blocked_peer6]:18085"
+        # shellcheck disable=SC2016
+        run_as_service net "$pid" "${lib.getExe' pkgs.bash "bash"}" -euc 'cap=$(awk "/^CapEff:/ { print \$2 }" /proc/self/status); [[ "$cap" =~ ^0+$ ]]' || return 1
+        [[ $(service_pid "$unit") == "$pid" ]] || { echo "$unit restarted during network probes" >&2; return 1; }
+        echo "$unit resolved host-configured loopback DNS (UDP/TCP) and reached controlled endpoint with zero capabilities"
+      }
+
+      check_public_state_network() {
+        local unit="$1" pid links families address
+        pid=$(service_pid "$unit")
+        links=$("${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ip"}" -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }')
+        [[ "$links" == lo ]] || { echo "$unit has network interfaces other than loopback: $links" >&2; return 1; }
+        families=$(systemctl show --property=RestrictAddressFamilies --value "$unit")
+        [[ "$families" == AF_UNIX ]] || { echo "$unit address-family restriction is not AF_UNIX: $families" >&2; return 1; }
+        for address in "198.20.0.2:18082" "198.18.0.1:18083" "$host_other_ip:18083" "198.18.0.6:18084"; do
+          if run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --silent --connect-timeout 1 --max-time 2 "http://$address/" >/dev/null 2>&1; then
+            echo "$unit unexpectedly reached network endpoint $address" >&2
+            return 1
+          fi
+        done
+        for address in "[fd42:198:20::2]:18082" "[fd42:198:20::1]:18083" "[fd42:198:18:0:1::2]:18085"; do
+          if run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --silent --connect-timeout 1 --max-time 2 -g "http://$address/" >/dev/null 2>&1; then
+            echo "$unit unexpectedly reached IPv6 network endpoint $address" >&2
+            return 1
+          fi
+        done
+        [[ $(service_pid "$unit") == "$pid" ]] || { echo "$unit restarted during network-denial probes" >&2; return 1; }
+        echo "$unit has only loopback and cannot reach external, host, or peer endpoints"
+      }
+
+      check_dashboard_mapping() {
+        local pid listener code ready=0
+        for _ in {1..100}; do
+          pid=$(service_pid hermes@vm.service) || return 1
+          if "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :9119' | grep -Fq '127.0.0.1:9119' \
+            && "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :9119' | grep -Fq '198.18.0.2:9119'; then
+            ready=1
+            break
+          fi
+          sleep 0.1
+        done
+        (( ready )) || { echo "The real Hermes dashboard is not listening on its namespace port 9119" >&2; return 1; }
+        listener=$(ss -H -ltn 'sport = :9119')
+        [[ "$listener" == *127.0.0.1:9119* && "$listener" != *0.0.0.0:9119* ]] || {
+          echo "Dashboard mapping is missing or not restricted to host loopback: $listener" >&2
+          return 1
+        }
+        code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:9119/)
+        [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || { echo "Dashboard mapping returned no HTTP response: $code" >&2; return 1; }
+        echo "Dashboard responds through configured loopback mapping 127.0.0.1:9119 -> agent port 9119 (HTTP $code)"
+      }
+
+      assert_network_resources_clean() {
+        local iface="$1" table="$2" subnet="$3" subnet6="$4" network_unit state
+        network_unit=hermes-network@''${iface#ha}.service
+        if [[ "$iface" == ha0 ]]; then network_unit=hermes-network@vm.service; fi
+        if [[ "$iface" == ha1 ]]; then network_unit=hermes-network@vm-peer.service; fi
+        for _ in {1..100}; do
+          state=$(systemctl show --property=ActiveState --value "$network_unit")
+          [[ "$state" == inactive || "$state" == failed ]] && break
+          sleep 0.1
+        done
+        [[ "$state" == inactive || "$state" == failed ]] || { echo "$network_unit did not finish teardown" >&2; return 1; }
+        if ip link show dev "$iface" >/dev/null 2>&1; then
+          echo "Stale host veth remains after stopping agent: $iface" >&2
+          return 1
+        fi
+        if nft list table inet "$table" >/dev/null 2>&1; then
+          echo "Stale per-agent runtime nftables table remains after stopping agent: $table" >&2
+          return 1
+        fi
+        host_dns_ip=198.18.0.1
+        host_dns_ip6=fd42:198:18::1
+        if [[ "$iface" == ha1 ]]; then
+          host_dns_ip=198.18.0.5
+          host_dns_ip6=fd42:198:18:0:1::1
+        fi
+        if ss -H -lunpt 'sport = :53' | grep -Fq "$host_dns_ip:53"; then
+          echo "Stale Hermes DNS listener remains after stopping agent $iface: $host_dns_ip:53" >&2
+          return 1
+        fi
+        if ss -H -lunpt 'sport = :53' | grep -Fq "[$host_dns_ip6]:53"; then
+          echo "Stale Hermes IPv6 DNS listener remains after stopping agent $iface: [$host_dns_ip6]:53" >&2
+          return 1
+        fi
+        nft list table inet hermes-agent-guard >/dev/null || { echo "Declarative Hermes firewall guard is missing" >&2; return 1; }
+        if ip -4 route show table all | grep -Fq "$subnet"; then
+          echo "Stale Hermes route remains after stopping agent $iface" >&2
+          return 1
+        fi
+        if ip -6 route show table all | grep -Fq "$subnet6"; then
+          echo "Stale Hermes IPv6 route remains after stopping agent $iface" >&2
+          return 1
+        fi
+        if ss -H -ltn 'sport = :9119' | grep -q .; then
+          echo "Stale host dashboard mapping remains after stopping agent $iface" >&2
+          return 1
+        fi
+        echo "No stale veth, route, or nftables table for $iface"
+      }
+
+      start_fail_closed_probe() {
+        local main_pid main_netns
+        echo "Testing fail-closed startup with a conflicting reserved interface"
+        main_pid=$(service_pid hermes@vm.service)
+        main_netns=$(readlink "/proc/$main_pid/ns/net")
+        timeout --kill-after=5s 60 systemctl stop hermes@vm.service || { diagnose; return 1; }
+        assert_network_resources_clean ha0 hermes_agent_0 198.18.0.0/30 fd42:198:18::/80 || return 1
+        assert_namespace_released "$main_netns" || return 1
+        ip link add ha0 type dummy
+        timeout --kill-after=5s 30 systemctl start hermes@vm.service || true
+        sleep 2
+        if [[ $(systemctl show --property=ActiveState --value hermes@vm.service) == active \
+          || $(systemctl show --property=ActiveState --value hermes-network@vm.service) == active ]]; then
+          echo "Agent/network helper became active despite its reserved veth name being occupied" >&2
+          return 1
+        fi
+        ip -d link show dev ha0 | grep -q 'alias hermes-agent-vm' && { echo "Failure cleanup deleted/claimed the conflicting link" >&2; return 1; }
+        assert_network_resources_clean hb0 hermes_agent_0 198.18.0.0/30 fd42:198:18::/80 || return 1
+        ip link delete dev ha0
+        timeout 30s systemctl reset-failed hermes@vm.service hermes-network@vm.service
+        timeout --kill-after=5s 60 systemctl start hermes@vm.service || { diagnose; return 1; }
+        timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        wait_for_active || { diagnose; return 1; }
+        echo "Setup failure stopped the service and preserved unrelated interface ha0"
+      }
+
       if ! wait_for_active; then diagnose; exit 1; fi
+      host_other_ip=$(ip -o -4 address show scope global | awk '$2 != "ha0" && $2 != "ha1" { split($4, a, "/"); print a[1]; exit }')
+      [[ -n "$host_other_ip" ]] || { echo "No non-veth host interface address is available for the isolation probe" >&2; diagnose; exit 1; }
+      grep -Fq 'nameserver 127.0.0.1' /etc/resolv.conf || { echo "VM host resolver does not use the loopback stub fixture" >&2; cat /etc/resolv.conf >&2; exit 1; }
+      echo "Host UDP/TCP DNS listeners:"
+      ss -H -lunpt 'sport = :53'
+      "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("0.0.0.0",18083));s.listen(8);time.sleep(600)' >/dev/null 2>&1 &
+      host_probe_pid=$!
+      "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,time;s=socket.socket(socket.AF_INET6);s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1);s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("::",18083));s.listen(8);time.sleep(600)' >/dev/null 2>&1 &
+      host_probe6_pid=$!
+      peer_pid=$(service_pid hermes@vm-peer.service)
+      "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$peer_pid" --net -- "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("198.18.0.6",18084));s.listen(8);time.sleep(600)' >/dev/null 2>&1 &
+      peer_probe_pid=$!
+      "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$peer_pid" --net -- "${lib.getExe' pkgs.python3 "python3"}" ${vmIpv6HttpServer} fd42:198:18:0:1::2 18085 >/dev/null 2>&1 &
+      peer_probe6_pid=$!
+      for _ in {1..30}; do
+        if ss -H -ltn 'sport = :18083' | grep -q . \
+          && "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$peer_pid" --net -- "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :18084' | grep -q . \
+          && "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$peer_pid" --net -- "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :18085' | grep -q .; then
+          break
+        fi
+        sleep 0.1
+      done
+      start_test_endpoint || { diagnose; exit 1; }
+      assert_distinct_namespaces || { diagnose; exit 1; }
+      check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
+      check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
+      check_dashboard_mapping || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm.service || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
+      start_fail_closed_probe || { diagnose; exit 1; }
+      check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
+      check_dashboard_mapping || { diagnose; exit 1; }
+
       echo "Restarting public-state services"
-      timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
+      pf_vm_netns=$(readlink "/proc/$(service_pid hermes-pf@vm.service)/ns/net")
+      pf_peer_netns=$(readlink "/proc/$(service_pid hermes-pf@vm-peer.service)/ns/net")
+      timeout --kill-after=5s 60 systemctl stop hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
+      assert_namespace_released "$pf_vm_netns" || { diagnose; exit 1; }
+      assert_namespace_released "$pf_peer_netns" || { diagnose; exit 1; }
+      timeout --kill-after=5s 60 systemctl start hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
       if ! wait_for_active; then diagnose; exit 1; fi
+      assert_distinct_namespaces || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm.service || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       echo "Restarting vm-peer agent"
       timeout --kill-after=5s 60 systemctl restart hermes@vm-peer.service || { diagnose; exit 1; }
       timeout --kill-after=5s 60 systemctl start hermes-pf@vm-peer.service || { diagnose; exit 1; }
       if ! wait_for_active; then diagnose; exit 1; fi
+      assert_distinct_namespaces || { diagnose; exit 1; }
+      check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       echo "Restarting vm agent"
       timeout --kill-after=5s 60 systemctl restart hermes@vm.service || { diagnose; exit 1; }
       echo "Requiring peer restart after main restart"
       timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service || { diagnose; exit 1; }
       timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
       if ! wait_for_active; then diagnose; exit 1; fi
+      assert_distinct_namespaces || { diagnose; exit 1; }
+      check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
+      check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
+      check_dashboard_mapping || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm.service || { diagnose; exit 1; }
+      check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
 
       for unit in "''${units[@]}"; do
         state=$(timeout 5s systemctl show --property=ActiveState --value "$unit")
@@ -161,17 +529,39 @@ in
   # This isolated, network-restricted test VM needs Hermes' current Matrix dependency.
   nixpkgs.config.permittedInsecurePackages = [ "olm-3.2.16" ];
 
+  networking.nameservers = [ "127.0.0.1" ];
+  services.dnsmasq = {
+    enable = true;
+    settings = {
+      address = [
+        "/hermes-vm.test/198.20.0.2"
+        "/hermes-vm.test/fd42:198:20::2"
+      ];
+      bind-interfaces = true;
+      interface = [ "lo" ];
+      no-hosts = true;
+      no-resolv = true;
+    };
+  };
+
+  systemd.services."hermes@" = {
+    after = [ "dnsmasq.service" ];
+    requires = [ "dnsmasq.service" ];
+  };
+
   services.hermes-specialised-agent = {
     enable = true;
     mainAgent = "vm";
     agents.vm = {
       enable = true;
       fullName = "Hermes module VM";
+      headroomEnable = false;
       headroomPort = 18080;
     };
     agents.vm-peer = {
       enable = true;
       fullName = "Hermes module VM peer";
+      headroomEnable = false;
       headroomPort = 18081;
     };
     installDefaultSkills = false;

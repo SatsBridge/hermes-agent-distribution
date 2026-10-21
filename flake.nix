@@ -82,18 +82,44 @@
                 && !agent.installDefaultSkills
                 && agent.agents.vm.enable
                 && agent.agents.vm.headroomPort == 18080
+                && !agent.agents.vm.headroomEnable
+                && agent.agents.vm.portMappings == null
                 && agent.agents.vm-peer.enable
                 && agent.agents.vm-peer.fullName != agent.agents.vm.fullName
                 && agent.agents.vm-peer.headroomPort == 18081
+                && !agent.agents.vm-peer.headroomEnable
                 && builtins.hasAttr "hermes@vm" units
                 && builtins.hasAttr "hermes@vm-peer" units
                 && builtins.hasAttr "hermes@" units
+                && builtins.hasAttr "hermes-network@vm" units
+                && builtins.hasAttr "hermes-network@vm-peer" units
                 && builtins.hasAttr "hermes-pf@vm" units
                 && builtins.hasAttr "hermes-pf@vm-peer" units
                 && units."hermes@vm".serviceConfig ? ExecStart
                 && units."hermes@vm-peer".serviceConfig ? ExecStart
+                && units."hermes@".serviceConfig.PrivateNetwork
+                && builtins.elem "hermes-network@%i.service" units."hermes@".requires
+                && builtins.elem "hermes-network@%i.service" units."hermes@".after
+                && builtins.elem "hermes-network@vm.service" units."hermes@vm".unitConfig.JoinsNamespaceOf
+                && units."hermes-network@vm".serviceConfig.PrivateNetwork
+                && units."hermes-network@vm-peer".serviceConfig.PrivateNetwork
+                && builtins.elem "CAP_SYS_PTRACE" units."hermes-network@vm".serviceConfig.CapabilityBoundingSet
+                && units."hermes-pf@".serviceConfig.PrivateNetwork
+                && units."hermes-pf@".serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ]
                 && builtins.length units."hermes@".serviceConfig.ExecStartPre == 1
                 && units."hermes-pf@".serviceConfig ? ExecStart
+                && hermesModuleVm.config.networking.nftables.enable
+                && hermesModuleVm.config.networking.firewall.backend == "nftables"
+                && hermesModuleVm.config.networking.firewall.filterForward
+                && hermesModuleVm.config.networking.nat.enable
+                && hermesModuleVm.config.networking.nat.enableIPv6
+                && builtins.elem "ha0" hermesModuleVm.config.networking.nat.internalInterfaces
+                && builtins.elem "ha1" hermesModuleVm.config.networking.nat.internalInterfaces
+                && builtins.hasAttr "hermes-agent-guard" hermesModuleVm.config.networking.nftables.tables
+                && nixpkgs-unstable.lib.hasInfix "ha0" hermesModuleVm.config.networking.firewall.extraInputRules
+                && nixpkgs-unstable.lib.hasInfix "ha1" hermesModuleVm.config.networking.firewall.extraInputRules
+                && nixpkgs-unstable.lib.hasInfix "ha0" hermesModuleVm.config.networking.firewall.extraForwardRules
+                && nixpkgs-unstable.lib.hasInfix "ha1" hermesModuleVm.config.networking.firewall.extraForwardRules
                 && builtins.elem "%S/hermes-vm-peer" units."hermes@vm".serviceConfig.BindPaths
                 && builtins.elem "%S/hermes-vm" units."hermes@vm-peer".serviceConfig.BindPaths
               then
