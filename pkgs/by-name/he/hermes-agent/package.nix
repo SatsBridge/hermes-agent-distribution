@@ -16,7 +16,6 @@
   olm,
   playwright,
   prek,
-  pyprojectVersionPatchHook,
   python3,
   rustPlatform,
   stdenv,
@@ -625,7 +624,7 @@ let
         maturinBuildHook
       ]
       # Tags lag the workspace Cargo.toml version that pyproject derives from.
-      ++ [ pyprojectVersionPatchHook ];
+      ++ [ python3.pkgs.pyprojectVersionPatchHook ];
     pname = "nemo-relay";
     pyproject = true;
 

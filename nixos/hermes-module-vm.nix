@@ -1,15 +1,152 @@
-{ lib, pkgs, ... }: {
+{ lib, pkgs, ... }:
+let
+  vmAgentRuntimeSmoke = pkgs.writeShellApplication {
+    name = "hermes-module-vm-agent-smoke";
+    runtimeInputs = [
+      pkgs.gawk
+      pkgs.acl
+      pkgs.coreutils
+      pkgs.systemd
+      pkgs.util-linux
+    ];
+    text = ''
+      units=(
+        hermes@vm.service
+        hermes@vm-peer.service
+        hermes-pf@vm.service
+        hermes-pf@vm-peer.service
+      )
+
+      diagnose() {
+        echo "Hermes VM runtime check failed; unit status follows:" >&2
+        timeout 15s systemctl status --no-pager --full "''${units[@]}" >&2 || true
+        for unit in "''${units[@]}"; do
+          timeout 15s journalctl -b -u "$unit" --no-pager -n 80 >&2 || true
+        done
+        getfacl -p -- /var/lib/hermes-vm /var/lib/hermes-vm/.hermes /var/lib/hermes-vm-peer /var/lib/hermes-vm-peer/.hermes >&2 || true
+      }
+
+      wait_for_active() {
+        local deadline=$((SECONDS + 120)) next_report=$SECONDS ready state unit
+        while (( SECONDS < deadline )); do
+          ready=1
+          for unit in "''${units[@]}"; do
+            state=$(timeout 5s systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
+            if [[ "$state" != active ]]; then
+              ready=0
+              if (( SECONDS >= next_report )); then
+                echo "Waiting for $unit (ActiveState=$state)"
+                next_report=$((SECONDS + 10))
+              fi
+              break
+            fi
+          done
+          (( ready == 1 )) && return 0
+          sleep 2
+        done
+        echo "Timed out waiting for Hermes units to become active" >&2
+        return 1
+      }
+
+      check_profile() {
+        local agent="$1" peer="$2" unit="hermes@$1.service" pid uid gid groups
+        echo "Preparing profile access check: $agent -> $peer"
+        pid=$(timeout 10s systemctl show --property=MainPID --value "$unit")
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]]
+        uid=$(awk '/^Uid:/ { print $3; exit }' "/proc/$pid/status")
+        gid=$(awk '/^Gid:/ { print $3; exit }' "/proc/$pid/status")
+        groups=$(awk '/^Groups:/ { $1 = ""; gsub(/[[:space:]]+/, ","); sub(/^,/, ""); print; exit }' "/proc/$pid/status")
+        echo "Checking $agent -> $peer profile as pid=$pid uid=$uid gid=$gid groups=$groups"
+        # shellcheck disable=SC2016
+        timeout --kill-after=5s --signal=TERM 30 "${pkgs.util-linux}/bin/nsenter" --target "$pid" --mount --root --wd -- "${pkgs.util-linux}/bin/setpriv" --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --reuid="$uid" --regid="$gid" --groups="$groups" /bin/bash -euc '
+            id
+            echo "Expected uid:gid:groups=$4:$5:$6; actual=$(id -u):$(id -g):$(id -G)"
+            [[ "$(id -u)" == "$4" && "$(id -g)" == "$5" ]] || { echo "Service identity mismatch" >&2; exit 1; }
+            for group in ''${6//,/ }; do
+              [[ " $(id -G) " == *" $group "* ]] || { echo "Missing supplementary group $group" >&2; exit 1; }
+            done
+            cap_eff=$(grep "^CapEff:" /proc/self/status) || { echo "Cannot read process capabilities" >&2; exit 1; }
+            echo "$cap_eff"
+            [[ "''${cap_eff#*:}" =~ ^[[:space:]]*0+[[:space:]]*$ ]]
+            profiles="/var/lib/hermes-$1/.hermes/profiles"
+            if [[ ! -r "$profiles" || ! -x "$profiles" ]]; then
+              echo "Cannot enumerate profile directory: $profiles" >&2
+              for path in "/var/lib/hermes-$1" "/var/lib/hermes-$1/.hermes" "$profiles"; do
+                "${pkgs.coreutils}/bin/stat" -c "%A %u:%g %n" "$path" >&2 || true
+              done
+              exit 1
+            fi
+            expected="$2"
+            found=
+            for profile in "$profiles"/*; do
+              if [[ ! -d "$profile" ]]; then
+                echo "Profile entry is not traversable as service identity: $profile" >&2
+                "${pkgs.coreutils}/bin/stat" -c "%A %u:%g %n" "$profile" >&2 || true
+                continue
+              fi
+              name=''${profile##*/}
+              printf "Visible profile from %s: %s\\n" "$3" "$name"
+              [[ "$name" == "$expected" ]] && found="$profile"
+            done
+            [[ -n "$found" ]]
+            test -r "$found/config.yaml"
+            config=$(<"$found/config.yaml")
+            [[ "$config" == *agent_profile_name* && "$config" == *"$expected"* ]]
+            echo "Read peer profile from service namespace: $expected"
+          ' -- "$agent" "$peer" "$unit" "$uid" "$gid" "$groups"
+      }
+
+      if ! wait_for_active; then diagnose; exit 1; fi
+      echo "Restarting public-state services"
+      timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
+      if ! wait_for_active; then diagnose; exit 1; fi
+      echo "Restarting vm-peer agent"
+      timeout --kill-after=5s 60 systemctl restart hermes@vm-peer.service || { diagnose; exit 1; }
+      timeout --kill-after=5s 60 systemctl start hermes-pf@vm-peer.service || { diagnose; exit 1; }
+      if ! wait_for_active; then diagnose; exit 1; fi
+      echo "Restarting vm agent"
+      timeout --kill-after=5s 60 systemctl restart hermes@vm.service || { diagnose; exit 1; }
+      echo "Requiring peer restart after main restart"
+      timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service || { diagnose; exit 1; }
+      timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
+      if ! wait_for_active; then diagnose; exit 1; fi
+
+      for unit in "''${units[@]}"; do
+        state=$(timeout 5s systemctl show --property=ActiveState --value "$unit")
+        substate=$(timeout 5s systemctl show --property=SubState --value "$unit")
+        service_type=$(timeout 5s systemctl show --property=Type --value "$unit")
+        echo "Verified $unit: $state/$substate ($service_type)"
+      done
+
+      check_profile vm "Hermes module VM peer" || { diagnose; exit 1; }
+      check_profile vm-peer "Hermes module VM" || { diagnose; exit 1; }
+      echo "Hermes VM runtime checks passed"
+    '';
+  };
+in
+{
   imports = import ../modules/module-list.nix;
+
+  # This isolated, network-restricted test VM needs Hermes' current Matrix dependency.
+  nixpkgs.config.permittedInsecurePackages = [ "olm-3.2.16" ];
 
   services.hermes-specialised-agent = {
     enable = true;
     mainAgent = "vm";
     agents.vm = {
-      enable = false;
+      enable = true;
       fullName = "Hermes module VM";
       headroomPort = 18080;
     };
+    agents.vm-peer = {
+      enable = true;
+      fullName = "Hermes module VM peer";
+      headroomPort = 18081;
+    };
   };
+
+  # Offline skill downloads are skipped; this also leaves the production ownership pre-step untested.
+  systemd.services."hermes@".serviceConfig.ExecStartPre = lib.mkForce [ ];
 
   system.stateVersion = "26.05";
 
@@ -78,5 +215,24 @@
       df -h /
       echo "Hermes VM smoke checks passed"
     '';
+  };
+
+  systemd.services.hermes-module-vm-agent-smoke = {
+    description = "Verify real Hermes agent and public-state services in their runtime namespaces";
+    after = [
+      "hermes@vm.service"
+      "hermes@vm-peer.service"
+      "hermes-pf@vm.service"
+      "hermes-pf@vm-peer.service"
+    ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      ExecStart = lib.getExe vmAgentRuntimeSmoke;
+      StandardError = "tty";
+      StandardOutput = "tty";
+      TimeoutStartSec = "420s";
+      Type = "oneshot";
+      TTYPath = "/dev/ttyS0";
+    };
   };
 }

@@ -72,16 +72,37 @@
                 "false"
             } = true
             test ${
+              let
+                agent = hermesModuleVm.config.services.hermes-specialised-agent;
+                units = hermesModuleVm.config.systemd.services;
+              in
               if
-                hermesModuleVm.config.services.hermes-specialised-agent.enable
-                && !hermesModuleVm.config.services.hermes-specialised-agent.agents.vm.enable
+                agent.enable
+                && agent.mainAgent == "vm"
+                && agent.agents.vm.enable
+                && agent.agents.vm.headroomPort == 18080
+                && agent.agents.vm-peer.enable
+                && agent.agents.vm-peer.fullName != agent.agents.vm.fullName
+                && agent.agents.vm-peer.headroomPort == 18081
+                && builtins.hasAttr "hermes@vm" units
+                && builtins.hasAttr "hermes@vm-peer" units
+                && builtins.hasAttr "hermes-pf@vm" units
+                && builtins.hasAttr "hermes-pf@vm-peer" units
+                && units."hermes@vm".serviceConfig ? ExecStart
+                && units."hermes@vm-peer".serviceConfig ? ExecStart
+                && units."hermes-pf@".serviceConfig ? ExecStart
+                && builtins.elem "%S/hermes-vm-peer" units."hermes@vm".serviceConfig.BindPaths
+                && builtins.elem "%S/hermes-vm" units."hermes@vm-peer".serviceConfig.BindPaths
               then
                 "true"
               else
                 "false"
             } = true
             test ${
-              if builtins.hasAttr "hermes-module-vm-smoke" hermesModuleVm.config.systemd.services then
+              if
+                builtins.hasAttr "hermes-module-vm-smoke" hermesModuleVm.config.systemd.services
+                && builtins.hasAttr "hermes-module-vm-agent-smoke" hermesModuleVm.config.systemd.services
+              then
                 "true"
               else
                 "false"

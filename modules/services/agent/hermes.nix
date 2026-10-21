@@ -340,8 +340,9 @@ let
                       }
                       ++ [ grantSkillsAcl ];
                     text = ''
-                      setfacl -m "g:${sharedStateId}:r-x" -- "$HOME/"
-                      setfacl -m "g:${sharedStateId}:r-x" -- "$HERMES_HOME/"
+                      # StateDirectoryMode=2700 can leave the ACL mask at ---; raise it so the shared-group r-x grant is effective.
+                      setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HOME/"
+                      setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HERMES_HOME/"
                       setfacl -m "g:${sharedStateId}:r-x" -- "$HERMES_HOME/cron"
                       setfacl -m "g:${sharedStateId}:r--" -- "$HERMES_HOME/cron/output"
 
