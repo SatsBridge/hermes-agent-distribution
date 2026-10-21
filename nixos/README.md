@@ -4,12 +4,12 @@ From the repository root, build a local x86_64-linux NixOS VM from the real
 `modules/services/agent/hermes.nix` module with two real Hermes agents (`vm`
 and `vm-peer`) and their public-state services. QEMU networking is restricted;
 no host Hermes state or credentials are supplied, and the check does not make
-model requests. The VM-only Nixpkgs configuration explicitly permits the
+model requests. Default skill downloads are disabled only for this offline
+fixture; the real ownership initialization pre-step remains enabled. The
+VM-only Nixpkgs configuration explicitly permits the
 known-insecure `olm-3.2.16` Matrix dependency without clearing its vulnerability
 metadata; this exception is not applied to other outputs. The real gateway
-`ExecStart` is tested, but the VM overrides the template's entire
-`ExecStartPre` list because its skill-install commands require network egress;
-this also means the production ownership pre-step is not exercised here.
+`ExecStart` and ownership initialization are tested.
 
 The guest is configured with 1024 MiB RAM and a 1024 MiB root disk. The QEMU
 command explicitly shares the host `/nix/store` read-only via 9p; the guest
@@ -52,9 +52,11 @@ guest `MemTotal`, and root filesystem usage to the serial console. It fails if
 units are active, restarts both public-state units and both agent instances,
 and reads each peer's generated profile from the other agent's live mount
 namespace using that service's UID/GID and supplementary groups. Each wait is
-bounded at 120 seconds; a failure prints unit status and the last 80 journal
-lines per unit. Successful boots print `Hermes VM runtime checks passed` on the
-serial console.
+bounded at 120 seconds, and both agents must retain the same live PID and
+restart count with `active/running` state for 10 seconds after startup and
+restarts, including after profile reads. A failure prints unit status and the
+last 80 journal lines per unit. Successful boots print
+`Hermes VM runtime checks passed` on the serial console.
 
 Start the VM from a directory where its qcow2 disk may be created, then wait
 for the runtime-check message on the serial console:

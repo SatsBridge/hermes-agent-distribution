@@ -79,6 +79,7 @@
               if
                 agent.enable
                 && agent.mainAgent == "vm"
+                && !agent.installDefaultSkills
                 && agent.agents.vm.enable
                 && agent.agents.vm.headroomPort == 18080
                 && agent.agents.vm-peer.enable
@@ -86,10 +87,12 @@
                 && agent.agents.vm-peer.headroomPort == 18081
                 && builtins.hasAttr "hermes@vm" units
                 && builtins.hasAttr "hermes@vm-peer" units
+                && builtins.hasAttr "hermes@" units
                 && builtins.hasAttr "hermes-pf@vm" units
                 && builtins.hasAttr "hermes-pf@vm-peer" units
                 && units."hermes@vm".serviceConfig ? ExecStart
                 && units."hermes@vm-peer".serviceConfig ? ExecStart
+                && builtins.length units."hermes@".serviceConfig.ExecStartPre == 1
                 && units."hermes-pf@".serviceConfig ? ExecStart
                 && builtins.elem "%S/hermes-vm-peer" units."hermes@vm".serviceConfig.BindPaths
                 && builtins.elem "%S/hermes-vm" units."hermes@vm-peer".serviceConfig.BindPaths

@@ -26,6 +26,33 @@ let
         getfacl -p -- /var/lib/hermes-vm /var/lib/hermes-vm/.hermes /var/lib/hermes-vm-peer /var/lib/hermes-vm-peer/.hermes >&2 || true
       }
 
+      assert_agents_stable() {
+        local deadline=$((SECONDS + 10)) unit state substate pid restarts current expected=
+        echo "Checking agent stability for 10 seconds"
+        while (( SECONDS < deadline )); do
+          current=
+          for unit in hermes@vm.service hermes@vm-peer.service; do
+            state=$(timeout 5s systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
+            substate=$(timeout 5s systemctl show --property=SubState --value "$unit" 2>/dev/null || true)
+            pid=$(timeout 5s systemctl show --property=MainPID --value "$unit" 2>/dev/null || true)
+            restarts=$(timeout 5s systemctl show --property=NRestarts --value "$unit" 2>/dev/null || true)
+            if [[ "$state" != active || "$substate" != running || ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+              echo "$unit is not stably running: $state/$substate pid=$pid" >&2
+              return 1
+            fi
+            current+="$unit:$pid:$restarts "
+          done
+          if [[ -z "$expected" ]]; then
+            expected="$current"
+          elif [[ "$current" != "$expected" ]]; then
+            echo "Hermes agent PID or restart count changed during stability window: $expected -> $current" >&2
+            return 1
+          fi
+          sleep 1
+        done
+        echo "Hermes agents stable for 10 seconds: $expected"
+      }
+
       wait_for_active() {
         local deadline=$((SECONDS + 120)) next_report=$SECONDS ready state unit
         while (( SECONDS < deadline )); do
@@ -41,7 +68,10 @@ let
               break
             fi
           done
-          (( ready == 1 )) && return 0
+          if (( ready == 1 )); then
+            assert_agents_stable
+            return $?
+          fi
           sleep 2
         done
         echo "Timed out waiting for Hermes units to become active" >&2
@@ -120,6 +150,7 @@ let
 
       check_profile vm "Hermes module VM peer" || { diagnose; exit 1; }
       check_profile vm-peer "Hermes module VM" || { diagnose; exit 1; }
+      if ! wait_for_active; then diagnose; exit 1; fi
       echo "Hermes VM runtime checks passed"
     '';
   };
@@ -143,10 +174,8 @@ in
       fullName = "Hermes module VM peer";
       headroomPort = 18081;
     };
+    installDefaultSkills = false;
   };
-
-  # Offline skill downloads are skipped; this also leaves the production ownership pre-step untested.
-  systemd.services."hermes@".serviceConfig.ExecStartPre = lib.mkForce [ ];
 
   system.stateVersion = "26.05";
 
@@ -228,11 +257,10 @@ in
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
       ExecStart = lib.getExe vmAgentRuntimeSmoke;
-      StandardError = "tty";
-      StandardOutput = "tty";
-      TimeoutStartSec = "420s";
+      StandardError = "journal+console";
+      StandardOutput = "journal+console";
+      TimeoutStartSec = "600s";
       Type = "oneshot";
-      TTYPath = "/dev/ttyS0";
     };
   };
 }

@@ -550,7 +550,9 @@ let
                   }
                 )
               }"
-              (lib.getExe (
+            ]
+            ++ optional cfg.installDefaultSkills (
+              lib.getExe (
                 pkgs.writeShellApplication {
                   name = "hermes-agent-exec-start-pre";
                   text = ''
@@ -561,8 +563,8 @@ let
                     hermes skills install -y official/software-development/subagent-driven-development
                   '';
                 }
-              ))
-            ];
+              )
+            );
             Group = agentStateSystemdId;
             InaccessiblePaths = "";
             KeyringMode = "private";
@@ -665,6 +667,11 @@ in
       type = types.attrsOf (types.submodule agentOpts);
     };
     enable = mkEnableOption "Hermes Agent gateway services";
+    installDefaultSkills = mkOption {
+      default = true;
+      description = "Install the default Hermes skills before starting agent services.";
+      type = types.bool;
+    };
     mainAgent = mkOption { type = types.str; };
   };
 }
