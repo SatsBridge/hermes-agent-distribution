@@ -36,12 +36,17 @@ granted `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE` to move the veth
 and configure the host namespace; its DNS and TCP proxy children drop to
 `nobody` before serving requests.
 
-Agent veths use `haN`/`hbN` interfaces, IPv4 subnets from `198.18.0.0/15`, and
+agent veths use `haN`/`hbN` interfaces, IPv4 subnets from `198.18.0.0/15`, and
 per-agent ULA IPv6 `/80`s under `fd42:198:18::/48`. Startup fails on overlapping
 host addresses/routes. The host resolver is proxied on each veth's host-side
 addresses; TCP/UDP port 53 to those addresses, required IPv6 neighbor/error control,
 and established replies to loopback dashboard proxies are the only accepted
 agent-to-host traffic. New connections to all other host services are dropped.
+The network helper waits for `network-online.target` before taking its upstream
+resolver snapshot. Resolver changes after startup are not watched; restart the
+agent service (`systemctl restart hermes@NAME.service`) to rebuild its network
+and refresh the DNS upstreams. If host network readiness never completes, the
+agent stays stopped rather than using an early or empty resolver configuration.
 Traffic to another Hermes agent subnet is blocked. Outbound IPv4/IPv6 routing
 and NAT use NixOS `networking.nat` with nftables;
 `networking.firewall.filterForward`
@@ -131,6 +136,22 @@ restart count with `active/running` state for 10 seconds after startup and
 restarts, including after profile reads. A failure prints unit status and the
 last 80 journal lines per unit. Successful boots print
 `Hermes VM runtime checks passed` on the serial console.
+For each real agent, the smoke check also runs `hermes profile list` from that
+agent's captured network namespace with its own `HOME` and verifies its default
+profile and the other agent's profile are visible. It stops the gateways while
+running the CLI to stay within the 1-GiB VM memory limit, then restarts them and
+repeats network checks. A separate peer-profile read runs as the service identity.
+Shared profile IDs must follow Hermes'
+profile-ID grammar (lowercase letters, numbers, `-`, `_`); the VM fixture uses
+`hermes-vm` and `hermes-vm-peer` and sets
+`kanban.default_assignee = "hermes-vm"`.
+The VM delays creation of its loopback-stub resolver until the
+`network-online.target` prerequisite, and the smoke check verifies the resolver
+was present before agent network startup. Host/peer TCP denial probes first
+prove their listeners accept connections from a control context; a temporary
+firewall allow rule also proves the denial oracle detects a reachable host
+service before the rule is removed. Peer listeners are recreated in both live
+agent namespaces after restarts.
 
 Start the VM from a directory where its qcow2 disk may be created, then wait
 for the runtime-check message on the serial console:

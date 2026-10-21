@@ -444,13 +444,17 @@ let
     mkIf (cfg.enable && agentCfg.enable) {
       services = {
         "hermes-network@${name}" = {
-          after = [ "nftables.service" ];
+          after = [
+            "network-online.target"
+            "nftables.service"
+          ];
           description = "Configure isolated network for Hermes agent ${name}";
           partOf = [
             "nftables.service"
             "hermes@${name}.service"
           ];
           requires = [ "nftables.service" ];
+          wants = [ "network-online.target" ];
           serviceConfig = {
             AmbientCapabilities = [ ];
             CapabilityBoundingSet = [

@@ -84,6 +84,7 @@
                 && agent.agents.vm.headroomPort == 18080
                 && !agent.agents.vm.headroomEnable
                 && agent.agents.vm.portMappings == null
+                && agent.agents.vm.settings.kanban.default_assignee == "hermes-vm"
                 && agent.agents.vm-peer.enable
                 && agent.agents.vm-peer.fullName != agent.agents.vm.fullName
                 && agent.agents.vm-peer.headroomPort == 18081
@@ -101,6 +102,11 @@
                 && builtins.elem "hermes-network@%i.service" units."hermes@".requires
                 && builtins.elem "hermes-network@%i.service" units."hermes@".after
                 && builtins.elem "hermes-network@vm.service" units."hermes@vm".unitConfig.JoinsNamespaceOf
+                && builtins.elem "network-online.target" units."hermes-network@vm".after
+                && builtins.elem "network-online.target" units."hermes-network@vm".wants
+                && builtins.hasAttr "hermes-vm-late-resolver" units
+                && builtins.elem "network-online.target" units.hermes-vm-late-resolver.before
+                && !hermesModuleVm.config.networking.resolvconf.enable
                 && units."hermes-network@vm".serviceConfig.PrivateNetwork
                 && units."hermes-network@vm-peer".serviceConfig.PrivateNetwork
                 && builtins.elem "CAP_SYS_PTRACE" units."hermes-network@vm".serviceConfig.CapabilityBoundingSet
