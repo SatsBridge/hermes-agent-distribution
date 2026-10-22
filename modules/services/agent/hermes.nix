@@ -579,6 +579,7 @@ let
       peerPlugins = lib.concatMap (peer: _agents.${peer}.extraPlugins) peerNames;
       gatewayClosure = closureStorePaths (
         config.systemd.services."hermes@${name}".path
+        ++ config.systemd.services."hermes@${name}".jobScripts
         ++ [
           agentCfg.package
           execStart
@@ -595,7 +596,14 @@ let
         ++ peerPlugins
       );
       networkClosure = closureStorePaths (
-        config.systemd.services."hermes-network@${name}".path ++ [ networkSetup ]
+        config.systemd.services."hermes-network@${name}".path
+        ++ config.systemd.services."hermes-network@${name}".jobScripts
+        ++ [ networkSetup ]
+      );
+      publicStateClosure = closureStorePaths (
+        lib.subtractLists config.systemd.services."hermes-pf@".path
+          config.systemd.services."hermes-pf@${name}".path
+        ++ config.systemd.services."hermes-pf@${name}".jobScripts
       );
     in
     mkIf (cfg.enable && agentCfg.enable) {
@@ -610,6 +618,7 @@ let
         };
         "hermes-pf@${name}" = {
           overrideStrategy = "asDropin";
+          serviceConfig.BindReadOnlyPaths = publicStateClosure;
           wantedBy = [ "multi-user.target" ];
         };
         "hermes@${name}" = {
@@ -796,7 +805,7 @@ let
           exec inotifywait -mrqe create,moved_to --format '%w%f%0' --no-newline -- "$HERMES_HOME/skills" | xargs -0P 1 -n 50 grant-skills-acl "$HERMES_HOME/skills" 1
         '';
       };
-      publicStateClosure = closureStorePaths (
+      publicStateTemplateClosure = closureStorePaths (
         config.systemd.services."hermes-pf@".path ++ [ publicStateExecStart ]
       );
     in
@@ -868,7 +877,6 @@ let
             DelegateNamespaces = false;
             DevicePolicy = "closed";
             DynamicUser = true;
-            BindReadOnlyPaths = publicStateClosure;
             InaccessiblePaths = nixStoreAliasPaths;
             TemporaryFileSystem = [ "/nix:ro" ];
             ExecStart = [ (lib.getExe publicStateExecStart) ];
@@ -902,6 +910,7 @@ let
             ReadWritePaths = [ agentStateSystemdPath ];
             RemoveIPC = true;
             Restart = "always";
+            BindReadOnlyPaths = publicStateTemplateClosure;
             RestrictAddressFamilies = [ "AF_UNIX" ];
             RestrictNamespaces = true;
             RestrictRealtime = true;

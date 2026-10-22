@@ -81,11 +81,41 @@
                   map (
                     path: builtins.head (nixpkgs-unstable.lib.splitString ":" path)
                   ) units.${name}.serviceConfig.BindReadOnlyPaths;
+                storeRoot =
+                  path:
+                  let
+                    source = builtins.head (nixpkgs-unstable.lib.splitString ":" path);
+                  in
+                  nixpkgs-unstable.lib.concatStringsSep "/" (
+                    nixpkgs-unstable.lib.take 4 (nixpkgs-unstable.lib.splitString "/" source)
+                  );
+                hasStoreRoot = executable: binds: builtins.elem (storeRoot executable) (map storeRoot binds);
                 networkSetup = builtins.head (
                   nixpkgs-unstable.lib.splitString " " units."hermes-network@vm".serviceConfig.ExecStart
                 );
                 gatewayStart = units."hermes@vm".serviceConfig.ExecStart;
-                hasStoreView =
+                closureProbe = hermesModuleVm.extendModules {
+                  modules = [
+                    (
+                      { pkgs, ... }:
+                      {
+                        systemd.services."hermes@vm".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-network@vm".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-pf@vm".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-pf@vm".path = [ pkgs.hello ];
+                      }
+                    )
+                  ];
+                };
+                closureProbeUnits = closureProbe.config.systemd.services;
+                closureProbeBinds = name: closureProbeUnits.${name}.serviceConfig.BindReadOnlyPaths;
+                hasJobScripts =
+                  name:
+                  builtins.all (
+                    script: hasStoreRoot script (closureProbeBinds name)
+                  ) closureProbeUnits.${name}.jobScripts;
+                hello = "${nixpkgs-unstable.legacyPackages.x86_64-linux.hello}/bin/hello";
+                hasSandbox =
                   name: template:
                   let
                     text = unitFiles.${name}.text;
@@ -95,9 +125,12 @@
                       nixpkgs-unstable.lib.hasInfix pattern text || nixpkgs-unstable.lib.hasInfix pattern templateText;
                   in
                   has "TemporaryFileSystem=/nix:ro"
-                  && has "BindReadOnlyPaths=/nix/store/"
                   && has "InaccessiblePaths=-/run/current-system"
                   && !has "BindReadOnlyPaths=/nix\n";
+                hasStoreView =
+                  name: template:
+                  hasSandbox name template
+                  && (nixpkgs-unstable.lib.hasInfix "BindReadOnlyPaths=/nix/store/" unitFiles.${name}.text);
               in
               if
                 agent.enable
@@ -124,9 +157,22 @@
                 && hasStoreView "hermes@vm-peer.service" "hermes@.service"
                 && hasStoreView "hermes-network@vm.service" "hermes-network@.service"
                 && hasStoreView "hermes-network@vm-peer.service" "hermes-network@.service"
-                && hasStoreView "hermes-pf@.service" null
-                && !(builtins.elem networkSetup (storeBinds "hermes@vm"))
-                && !(builtins.elem gatewayStart (storeBinds "hermes-network@vm"))
+                && hasSandbox "hermes-pf@.service" null
+                && hasStoreView "hermes-pf@vm.service" "hermes-pf@.service"
+                && hasStoreView "hermes-pf@vm-peer.service" "hermes-pf@.service"
+                && !(hasStoreRoot networkSetup (storeBinds "hermes@vm"))
+                && hasStoreRoot networkSetup (storeBinds "hermes@vm" ++ [ networkSetup ])
+                && !(hasStoreRoot gatewayStart (storeBinds "hermes-network@vm"))
+                && hasStoreRoot gatewayStart (storeBinds "hermes-network@vm" ++ [ gatewayStart ])
+                && hasStoreRoot hello (closureProbeBinds "hermes@vm")
+                && hasJobScripts "hermes@vm"
+                && !(hasStoreRoot hello (closureProbeBinds "hermes@vm-peer"))
+                && hasStoreRoot hello (closureProbeBinds "hermes-network@vm")
+                && hasJobScripts "hermes-network@vm"
+                && !(hasStoreRoot hello (closureProbeBinds "hermes-network@vm-peer"))
+                && hasStoreRoot hello (closureProbeBinds "hermes-pf@vm")
+                && hasJobScripts "hermes-pf@vm"
+                && !(hasStoreRoot hello (closureProbeBinds "hermes-pf@vm-peer"))
                 && units."hermes@vm".serviceConfig ? ExecStart
                 && units."hermes@vm-peer".serviceConfig ? ExecStart
                 && units."hermes@".serviceConfig.PrivateNetwork
