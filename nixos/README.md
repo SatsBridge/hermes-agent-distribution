@@ -88,6 +88,30 @@ whereas this mapping is a host-loopback-only proxy.
 Host-local application services/webhooks remain unreachable from agents except
 for DNS. The public-state fixer has no network access.
 
+## Per-service Nix store visibility
+
+Each enabled `hermes@NAME`, `hermes-pf@NAME`, and `hermes-network@NAME` service
+gets a separate read-only `/nix` view containing only its evaluated runtime
+closure. The gateway closure follows its effective PATH, agent package override,
+startup and pre-start scripts, resolver/config files, CA bundle, configured
+plugins, and peer profile configs/plugins. The public-state fixer and network
+helper receive their own closures. Other host store paths and NixOS profile and
+system aliases are hidden; package contents are not stripped.
+
+This is an intentional compatibility boundary: service processes can no longer
+run arbitrary host `/nix/store` paths or discover packages through NixOS profile
+aliases. Add runtime tools through the service PATH/package configuration,
+plugins through `extraPlugins`, or reference store-backed resources in the
+declared agent configuration. The offline VM fixture disables Headroom and
+default skill downloads, so their default-on closure coverage is evaluated and
+built separately; the VM does not exercise their runtime startup.
+
+Each store path is a separate bind mount. The current VM fixture renders about
+1.1k gateway binds per agent, 116 network-helper binds, and 19 public-state
+fixer binds; package-set updates can change these counts and service start time.
+The longer start/restart bounds apply only to the VM smoke test, not production
+systemd timeouts.
+
 For diagnostics, inspect `systemctl status hermes-network@NAME.service`,
 `readlink /proc/$(systemctl show -p MainPID --value hermes@NAME.service)/ns/net`,
 `ip link show haN`, `nft list table inet hermes-agent-guard`,
@@ -129,6 +153,8 @@ guest `MemTotal`, and root filesystem usage to the serial console. It fails if
 `/nix/store` is a bind of that read-only mount. The
 `hermes-module-vm-agent-smoke` one-shot then checks both agent and public-state
 units are active, restarts both public-state units and both agent instances,
+checks that each service sees its store closure but not a known unrelated host
+store sentinel (including the guest's read-only 9p alias),
 and reads each peer's generated profile from the other agent's live mount
 namespace using that service's UID/GID and supplementary groups. Each wait is
 bounded at 120 seconds, and both agents must retain the same live PID and
@@ -136,6 +162,9 @@ restart count with `active/running` state for 10 seconds after startup and
 restarts, including after profile reads. A failure prints unit status and the
 last 80 journal lines per unit. Successful boots print
 `Hermes VM runtime checks passed` on the serial console.
+Gateway start/restart commands are bounded at 180 seconds and the smoke unit
+at 900 seconds to allow per-store-path mount setup in the 1-GiB guest; the VM's
+RAM and disk limits are unchanged.
 For each real agent, the smoke check also runs `hermes profile list` from that
 agent's captured network namespace with its own `HOME` and verifies its default
 profile and the other agent's profile are visible. It stops the gateways while

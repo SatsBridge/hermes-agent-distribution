@@ -16,6 +16,7 @@ let
 
     ThreadingHTTPServerV6((sys.argv[1], int(sys.argv[2])), http.server.SimpleHTTPRequestHandler).serve_forever()
   '';
+  vmStoreSentinel = pkgs.writeText "hermes-vm-unrelated-store-sentinel" "Hermes VM unrelated store sentinel\n";
   vmAgentRuntimeSmoke = pkgs.writeShellApplication {
     name = "hermes-module-vm-agent-smoke";
     runtimeInputs = [
@@ -32,6 +33,11 @@ let
       pkgs.util-linux
     ];
     text = ''
+      store_sentinel=${vmStoreSentinel}
+      store_sentinel_text='Hermes VM unrelated store sentinel'
+      store_probe=${lib.getExe' pkgs.coreutils "stat"}
+      store_bash=${pkgs.runtimeShell}
+      dnsmasq_exe=${lib.getExe pkgs.dnsmasq}
       units=(
         hermes@vm.service
         hermes@vm-peer.service
@@ -119,6 +125,7 @@ let
           done
           if (( ready == 1 )); then
             assert_agents_stable
+            check_all_store_isolation
             return $?
           fi
           sleep 2
@@ -197,7 +204,7 @@ let
         assert_namespace_released "$vm_netns" || return 1
         assert_namespace_released "$peer_netns" || return 1
 
-        timeout --kill-after=5s 60 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
         if ! wait_for_active; then diagnose; return 1; fi
         assert_distinct_namespaces || return 1
         start_peer_probes hermes@vm.service 198.18.0.2 fd42:198:18::2 || return 1
@@ -322,6 +329,106 @@ let
         pid=$(timeout 10s systemctl show --property=MainPID --value "$1")
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo "$1 has no live main PID: $pid" >&2; return 1; }
         printf '%s\n' "$pid"
+      }
+
+      network_helper_pid() {
+        local unit="$1" cgroup candidate executable
+        cgroup=$(timeout 10s systemctl show --property=ControlGroup --value "$unit")
+        [[ "$cgroup" == /* ]] || { echo "$unit has no service cgroup: $cgroup" >&2; return 1; }
+        while IFS= read -r candidate; do
+          [[ "$candidate" =~ ^[1-9][0-9]*$ ]] || continue
+          executable=$(readlink "/proc/$candidate/exe" 2>/dev/null || true)
+          if [[ "$executable" == "$dnsmasq_exe" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+          fi
+        done < "/sys/fs/cgroup$cgroup/cgroup.procs"
+        echo "$unit has no surviving dnsmasq process in its service cgroup" >&2
+        return 1
+      }
+
+      check_store_isolation() {
+        local unit="$1" pid="$2" bind_paths temporary_filesystem inaccessible_paths alias uid gid
+        echo "Checking store closure and host-store denial in $unit (pid=$pid)"
+        bind_paths=$(timeout 10s systemctl show --property=BindReadOnlyPaths --value "$unit")
+        temporary_filesystem=$(timeout 10s systemctl show --property=TemporaryFileSystem --value "$unit")
+        inaccessible_paths=$(timeout 10s systemctl show --property=InaccessiblePaths --value "$unit")
+        [[ "$bind_paths" == *"/nix/store/"* ]] || {
+          echo "$unit has no effective individual store-path binds" >&2
+          return 1
+        }
+        case " $bind_paths " in
+          *" /nix "*) echo "$unit still binds the entire /nix tree" >&2; return 1 ;;
+        esac
+        [[ "$temporary_filesystem" == *"/nix:ro"* ]] || {
+          echo "$unit does not mask the host /nix tree with a read-only temporary filesystem: $temporary_filesystem" >&2
+          return 1
+        }
+        for alias in /run/current-system /run/booted-system /run/wrappers /etc/static /etc/profiles /etc/systemd; do
+          [[ "$inaccessible_paths" == *"$alias"* ]] || {
+            echo "$unit does not mask Nix store alias $alias: $inaccessible_paths" >&2
+            return 1
+          }
+        done
+        uid=$(awk '/^Uid:/ { print $3; exit }' "/proc/$pid/status")
+        gid=$(awk '/^Gid:/ { print $3; exit }' "/proc/$pid/status")
+        # shellcheck disable=SC2016
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --mount --root --wd --setuid "$uid" --setgid "$gid" -- \
+          "$store_bash" -euc '
+          sentinel="$1"
+          expected="$2"
+          probe="$3"
+          test -r "$probe" && test -x "$probe"
+          "$probe" --version >/dev/null
+          if [[ -r "$sentinel" ]]; then
+            echo "Unrelated host store sentinel is readable: $sentinel" >&2
+            exit 1
+          fi
+          for path in \
+            "/nix/.ro-store/''${sentinel##*/}" \
+            /etc/profiles/per-user/root/bin/bash \
+            /etc/static/os-release \
+            /etc/systemd/system/multi-user.target \
+            /nix/var/nix/profiles/system \
+            /root/.nix-defexpr \
+            /root/.nix-profile/bin/bash \
+            /run/booted-system/sw/bin/bash \
+            /run/current-system/sw/bin/bash \
+            /run/wrappers/bin/sudo; do
+            if [[ -e "$path" ]]; then
+              echo "Host Nix store alias remains reachable: $path" >&2
+              exit 1
+            fi
+          done
+          [[ "$expected" == "Hermes VM unrelated store sentinel" ]]
+          echo "Allowed store probe is executable; unrelated host store paths are hidden"
+        ' -- "$store_sentinel" "$store_sentinel_text" "$store_probe"
+      }
+
+      check_all_store_isolation() {
+        local unit pid
+        [[ -r "$store_sentinel" ]] || { echo "Positive-control store sentinel is missing: $store_sentinel" >&2; return 1; }
+        [[ "$(<"$store_sentinel")" == "$store_sentinel_text" ]] || {
+          echo "Positive-control store sentinel has unexpected contents" >&2
+          return 1
+        }
+        "$store_probe" "$store_sentinel" >/dev/null || { echo "Positive-control store probe cannot read sentinel" >&2; return 1; }
+        [[ -r "/nix/.ro-store/''${store_sentinel##*/}" ]] || {
+          echo "Positive-control 9p store alias cannot read sentinel" >&2
+          return 1
+        }
+        [[ -x /run/current-system/sw/bin/bash && -r /etc/static/os-release ]] || {
+          echo "Positive-control NixOS store aliases are unavailable" >&2
+          return 1
+        }
+        for unit in "''${agent_units[@]}" "''${public_state_units[@]}"; do
+          pid=$(service_pid "$unit") || return 1
+          check_store_isolation "$unit" "$pid" || return 1
+        done
+        for unit in hermes-network@vm.service hermes-network@vm-peer.service; do
+          pid=$(network_helper_pid "$unit") || return 1
+          check_store_isolation "$unit" "$pid" || return 1
+        done
       }
 
       assert_distinct_namespaces() {
@@ -577,8 +684,8 @@ let
         assert_network_resources_clean hb0 hermes_agent_0 198.18.0.0/30 fd42:198:18::/80 || return 1
         ip link delete dev ha0
         timeout 30s systemctl reset-failed hermes@vm.service hermes-network@vm.service
-        timeout --kill-after=5s 60 systemctl start hermes@vm.service || { diagnose; return 1; }
-        timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        timeout --kill-after=5s 180 systemctl start hermes@vm.service || { diagnose; return 1; }
+        timeout --kill-after=5s 180 systemctl start hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
         wait_for_active || { diagnose; return 1; }
         echo "Setup failure stopped the service and preserved unrelated interface ha0"
       }
@@ -632,7 +739,7 @@ let
       check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       echo "Restarting vm-peer agent"
       stop_peer_probes
-      timeout --kill-after=5s 60 systemctl restart hermes@vm-peer.service || { diagnose; exit 1; }
+      timeout --kill-after=5s 180 systemctl restart hermes@vm-peer.service || { diagnose; exit 1; }
       timeout --kill-after=5s 60 systemctl start hermes-pf@vm-peer.service || { diagnose; exit 1; }
       if ! wait_for_active; then diagnose; exit 1; fi
       assert_distinct_namespaces || { diagnose; exit 1; }
@@ -642,7 +749,7 @@ let
       check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       echo "Restarting vm agent"
       stop_peer_probes
-      timeout --kill-after=5s 60 systemctl restart hermes@vm.service || { diagnose; exit 1; }
+      timeout --kill-after=5s 180 systemctl restart hermes@vm.service || { diagnose; exit 1; }
       echo "Requiring peer restart after main restart"
       timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service || { diagnose; exit 1; }
       timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
@@ -809,7 +916,8 @@ in
       ExecStart = lib.getExe vmAgentRuntimeSmoke;
       StandardError = "journal+console";
       StandardOutput = "journal+console";
-      TimeoutStartSec = "600s";
+      # Gateway restarts recreate one mount per closure path in the 1-GiB guest.
+      TimeoutStartSec = "900s";
       Type = "oneshot";
     };
   };

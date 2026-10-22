@@ -75,6 +75,29 @@
               let
                 agent = hermesModuleVm.config.services.hermes-specialised-agent;
                 units = hermesModuleVm.config.systemd.services;
+                unitFiles = hermesModuleVm.config.systemd.units;
+                storeBinds =
+                  name:
+                  map (
+                    path: builtins.head (nixpkgs-unstable.lib.splitString ":" path)
+                  ) units.${name}.serviceConfig.BindReadOnlyPaths;
+                networkSetup = builtins.head (
+                  nixpkgs-unstable.lib.splitString " " units."hermes-network@vm".serviceConfig.ExecStart
+                );
+                gatewayStart = units."hermes@vm".serviceConfig.ExecStart;
+                hasStoreView =
+                  name: template:
+                  let
+                    text = unitFiles.${name}.text;
+                    templateText = if template == null then "" else unitFiles.${template}.text;
+                    has =
+                      pattern:
+                      nixpkgs-unstable.lib.hasInfix pattern text || nixpkgs-unstable.lib.hasInfix pattern templateText;
+                  in
+                  has "TemporaryFileSystem=/nix:ro"
+                  && has "BindReadOnlyPaths=/nix/store/"
+                  && has "InaccessiblePaths=-/run/current-system"
+                  && !has "BindReadOnlyPaths=/nix\n";
               in
               if
                 agent.enable
@@ -92,26 +115,39 @@
                 && builtins.hasAttr "hermes@vm" units
                 && builtins.hasAttr "hermes@vm-peer" units
                 && builtins.hasAttr "hermes@" units
+                && builtins.hasAttr "hermes-network@" units
                 && builtins.hasAttr "hermes-network@vm" units
                 && builtins.hasAttr "hermes-network@vm-peer" units
                 && builtins.hasAttr "hermes-pf@vm" units
                 && builtins.hasAttr "hermes-pf@vm-peer" units
+                && hasStoreView "hermes@vm.service" "hermes@.service"
+                && hasStoreView "hermes@vm-peer.service" "hermes@.service"
+                && hasStoreView "hermes-network@vm.service" "hermes-network@.service"
+                && hasStoreView "hermes-network@vm-peer.service" "hermes-network@.service"
+                && hasStoreView "hermes-pf@.service" null
+                && !(builtins.elem networkSetup (storeBinds "hermes@vm"))
+                && !(builtins.elem gatewayStart (storeBinds "hermes-network@vm"))
                 && units."hermes@vm".serviceConfig ? ExecStart
                 && units."hermes@vm-peer".serviceConfig ? ExecStart
                 && units."hermes@".serviceConfig.PrivateNetwork
-                && builtins.elem "hermes-network@%i.service" units."hermes@".requires
+                && builtins.elem "hermes-network@%i.service" units."hermes@".bindsTo
                 && builtins.elem "hermes-network@%i.service" units."hermes@".after
-                && builtins.elem "hermes-network@vm.service" units."hermes@vm".unitConfig.JoinsNamespaceOf
-                && builtins.elem "network-online.target" units."hermes-network@vm".after
-                && builtins.elem "network-online.target" units."hermes-network@vm".wants
+                && builtins.elem "hermes-network@%i.service" units."hermes@".unitConfig.JoinsNamespaceOf
+                && builtins.elem "network-online.target" units."hermes-network@".after
+                && builtins.elem "network-online.target" units."hermes-network@".wants
                 && builtins.hasAttr "hermes-vm-late-resolver" units
                 && builtins.elem "network-online.target" units.hermes-vm-late-resolver.before
                 && !hermesModuleVm.config.networking.resolvconf.enable
-                && units."hermes-network@vm".serviceConfig.PrivateNetwork
-                && units."hermes-network@vm-peer".serviceConfig.PrivateNetwork
-                && builtins.elem "CAP_SYS_PTRACE" units."hermes-network@vm".serviceConfig.CapabilityBoundingSet
+                && units."hermes-network@".serviceConfig.PrivateNetwork
+                && units."hermes-network@".serviceConfig.Type == "oneshot"
+                && units."hermes-network@vm".serviceConfig ? ExecStart
+                && units."hermes-network@vm".serviceConfig ? ExecStopPost
+                && units."hermes-network@vm-peer".serviceConfig ? ExecStart
+                && units."hermes-network@vm-peer".serviceConfig ? ExecStopPost
+                && builtins.elem "CAP_SYS_PTRACE" units."hermes-network@".serviceConfig.CapabilityBoundingSet
                 && units."hermes-pf@".serviceConfig.PrivateNetwork
                 && units."hermes-pf@".serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ]
+                && builtins.elem "hermes@%i.service" units."hermes-pf@".partOf
                 && builtins.length units."hermes@".serviceConfig.ExecStartPre == 1
                 && units."hermes-pf@".serviceConfig ? ExecStart
                 && hermesModuleVm.config.networking.nftables.enable

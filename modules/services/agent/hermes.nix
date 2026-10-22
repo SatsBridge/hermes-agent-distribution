@@ -115,6 +115,55 @@ let
   activeAgentNames = builtins.filter (name: cfg.agents.${name}.enable) (
     builtins.attrNames cfg.agents
   );
+  closureStorePaths =
+    rootPaths:
+    let
+      closureInfo = pkgs.closureInfo { inherit rootPaths; };
+    in
+    builtins.filter (path: path != "") (
+      lib.splitString "\n" (builtins.readFile "${closureInfo}/store-paths")
+    );
+  nixStoreAliasPaths = [
+    "-/etc/profiles"
+    "-/etc/static"
+    "-/etc/systemd"
+    "-/nix/var/nix/profiles"
+    "-/root/.nix-defexpr"
+    "-/root/.nix-profile"
+    "-/run/booted-system"
+    "-/run/current-system"
+    "-/run/wrappers"
+  ];
+  hermesRuntimePath = builtins.attrValues {
+    inherit (pkgs)
+      ast-grep
+      bash
+      coreutils
+      diffutils
+      findutils
+      git
+      gnugrep
+      gnused
+      headroom
+      headroom-proxy
+      mnemosyne
+      nix
+      openssh
+      ripgrep
+      util-linux
+      ;
+  };
+  gatewayOwnershipExecStartPre = pkgs.writeShellApplication {
+    name = "hermes-agent-exec-start-pre";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      uid="$(stat --printf=%u -- "''${RUNTIME_DIRECTORY%%:*}")"
+      gid="$(stat --printf=%g -- "''${RUNTIME_DIRECTORY%%:*}")"
+
+      exec chown -R "$uid:$gid" -- "$HOME"
+    '';
+  };
+
   activePortMappings =
     if cfg.enable then
       lib.concatMap (
@@ -275,14 +324,16 @@ let
     in
     pkgs.writeShellApplication {
       name = "hermes-agent-network-${toString network.index}";
-      runtimeInputs = [
-        pkgs.coreutils
-        pkgs.gawk
-        pkgs.gnugrep
-        pkgs.iproute2
-        pkgs.python3
-        pkgs.util-linux
-      ];
+      runtimeInputs = builtins.attrValues {
+        inherit (pkgs)
+          coreutils
+          gawk
+          gnugrep
+          iproute2
+          python3
+          util-linux
+          ;
+      };
       text = ''
                 host() { ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- "$@"; }
                 host_if=${network.hostIf}
@@ -380,7 +431,7 @@ let
                 ${lib.getExe' pkgs.iproute2 "ip"} -6 route add default via "$host_ip6" dev "$peer_if"
 
                 host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" up
-                mapfile -t dns_upstreams < <(awk '$1 == "nameserver" && NF >= 2 { print $2 }' /etc/resolv.conf)
+                mapfile -t dns_upstreams < <(awk '$1 == "nameserver" && NF >= 2 { print $2 }' /run/hermes-host-resolv.conf)
                 ((''${#dns_upstreams[@]} > 0)) || { echo "No host nameservers in /etc/resolv.conf" >&2; exit 1; }
                 dns_args=()
                 for dns_upstream in "''${dns_upstreams[@]}"; do dns_args+=("--server=$dns_upstream"); done
@@ -440,48 +491,119 @@ let
           agentCfg.portMappings;
       networkSetup = mkAgentNetworkSetup name agentNetwork portMappings;
       resolvConf = pkgs.writeText "${agentStateId}-resolv.conf" "nameserver ${agentNetwork.hostIp}\nnameserver ${agentNetwork.hostIpv6}\noptions attempts:1 timeout:2\n";
+      agentConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
+        lib.recursiveUpdate agentCfg.settings {
+          kanban = {
+            agent_profile_name = agentCfg.fullName;
+            dispatch_profiles = [ agentCfg.fullName ];
+          };
+        }
+      );
+      mnemosyneConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-mnemosyne-config.yaml" (
+        agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { }
+      );
+      profileFarm = pkgs.linkFarm "hermes-${name}-profiles" (
+        map ({ fullName, name, ... }: {
+          name = fullName;
+          path = "/var/lib/${name}/.hermes";
+        }) (builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames)
+      );
+      execStart = pkgs.writeShellApplication {
+        name = "hermes-agent-exec-start";
+        runtimeInputs = [ agentCfg.package ] ++ optional agentCfg.headroomEnable pkgs.headroom;
+        text = ''
+          cd ~/
+          ${lib.optionalString agentCfg.headroomEnable ''
+            headroom proxy \
+              --port ${toString agentCfg.headroomPort} \
+              --intercept-tool-results \
+              --memory \
+              --learn \
+              --code-graph &
+          ''}
+          ${
+            concatStringsSep " " (
+              [
+                "hermes"
+                "gateway"
+              ]
+              ++ agentCfg.extraArgs
+            )
+          } &
+          ${lib.optionalString (cfg.mainAgent == name) ''
+            ${
+              concatStringsSep " " [
+                "hermes"
+                "dashboard"
+                "--no-open"
+              ]
+            } &
+          ''}
+          wait -n
+        '';
+      };
+      installSkillsExecStartPre = pkgs.writeShellApplication {
+        name = "hermes-agent-exec-start-pre";
+        runtimeInputs = [ agentCfg.package ];
+        text = ''
+          hermes skills install -y official/creative/concept-diagrams
+          hermes skills install -y official/creative/creative-ideation
+          hermes skills install -y official/software-development/ast-grep
+          hermes skills install -y official/software-development/code-wiki
+          hermes skills install -y official/software-development/subagent-driven-development
+        '';
+      };
+
+      peerNames = builtins.filter (peer: peer != name && _agents.${peer}.enable) (
+        builtins.attrNames _agents
+      );
+      peerConfigs = lib.concatMap (peer: [
+        ((pkgs.formats.yaml { }).generate "hermes-${peer}-config.yaml" (
+          lib.recursiveUpdate _agents.${peer}.settings {
+            kanban = {
+              agent_profile_name = _agents.${peer}.fullName;
+              dispatch_profiles = [ _agents.${peer}.fullName ];
+            };
+          }
+        ))
+        ((pkgs.formats.yaml { }).generate "hermes-${peer}-mnemosyne-config.yaml" (
+          _agents.${peer}.settings.memory.nix-managed-mnemosyne-hermes or { }
+        ))
+        (pkgs.linkFarm "hermes-${peer}-profiles" (
+          map ({ fullName, name, ... }: {
+            name = fullName;
+            path = "/var/lib/${name}/.hermes";
+          }) (builtins.filter (agent: agent.enable && agent.name != "hermes-${peer}") agentFullNames)
+        ))
+      ]) peerNames;
+      peerPlugins = lib.concatMap (peer: _agents.${peer}.extraPlugins) peerNames;
+      gatewayClosure = closureStorePaths (
+        config.systemd.services."hermes@${name}".path
+        ++ [
+          agentCfg.package
+          execStart
+          gatewayOwnershipExecStartPre
+          resolvConf
+          agentConfig
+          mnemosyneConfig
+          profileFarm
+          pkgs.cacert
+        ]
+        ++ optional cfg.installDefaultSkills installSkillsExecStartPre
+        ++ agentCfg.extraPlugins
+        ++ peerConfigs
+        ++ peerPlugins
+      );
+      networkClosure = closureStorePaths (
+        config.systemd.services."hermes-network@${name}".path ++ [ networkSetup ]
+      );
     in
     mkIf (cfg.enable && agentCfg.enable) {
       services = {
         "hermes-network@${name}" = {
-          after = [
-            "network-online.target"
-            "nftables.service"
-          ];
-          description = "Configure isolated network for Hermes agent ${name}";
-          partOf = [
-            "nftables.service"
-            "hermes@${name}.service"
-          ];
-          requires = [ "nftables.service" ];
-          wants = [ "network-online.target" ];
+          overrideStrategy = "asDropin";
           serviceConfig = {
-            AmbientCapabilities = [ ];
-            CapabilityBoundingSet = [
-              "CAP_NET_ADMIN"
-              "CAP_NET_BIND_SERVICE"
-              "CAP_SETGID"
-              "CAP_SETUID"
-              "CAP_SYS_ADMIN"
-              "CAP_SYS_PTRACE"
-            ];
-            NoNewPrivileges = true;
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            ProtectHome = true;
-            ProtectSystem = "strict";
-            RestrictAddressFamilies = [
-              "AF_INET"
-              "AF_INET6"
-              "AF_NETLINK"
-              "AF_UNIX"
-            ];
-            TimeoutStartSec = "30s";
-            TimeoutStopSec = "15s";
-            Type = "oneshot";
-            RemainAfterExit = true;
+            BindReadOnlyPaths = [ "/etc/resolv.conf:/run/hermes-host-resolv.conf" ] ++ networkClosure;
             ExecStart = "${lib.getExe networkSetup} setup";
             ExecStopPost = "${lib.getExe networkSetup} cleanup";
           };
@@ -509,7 +631,6 @@ let
           };
           overrideStrategy = "asDropin";
           path = config.systemd.services."hermes@".path ++ [ agentCfg.package ];
-          unitConfig.JoinsNamespaceOf = [ "hermes-network@${name}.service" ];
           serviceConfig = {
             BindPaths = [
               "/dev/kvm"
@@ -518,56 +639,17 @@ let
             ++ map ({ name, ... }: "%S/${name}") (
               builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames
             );
-            BindReadOnlyPaths = [ "${resolvConf}:/etc/resolv.conf" ];
-            ExecStart = lib.getExe (
-              pkgs.writeShellApplication {
-                name = "hermes-agent-exec-start";
-                text = ''
-                  cd ~/
-                  ${lib.optionalString agentCfg.headroomEnable ''
-                    headroom proxy \
-                      --port ${toString agentCfg.headroomPort} \
-                      --intercept-tool-results \
-                      --memory \
-                      --learn \
-                      --code-graph &
-                  ''}
-                  ${
-                    concatStringsSep " " (
-                      [
-                        "hermes"
-                        "gateway"
-                      ]
-                      ++ agentCfg.extraArgs
-                    )
-                  } &
-                  ${lib.optionalString (cfg.mainAgent == name) ''
-                    ${
-                      concatStringsSep " " [
-                        "hermes"
-                        "dashboard"
-                        "--no-open"
-                      ]
-                    } &
-                  ''}
-                  wait -n
-                '';
-              }
-            );
+            BindReadOnlyPaths = [ "${resolvConf}:/etc/resolv.conf" ] ++ gatewayClosure;
+            InaccessiblePaths = nixStoreAliasPaths;
+            TemporaryFileSystem = [ "/nix:ro" ];
+            ExecStartPre = optional cfg.installDefaultSkills (lib.getExe installSkillsExecStartPre);
+            ExecStart = lib.getExe execStart;
           };
           wantedBy = [ "multi-user.target" ];
         };
       };
       tmpfiles.rules =
         let
-          config = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
-            lib.recursiveUpdate agentCfg.settings {
-              kanban = {
-                agent_profile_name = agentCfg.fullName;
-                dispatch_profiles = [ agentCfg.fullName ];
-              };
-            }
-          );
           mnemosyneConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-mnemosyne-config.yaml" (
             agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { }
           );
@@ -587,17 +669,10 @@ let
           "d ${hermesAgentStatePath}/skills/software-development 2700 - - - -"
           #"L+ ${hermesAgentStatePath}/skills/software-development/agent-delivery-governance - - - - ${./../../../skills/software-development/agent-delivery-governance}"
           "f ${hermesAgentStatePath}/.env 0600 - - - -"
-          "L+ ${hermesAgentStatePath}/config.yaml - - - - ${config}"
+          "L+ ${hermesAgentStatePath}/config.yaml - - - - ${agentConfig}"
           "d ${hermesAgentStatePath}/mnemosyne 2700 - - - -"
           "L+ ${hermesAgentStatePath}/mnemosyne/config.yaml - - - - ${mnemosyneConfig}"
-          "L+ ${hermesAgentStatePath}/profiles - - - - ${
-            pkgs.linkFarm "hermes-${name}-profiles" (
-              map ({ fullName, name, ... }: {
-                name = fullName;
-                path = "/var/lib/${name}/.hermes";
-              }) (builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames)
-            )
-          }"
+          "L+ ${hermesAgentStatePath}/profiles - - - - ${profileFarm}"
           "d ${hermesAgentStatePath}/plugins 2700 - - - -"
         ]
         ++ map (
@@ -610,197 +685,242 @@ let
       agentStateSystemdPath = "%S/${agentStateSystemdId}";
       hermesAgentStateSystemdPath = "${agentStateSystemdPath}/.hermes";
       publicStateFixerSystemdId = "hermes-%i-pf";
+      grantSkillsAcl = pkgs.writeShellApplication {
+        name = "grant-skills-acl";
+        runtimeInputs = builtins.attrValues { inherit (pkgs) acl coreutils findutils; };
+        text = ''
+          skills_dir="$1"
+          jobs="''${2:-$(nproc)}"
+          scope="''${3:-}"
+
+          [[ -d "$skills_dir" ]] || exit 0
+
+          skills_dir_real=$(realpath -m -- "$skills_dir")
+
+          if [[ -n "$scope" ]]; then
+              scope_real=$(realpath -m -- "$scope")
+
+              case "$scope_real" in
+              "$skills_dir_real"|"$skills_dir_real"/*) ;;
+              *)
+                  echo "grant-skills-acl: refusing scope outside skills_dir: $scope (resolved: $scope_real, skills_dir resolved: $skills_dir_real)" >&2
+                  exit 1
+              ;;
+              esac
+
+              search_root="$scope_real"
+          else
+              search_root="$skills_dir_real"
+          fi
+
+          declare -A dirs_to_grant=()
+          declare -a skill_files=()
+
+          if [[ -f "$search_root" ]]; then
+              [[ "$(basename "$search_root")" == "SKILL.md" ]] || exit 0
+              skill_files+=("$search_root")
+          elif [[ -d "$search_root" ]]; then
+              while IFS= read -r -d ${"''"} skill_file; do
+              skill_files+=("$skill_file")
+              done < <(find "$search_root" -name 'SKILL.md' -type f -print0)
+          else
+              exit 0
+          fi
+
+          for skill_file in "''${skill_files[@]}"; do
+              dir=$(dirname "$skill_file")
+
+              while [[ "$dir" != "$skills_dir_real" && "$dir" != "/" ]]; do
+              dirs_to_grant["$dir"]=1
+              dir=$(dirname "$dir")
+              done
+          done
+
+          dirs_to_grant["$skills_dir_real"]=1
+
+          if [[ "''${#skill_files[@]}" -gt 0 ]]; then
+              printf '%s\0' "''${skill_files[@]}" | \
+              xargs -0P "$jobs" -n 50 setfacl -m "g:${sharedStateId}:r--" --
+          fi
+
+          printf '%s\0' "''${!dirs_to_grant[@]}" | \
+              xargs -0P "$jobs" -n 50 setfacl -m "g:${sharedStateId}:r-x" --
+        '';
+      };
+      publicStatePath =
+        builtins.attrValues {
+          inherit (pkgs)
+            acl
+            bash
+            coreutils
+            findutils
+            inotify-tools
+            ;
+        }
+        ++ [ grantSkillsAcl ];
+      publicStateExecStart = pkgs.writeShellApplication {
+        name = "hermes-agent-pf-exec-start";
+        runtimeInputs =
+          builtins.attrValues {
+            inherit (pkgs)
+              acl
+              bash
+              coreutils
+              findutils
+              inotify-tools
+              ;
+          }
+          ++ [ grantSkillsAcl ];
+        text = ''
+          # StateDirectoryMode=2700 can leave the ACL mask at ---; raise it so the shared-group r-x grant is effective.
+          setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HOME/"
+          setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HERMES_HOME/"
+          setfacl -m "g:${sharedStateId}:r-x" -- "$HERMES_HOME/cron"
+          setfacl -m "g:${sharedStateId}:r--" -- "$HERMES_HOME/cron/output"
+
+          grant-skills-acl "$HERMES_HOME/skills" 1 "$HERMES_HOME/skills" &
+
+          find "$HERMES_HOME/gateway.pid" "$HERMES_HOME/gateway_state.json" -type f -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
+
+          find "$HERMES_HOME/logs" "$HERMES_HOME/logs/curator" -type d -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
+
+          wait
+
+          (sleep 5;
+
+           grant-skills-acl "$HERMES_HOME/skills" 1 "$HERMES_HOME/skills" &
+           find "$HERMES_HOME/gateway.pid" "$HERMES_HOME/gateway_state.json" "$HERMES_HOME/gateway_state.json" -type f -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
+
+           find "$HERMES_HOME/logs" "$HERMES_HOME/logs/curator" -type d -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &) &
+
+          exec inotifywait -mrqe create,moved_to --format '%w%f%0' --no-newline -- "$HERMES_HOME/skills" | xargs -0P 1 -n 50 grant-skills-acl "$HERMES_HOME/skills" 1
+        '';
+      };
+      publicStateClosure = closureStorePaths (
+        config.systemd.services."hermes-pf@".path ++ [ publicStateExecStart ]
+      );
     in
     mkIf cfg.enable {
       services = {
-        "hermes-pf@" =
-          let
-            grantSkillsAcl = pkgs.writeShellApplication {
-              name = "grant-skills-acl";
-              runtimeInputs = builtins.attrValues { inherit (pkgs) acl coreutils findutils; };
-              text = ''
-                skills_dir="$1"
-                jobs="''${2:-$(nproc)}"
-                scope="''${3:-}"
-
-                [[ -d "$skills_dir" ]] || exit 0
-
-                skills_dir_real=$(realpath -m -- "$skills_dir")
-
-                if [[ -n "$scope" ]]; then
-                    scope_real=$(realpath -m -- "$scope")
-
-                    case "$scope_real" in
-                    "$skills_dir_real"|"$skills_dir_real"/*) ;;
-                    *)
-                        echo "grant-skills-acl: refusing scope outside skills_dir: $scope (resolved: $scope_real, skills_dir resolved: $skills_dir_real)" >&2
-                        exit 1
-                    ;;
-                    esac
-
-                    search_root="$scope_real"
-                else
-                    search_root="$skills_dir_real"
-                fi
-
-                declare -A dirs_to_grant=()
-                declare -a skill_files=()
-
-                if [[ -f "$search_root" ]]; then
-                    [[ "$(basename "$search_root")" == "SKILL.md" ]] || exit 0
-                    skill_files+=("$search_root")
-                elif [[ -d "$search_root" ]]; then
-                    while IFS= read -r -d ${"''"} skill_file; do
-                    skill_files+=("$skill_file")
-                    done < <(find "$search_root" -name 'SKILL.md' -type f -print0)
-                else
-                    exit 0
-                fi
-
-                for skill_file in "''${skill_files[@]}"; do
-                    dir=$(dirname "$skill_file")
-
-                    while [[ "$dir" != "$skills_dir_real" && "$dir" != "/" ]]; do
-                    dirs_to_grant["$dir"]=1
-                    dir=$(dirname "$dir")
-                    done
-                done
-
-                dirs_to_grant["$skills_dir_real"]=1
-
-                if [[ "''${#skill_files[@]}" -gt 0 ]]; then
-                    printf '%s\0' "''${skill_files[@]}" | \
-                    xargs -0P "$jobs" -n 50 setfacl -m "g:${sharedStateId}:r--" --
-                fi
-
-                printf '%s\0' "''${!dirs_to_grant[@]}" | \
-                    xargs -0P "$jobs" -n 50 setfacl -m "g:${sharedStateId}:r-x" --
-              '';
-            };
-          in
-          {
-            after = [ "hermes@%i.service" ];
-            description = "Hermes Agent Public State Fixer";
-            enableDefaultPath = false;
-            environment = {
-              HERMES_HOME = hermesAgentStateSystemdPath;
-              HOME = agentStateSystemdPath;
-            };
-            path =
-              builtins.attrValues {
-                inherit (pkgs)
-                  acl
-                  bash
-                  coreutils
-                  findutils
-                  inotify-tools
-                  ;
-              }
-              ++ [ grantSkillsAcl ];
-            serviceConfig = {
-              AmbientCapabilities = [
-                "CAP_DAC_READ_SEARCH"
-                "CAP_FOWNER"
-              ];
-              CapabilityBoundingSet = [
-                "CAP_DAC_READ_SEARCH"
-                "CAP_FOWNER"
-              ];
-              CoredumpFilter = "0x00";
-              DelegateNamespaces = false;
-              DevicePolicy = "closed";
-              DynamicUser = true;
-              ExecStart = [
-                (lib.getExe (
-                  pkgs.writeShellApplication {
-                    name = "hermes-agent-pf-exec-start";
-                    runtimeInputs =
-                      builtins.attrValues {
-                        inherit (pkgs)
-                          acl
-                          bash
-                          coreutils
-                          findutils
-                          inotify-tools
-                          ;
-                      }
-                      ++ [ grantSkillsAcl ];
-                    text = ''
-                      # StateDirectoryMode=2700 can leave the ACL mask at ---; raise it so the shared-group r-x grant is effective.
-                      setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HOME/"
-                      setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HERMES_HOME/"
-                      setfacl -m "g:${sharedStateId}:r-x" -- "$HERMES_HOME/cron"
-                      setfacl -m "g:${sharedStateId}:r--" -- "$HERMES_HOME/cron/output"
-
-                      grant-skills-acl "$HERMES_HOME/skills" 1 "$HERMES_HOME/skills" &
-
-                      find "$HERMES_HOME/gateway.pid" "$HERMES_HOME/gateway_state.json" -type f -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
-
-                      find "$HERMES_HOME/logs" "$HERMES_HOME/logs/curator" -type d -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
-
-                      wait
-
-                      (sleep 5;
-
-                       grant-skills-acl "$HERMES_HOME/skills" 1 "$HERMES_HOME/skills" &
-                       find "$HERMES_HOME/gateway.pid" "$HERMES_HOME/gateway_state.json" "$HERMES_HOME/gateway_state.json" -type f -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
-
-                       find "$HERMES_HOME/logs" "$HERMES_HOME/logs/curator" -type d -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &) &
-
-                      exec inotifywait -mrqe create,moved_to --format '%w%f%0' --no-newline -- "$HERMES_HOME/skills" | xargs -0P 1 -n 50 grant-skills-acl "$HERMES_HOME/skills" 1
-                    '';
-                  }
-                ))
-              ];
-              Group = publicStateFixerSystemdId;
-              KeyringMode = "private";
-              LockPersonality = true;
-              MemoryDenyWriteExecute = true;
-              MemoryKSM = true;
-              MountAPIVFS = true;
-              NoNewPrivileges = true;
-              NotifyAccess = "none";
-              #PrivateBPF = true;
-              PrivateDevices = true;
-              PrivateIPC = true;
-              PrivateMounts = true;
-              PrivateNetwork = true;
-              #PrivatePIDs = true;
-              PrivateTmp = true;
-              # TODO: PrivateUsers = "self" after https://github.com/systemd/systemd/issues/41994
-              PrivateUsers = "identity";
-              ProcSubset = "pid";
-              ProtectClock = true;
-              ProtectControlGroups = "strict";
-              ProtectHome = true;
-              ProtectHostname = "private";
-              ProtectKernelLogs = true;
-              ProtectKernelModules = true;
-              ProtectKernelTunables = true;
-              ProtectProc = "invisible";
-              ProtectSystem = "strict";
-              ReadWritePaths = [ agentStateSystemdPath ];
-              RemoveIPC = true;
-              Restart = "always";
-              RestrictAddressFamilies = [ "AF_UNIX" ];
-              RestrictNamespaces = true;
-              RestrictRealtime = true;
-              RestrictSUIDSGID = true;
-              SetLoginEnvironment = false;
-              SupplementaryGroups = [ sharedStateId ];
-              SystemCallArchitectures = "native";
-              SystemCallErrorNumber = "EPERM";
-              SystemCallFilter = [
-                "@system-service"
-                "~@resources"
-                "~@privileged"
-              ];
-              Type = "exec";
-              UMask = "0077";
-              User = publicStateFixerSystemdId;
-            };
-            wantedBy = [ "hermes@%i.service" ];
+        "hermes-network@" = {
+          after = [
+            "network-online.target"
+            "nftables.service"
+          ];
+          description = "Configure isolated network for Hermes agent %i";
+          partOf = [
+            "nftables.service"
+            "hermes@%i.service"
+          ];
+          requires = [ "nftables.service" ];
+          wants = [ "network-online.target" ];
+          serviceConfig = {
+            AmbientCapabilities = [ ];
+            CapabilityBoundingSet = [
+              "CAP_NET_ADMIN"
+              "CAP_NET_BIND_SERVICE"
+              "CAP_SETGID"
+              "CAP_SETUID"
+              "CAP_SYS_ADMIN"
+              "CAP_SYS_PTRACE"
+            ];
+            InaccessiblePaths = nixStoreAliasPaths;
+            NoNewPrivileges = true;
+            PrivateDevices = true;
+            PrivateIPC = true;
+            PrivateNetwork = true;
+            PrivateTmp = true;
+            ProtectHome = true;
+            ProtectSystem = "strict";
+            RestrictAddressFamilies = [
+              "AF_INET"
+              "AF_INET6"
+              "AF_NETLINK"
+              "AF_UNIX"
+            ];
+            TemporaryFileSystem = [ "/nix:ro" ];
+            TimeoutStartSec = "30s";
+            TimeoutStopSec = "15s";
+            Type = "oneshot";
+            RemainAfterExit = true;
           };
+        };
+        "hermes-pf@" = {
+          after = [ "hermes@%i.service" ];
+          description = "Hermes Agent Public State Fixer";
+          partOf = [ "hermes@%i.service" ];
+          enableDefaultPath = false;
+          environment = {
+            HERMES_HOME = hermesAgentStateSystemdPath;
+            HOME = agentStateSystemdPath;
+          };
+          path = publicStatePath;
+          serviceConfig = {
+            AmbientCapabilities = [
+              "CAP_DAC_READ_SEARCH"
+              "CAP_FOWNER"
+            ];
+            CapabilityBoundingSet = [
+              "CAP_DAC_READ_SEARCH"
+              "CAP_FOWNER"
+            ];
+            CoredumpFilter = "0x00";
+            DelegateNamespaces = false;
+            DevicePolicy = "closed";
+            DynamicUser = true;
+            BindReadOnlyPaths = publicStateClosure;
+            InaccessiblePaths = nixStoreAliasPaths;
+            TemporaryFileSystem = [ "/nix:ro" ];
+            ExecStart = [ (lib.getExe publicStateExecStart) ];
+            Group = publicStateFixerSystemdId;
+            KeyringMode = "private";
+            LockPersonality = true;
+            MemoryDenyWriteExecute = true;
+            MemoryKSM = true;
+            MountAPIVFS = true;
+            NoNewPrivileges = true;
+            NotifyAccess = "none";
+            #PrivateBPF = true;
+            PrivateDevices = true;
+            PrivateIPC = true;
+            PrivateMounts = true;
+            PrivateNetwork = true;
+            #PrivatePIDs = true;
+            PrivateTmp = true;
+            # TODO: PrivateUsers = "self" after https://github.com/systemd/systemd/issues/41994
+            PrivateUsers = "identity";
+            ProcSubset = "pid";
+            ProtectClock = true;
+            ProtectControlGroups = "strict";
+            ProtectHome = true;
+            ProtectHostname = "private";
+            ProtectKernelLogs = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectProc = "invisible";
+            ProtectSystem = "strict";
+            ReadWritePaths = [ agentStateSystemdPath ];
+            RemoveIPC = true;
+            Restart = "always";
+            RestrictAddressFamilies = [ "AF_UNIX" ];
+            RestrictNamespaces = true;
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            SetLoginEnvironment = false;
+            SupplementaryGroups = [ sharedStateId ];
+            SystemCallArchitectures = "native";
+            SystemCallErrorNumber = "EPERM";
+            SystemCallFilter = [
+              "@system-service"
+              "~@resources"
+              "~@privileged"
+            ];
+            Type = "exec";
+            UMask = "0077";
+            User = publicStateFixerSystemdId;
+          };
+          wantedBy = [ "hermes@%i.service" ];
+        };
         "hermes@" = {
           after = [
             "network-online.target"
@@ -810,7 +930,6 @@ let
             "network-online.target"
             "hermes-network@%i.service"
           ];
-          requires = [ "hermes-network@%i.service" ];
           description = "Hermes Agent Gateway";
           enableDefaultPath = false;
           environment = {
@@ -889,25 +1008,7 @@ let
             SSH_AUTH_SOCK = "%t/${agentStateSystemdId}/ssh-agent.socket";
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           };
-          path = builtins.attrValues {
-            inherit (pkgs)
-              ast-grep
-              bash
-              coreutils
-              diffutils
-              findutils
-              git
-              gnugrep
-              gnused
-              headroom
-              headroom-proxy
-              mnemosyne
-              nix
-              openssh
-              ripgrep
-              util-linux
-              ;
-          };
+          path = hermesRuntimePath;
           serviceConfig = {
             AmbientCapabilities = [ "" ];
             BindPaths = [
@@ -915,51 +1016,23 @@ let
               sharedStatePath
             ];
             BindReadOnlyPaths = [
-              "/nix"
               "${lib.getExe' pkgs.bash "sh"}:/bin/sh"
               "${lib.getExe' pkgs.bash "bash"}:/bin/bash"
               "${lib.getExe' pkgs.coreutils "env"}:/usr/bin/env"
               "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt"
               "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt"
             ];
+            InaccessiblePaths = nixStoreAliasPaths;
+            TemporaryFileSystem = [ "/nix:ro" ];
             CapabilityBoundingSet = [ "" ];
             CoredumpFilter = "0x00";
             DelegateNamespaces = false;
             DeviceAllow = [ "/dev/kvm rw" ];
             DevicePolicy = "closed";
             DynamicUser = true;
-            ExecStartPre = [
-              "+${
-                lib.getExe (
-                  pkgs.writeShellApplication {
-                    name = "hermes-agent-exec-start-pre";
-                    runtimeInputs = [ pkgs.coreutils ];
-                    text = ''
-                      uid="$(stat --printf=%u -- "''${RUNTIME_DIRECTORY%%:*}")"
-                      gid="$(stat --printf=%g -- "''${RUNTIME_DIRECTORY%%:*}")"
-
-                      exec chown -R "$uid:$gid" -- "$HOME"
-                    '';
-                  }
-                )
-              }"
-            ]
-            ++ optional cfg.installDefaultSkills (
-              lib.getExe (
-                pkgs.writeShellApplication {
-                  name = "hermes-agent-exec-start-pre";
-                  text = ''
-                    hermes skills install -y official/creative/concept-diagrams
-                    hermes skills install -y official/creative/creative-ideation
-                    hermes skills install -y official/software-development/ast-grep
-                    hermes skills install -y official/software-development/code-wiki
-                    hermes skills install -y official/software-development/subagent-driven-development
-                  '';
-                }
-              )
-            );
+            ExecStartPre = [ "+${lib.getExe gatewayOwnershipExecStartPre}" ];
             Group = agentStateSystemdId;
-            InaccessiblePaths = "";
+
             KeyringMode = "private";
             LockPersonality = true;
             #MemoryDenyWriteExecute = true;
@@ -1021,7 +1094,7 @@ let
             UMask = "0007";
             User = agentStateSystemdId;
           };
-          unitConfig.PropagatesStopTo = [ "hermes-pf@%i.service" ];
+          unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
           wantedBy = [ "multi-user.target" ];
         };
       };
