@@ -107,6 +107,7 @@
                         systemd.services."hermes-pf@vm".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes@".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-network@".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-network@".serviceConfig.ExecStartPost = "${pkgs.toilet}/bin/toilet";
                         systemd.services."hermes-pf@".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-pf@vm".path = [ pkgs.hello ];
                         systemd.services."hermes@vm".serviceConfig.ExecStartPost =
@@ -121,15 +122,29 @@
                     (
                       { pkgs, lib, ... }:
                       {
-                        systemd.services."hermes@vm".serviceConfig.ExecCondition =
-                          lib.mkIf true "${pkgs.figlet}/bin/figlet";
-                        systemd.services."hermes-network@vm".serviceConfig.ExecReloadPost = lib.mkAfter [
-                          "${pkgs.cowsay}/bin/cowsay"
+                        systemd.services."hermes@vm" = lib.mkIf true {
+                          serviceConfig.ExecCondition = "${pkgs.figlet}/bin/figlet";
+                        };
+                        systemd.services."hermes-network@vm" = lib.mkIf true {
+                          serviceConfig = {
+                            ExecReloadPost = lib.mkAfter [ "${pkgs.cowsay}/bin/cowsay" ];
+                            ExecReload = lib.mkForce "${pkgs.coreutils}/bin/true";
+                          };
+                        };
+                        systemd.services."hermes-pf@vm" = lib.mkMerge [
+                          {
+                            serviceConfig.ExecStopPost = "${pkgs.toilet}/bin/toilet";
+                          }
                         ];
-                        systemd.services."hermes-network@vm".serviceConfig.ExecReload =
-                          lib.mkForce "${pkgs.coreutils}/bin/true";
-                        systemd.services."hermes-pf@vm".serviceConfig.ExecStopPost =
-                          lib.mkIf true "${pkgs.toilet}/bin/toilet";
+                        systemd.services."hermes-network@" = lib.mkIf true {
+                          serviceConfig.ExecStartPost = lib.mkForce "${pkgs.coreutils}/bin/true";
+                        };
+                        systemd.services."hermes-network@vm-peer".serviceConfig = lib.mkIf true {
+                          ExecStartPost = "${pkgs.figlet}/bin/figlet";
+                        };
+                        systemd.services."hermes-pf@vm-peer".serviceConfig = lib.mkIf false {
+                          ExecStartPost = "${pkgs.toilet}/bin/toilet";
+                        };
                       }
                     )
                   ];
@@ -152,6 +167,11 @@
                 toilet = "${closureProbe.pkgs.toilet}/bin/toilet";
                 effectiveReload = closureProbeUnits."hermes-network@vm".serviceConfig.ExecReload;
                 effectiveReloadPost = closureProbeUnits."hermes-network@vm".serviceConfig.ExecReloadPost;
+                effectiveCondition = closureProbeUnits."hermes@vm".serviceConfig.ExecCondition;
+                effectivePfStopPost = closureProbeUnits."hermes-pf@vm".serviceConfig.ExecStopPost;
+                effectiveTemplateExecPost = closureProbeUnits."hermes-network@".serviceConfig.ExecStartPost;
+                effectivePeerExec = closureProbeUnits."hermes-network@vm-peer".serviceConfig.ExecStartPost;
+                disabledPeerExec = closureProbeUnits."hermes-pf@vm-peer".serviceConfig;
                 directExec = closureProbeUnits."hermes@vm".serviceConfig.ExecStartPost;
                 gatewayTemplateScript = builtins.head closureProbeUnits."hermes@".jobScripts;
                 networkTemplateScript = builtins.head closureProbeUnits."hermes-network@".jobScripts;
@@ -226,9 +246,18 @@
                 && hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm")
                 && !(hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm-peer"))
                 && hasStoreRoot figlet (closureProbeBinds "hermes@vm")
+                && effectiveCondition == figlet
                 && builtins.elem cowsay effectiveReloadPost
                 && hasStoreRoot cowsay (closureProbeBinds "hermes-network@vm")
+                && !(disabledPeerExec ? ExecStartPost)
+                && !(hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm-peer"))
+                && effectivePeerExec == figlet
+                && hasStoreRoot figlet (closureProbeBinds "hermes-network@vm-peer")
+                && effectivePfStopPost == toilet
                 && hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm")
+                && effectiveTemplateExecPost == "${closureProbe.pkgs.coreutils}/bin/true"
+                && hasStoreRoot effectiveTemplateExecPost (closureProbeBinds "hermes-network@vm")
+                && !(hasStoreRoot toilet (closureProbeBinds "hermes-network@"))
                 && effectiveReload == "${closureProbe.pkgs.coreutils}/bin/true"
                 && !(hasStoreRoot figlet (
                   closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"

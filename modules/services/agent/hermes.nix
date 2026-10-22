@@ -129,21 +129,50 @@ let
     let
       unitOption =
         (options.systemd.services.type.getSubOptions [ ]).serviceConfig.type.nestedTypes.elemType;
+      projectPath =
+        path: value:
+        if path == [ ] then
+          value
+        else if !builtins.isAttrs value then
+          null
+        else if value ? _type then
+          if value._type == "merge" then
+            let
+              projected = builtins.filter (item: item != null) (map (item: projectPath path item) value.contents);
+            in
+            if projected == [ ] then null else lib.mkMerge projected
+          else
+            let
+              projected = projectPath path value.content;
+            in
+            if projected == null then
+              null
+            else if value._type == "if" then
+              lib.mkIf value.condition projected
+            else if value._type == "override" then
+              lib.mkOverride value.priority projected
+            else if value._type == "order" then
+              lib.mkOrder value.priority projected
+            else
+              null
+        else
+          let
+            key = builtins.head path;
+          in
+          if builtins.hasAttr key value then projectPath (lib.tail path) value.${key} else null;
       commands =
         lib.concatMap
           (
             name:
             let
-              # Merge only Exec* leaves; resolving serviceConfig forces these closure binds.
               definitions = lib.concatMap (
                 definition:
                 let
-                  service = definition.value.${unitName} or { };
-                  serviceConfig = service.serviceConfig or { };
+                  value = projectPath [ unitName "serviceConfig" name ] definition.value;
                 in
-                lib.optional (builtins.hasAttr name serviceConfig) {
+                lib.optional (value != null) {
                   inherit (definition) file;
-                  value = serviceConfig.${name};
+                  inherit value;
                 }
               ) options.systemd.services.definitionsWithLocations;
               merged = lib.modules.mergeDefinitions [
