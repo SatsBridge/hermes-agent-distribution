@@ -127,23 +127,39 @@ let
   serviceExecRoots =
     unitName:
     let
-      # Read raw definitions to avoid a cycle through the merged BindReadOnlyPaths.
-      definitions = lib.concatMap (
-        definition:
-        if builtins.hasAttr unitName definition then
-          [ (definition.${unitName}.serviceConfig or { }) ]
-        else
-          [ ]
-      ) options.systemd.services.definitions;
-      commands = lib.concatMap (
-        serviceConfig:
+      unitOption =
+        (options.systemd.services.type.getSubOptions [ ]).serviceConfig.type.nestedTypes.elemType;
+      commands =
         lib.concatMap
           (
             name:
             let
-              value = serviceConfig.${name} or null;
+              # Merge only Exec* leaves; resolving serviceConfig forces these closure binds.
+              definitions = lib.concatMap (
+                definition:
+                let
+                  service = definition.value.${unitName} or { };
+                  serviceConfig = service.serviceConfig or { };
+                in
+                lib.optional (builtins.hasAttr name serviceConfig) {
+                  inherit (definition) file;
+                  value = serviceConfig.${name};
+                }
+              ) options.systemd.services.definitionsWithLocations;
+              merged = lib.modules.mergeDefinitions [
+                "systemd"
+                "services"
+                unitName
+                "serviceConfig"
+                name
+              ] unitOption definitions;
             in
-            if builtins.isList value then value else lib.optional (builtins.isString value) value
+            if !merged.isDefined then
+              [ ]
+            else if builtins.isList merged.mergedValue then
+              merged.mergedValue
+            else
+              lib.optional (builtins.isString merged.mergedValue) merged.mergedValue
           )
           [
             "ExecCondition"
@@ -151,10 +167,10 @@ let
             "ExecStart"
             "ExecStartPost"
             "ExecReload"
+            "ExecReloadPost"
             "ExecStop"
             "ExecStopPost"
-          ]
-      ) definitions;
+          ];
     in
     lib.concatMap (
       command:

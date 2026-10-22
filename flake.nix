@@ -115,6 +115,21 @@
                           "${directExecProbe}/bin/hermes-direct-exec-probe";
                         systemd.services."hermes-pf@vm".serviceConfig.ExecStartPre =
                           "${directExecProbe}/bin/hermes-direct-exec-probe";
+                        systemd.services."hermes-network@vm".serviceConfig.ExecReload = "${pkgs.figlet}/bin/figlet";
+                      }
+                    )
+                    (
+                      { pkgs, lib, ... }:
+                      {
+                        systemd.services."hermes@vm".serviceConfig.ExecCondition =
+                          lib.mkIf true "${pkgs.figlet}/bin/figlet";
+                        systemd.services."hermes-network@vm".serviceConfig.ExecReloadPost = lib.mkAfter [
+                          "${pkgs.cowsay}/bin/cowsay"
+                        ];
+                        systemd.services."hermes-network@vm".serviceConfig.ExecReload =
+                          lib.mkForce "${pkgs.coreutils}/bin/true";
+                        systemd.services."hermes-pf@vm".serviceConfig.ExecStopPost =
+                          lib.mkIf true "${pkgs.toilet}/bin/toilet";
                       }
                     )
                   ];
@@ -132,6 +147,11 @@
                     script: hasStoreRoot script (closureProbeBinds name ++ closureProbeBinds template)
                   ) closureProbeUnits.${template}.jobScripts;
                 hello = "${nixpkgs-unstable.legacyPackages.x86_64-linux.hello}/bin/hello";
+                figlet = "${closureProbe.pkgs.figlet}/bin/figlet";
+                cowsay = "${closureProbe.pkgs.cowsay}/bin/cowsay";
+                toilet = "${closureProbe.pkgs.toilet}/bin/toilet";
+                effectiveReload = closureProbeUnits."hermes-network@vm".serviceConfig.ExecReload;
+                effectiveReloadPost = closureProbeUnits."hermes-network@vm".serviceConfig.ExecReloadPost;
                 directExec = closureProbeUnits."hermes@vm".serviceConfig.ExecStartPost;
                 gatewayTemplateScript = builtins.head closureProbeUnits."hermes@".jobScripts;
                 networkTemplateScript = builtins.head closureProbeUnits."hermes-network@".jobScripts;
@@ -205,6 +225,14 @@
                 && hasStoreRoot hello (closureProbeBinds "hermes-pf@")
                 && hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm")
                 && !(hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm-peer"))
+                && hasStoreRoot figlet (closureProbeBinds "hermes@vm")
+                && builtins.elem cowsay effectiveReloadPost
+                && hasStoreRoot cowsay (closureProbeBinds "hermes-network@vm")
+                && hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm")
+                && effectiveReload == "${closureProbe.pkgs.coreutils}/bin/true"
+                && !(hasStoreRoot figlet (
+                  closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
+                ))
                 && !(hasStoreRoot publicStateTemplateScript (
                   closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
                 ))
