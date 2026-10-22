@@ -98,23 +98,44 @@
                   modules = [
                     (
                       { pkgs, ... }:
+                      let
+                        directExecProbe = pkgs.writeShellScriptBin "hermes-direct-exec-probe" "exit 0";
+                      in
                       {
                         systemd.services."hermes@vm".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-network@vm".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-pf@vm".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes@".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-network@".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-pf@".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-pf@vm".path = [ pkgs.hello ];
+                        systemd.services."hermes@vm".serviceConfig.ExecStartPost =
+                          "${directExecProbe}/bin/hermes-direct-exec-probe";
+                        systemd.services."hermes-network@vm".serviceConfig.ExecStop =
+                          "${directExecProbe}/bin/hermes-direct-exec-probe";
+                        systemd.services."hermes-pf@vm".serviceConfig.ExecStartPre =
+                          "${directExecProbe}/bin/hermes-direct-exec-probe";
                       }
                     )
                   ];
                 };
                 closureProbeUnits = closureProbe.config.systemd.services;
-                closureProbeBinds = name: closureProbeUnits.${name}.serviceConfig.BindReadOnlyPaths;
+                closureProbeBinds = name: closureProbeUnits.${name}.serviceConfig.BindReadOnlyPaths or [ ];
                 hasJobScripts =
                   name:
                   builtins.all (
                     script: hasStoreRoot script (closureProbeBinds name)
                   ) closureProbeUnits.${name}.jobScripts;
+                hasTemplateJobScripts =
+                  name: template:
+                  builtins.all (
+                    script: hasStoreRoot script (closureProbeBinds name ++ closureProbeBinds template)
+                  ) closureProbeUnits.${template}.jobScripts;
                 hello = "${nixpkgs-unstable.legacyPackages.x86_64-linux.hello}/bin/hello";
+                directExec = closureProbeUnits."hermes@vm".serviceConfig.ExecStartPost;
+                gatewayTemplateScript = builtins.head closureProbeUnits."hermes@".jobScripts;
+                networkTemplateScript = builtins.head closureProbeUnits."hermes-network@".jobScripts;
+                publicStateTemplateScript = builtins.head closureProbeUnits."hermes-pf@".jobScripts;
                 hasSandbox =
                   name: template:
                   let
@@ -166,13 +187,27 @@
                 && hasStoreRoot gatewayStart (storeBinds "hermes-network@vm" ++ [ gatewayStart ])
                 && hasStoreRoot hello (closureProbeBinds "hermes@vm")
                 && hasJobScripts "hermes@vm"
-                && !(hasStoreRoot hello (closureProbeBinds "hermes@vm-peer"))
+                && hasTemplateJobScripts "hermes@vm" "hermes@"
+                && hasStoreRoot directExec (closureProbeBinds "hermes@vm")
+                && !(hasStoreRoot directExec (closureProbeBinds "hermes@vm-peer"))
+                && !(hasStoreRoot gatewayTemplateScript (
+                  closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
+                ))
                 && hasStoreRoot hello (closureProbeBinds "hermes-network@vm")
                 && hasJobScripts "hermes-network@vm"
-                && !(hasStoreRoot hello (closureProbeBinds "hermes-network@vm-peer"))
+                && hasTemplateJobScripts "hermes-network@vm" "hermes-network@"
+                && hasStoreRoot directExec (closureProbeBinds "hermes-network@vm")
+                && !(hasStoreRoot directExec (closureProbeBinds "hermes-network@vm-peer"))
+                && !(hasStoreRoot networkTemplateScript (closureProbeBinds "hermes-pf@"))
                 && hasStoreRoot hello (closureProbeBinds "hermes-pf@vm")
                 && hasJobScripts "hermes-pf@vm"
-                && !(hasStoreRoot hello (closureProbeBinds "hermes-pf@vm-peer"))
+                && hasTemplateJobScripts "hermes-pf@" "hermes-pf@"
+                && hasStoreRoot hello (closureProbeBinds "hermes-pf@")
+                && hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm")
+                && !(hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm-peer"))
+                && !(hasStoreRoot publicStateTemplateScript (
+                  closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
+                ))
                 && units."hermes@vm".serviceConfig ? ExecStart
                 && units."hermes@vm-peer".serviceConfig ? ExecStart
                 && units."hermes@".serviceConfig.PrivateNetwork

@@ -1,6 +1,7 @@
 {
   config,
   lib,
+  options,
   pkgs,
   ...
 }:
@@ -123,6 +124,44 @@ let
     builtins.filter (path: path != "") (
       lib.splitString "\n" (builtins.readFile "${closureInfo}/store-paths")
     );
+  serviceExecRoots =
+    unitName:
+    let
+      # Read raw definitions to avoid a cycle through the merged BindReadOnlyPaths.
+      definitions = lib.concatMap (
+        definition:
+        if builtins.hasAttr unitName definition then
+          [ (definition.${unitName}.serviceConfig or { }) ]
+        else
+          [ ]
+      ) options.systemd.services.definitions;
+      commands = lib.concatMap (
+        serviceConfig:
+        lib.concatMap
+          (
+            name:
+            let
+              value = serviceConfig.${name} or null;
+            in
+            if builtins.isList value then value else lib.optional (builtins.isString value) value
+          )
+          [
+            "ExecCondition"
+            "ExecStartPre"
+            "ExecStart"
+            "ExecStartPost"
+            "ExecReload"
+            "ExecStop"
+            "ExecStopPost"
+          ]
+      ) definitions;
+    in
+    lib.concatMap (
+      command:
+      map (part: builtins.toPath "/nix/store/${builtins.head (lib.splitString "/" part)}") (
+        builtins.filter (part: part != "") (lib.tail (lib.splitString "/nix/store/" command))
+      )
+    ) commands;
   nixStoreAliasPaths = [
     "-/etc/profiles"
     "-/etc/static"
@@ -578,8 +617,12 @@ let
       ]) peerNames;
       peerPlugins = lib.concatMap (peer: _agents.${peer}.extraPlugins) peerNames;
       gatewayClosure = closureStorePaths (
-        config.systemd.services."hermes@${name}".path
+        config.systemd.services."hermes@".path
+        ++ config.systemd.services."hermes@".jobScripts
+        ++ serviceExecRoots "hermes@"
+        ++ config.systemd.services."hermes@${name}".path
         ++ config.systemd.services."hermes@${name}".jobScripts
+        ++ serviceExecRoots "hermes@${name}"
         ++ [
           agentCfg.package
           execStart
@@ -596,13 +639,18 @@ let
         ++ peerPlugins
       );
       networkClosure = closureStorePaths (
-        config.systemd.services."hermes-network@${name}".path
+        config.systemd.services."hermes-network@".path
+        ++ config.systemd.services."hermes-network@".jobScripts
+        ++ serviceExecRoots "hermes-network@"
+        ++ config.systemd.services."hermes-network@${name}".path
         ++ config.systemd.services."hermes-network@${name}".jobScripts
+        ++ serviceExecRoots "hermes-network@${name}"
         ++ [ networkSetup ]
       );
       publicStateClosure = closureStorePaths (
         lib.subtractLists config.systemd.services."hermes-pf@".path
           config.systemd.services."hermes-pf@${name}".path
+        ++ serviceExecRoots "hermes-pf@${name}"
         ++ config.systemd.services."hermes-pf@${name}".jobScripts
       );
     in
@@ -806,7 +854,10 @@ let
         '';
       };
       publicStateTemplateClosure = closureStorePaths (
-        config.systemd.services."hermes-pf@".path ++ [ publicStateExecStart ]
+        config.systemd.services."hermes-pf@".path
+        ++ config.systemd.services."hermes-pf@".jobScripts
+        ++ serviceExecRoots "hermes-pf@"
+        ++ [ publicStateExecStart ]
       );
     in
     mkIf cfg.enable {

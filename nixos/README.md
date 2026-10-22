@@ -92,11 +92,13 @@ for DNS. The public-state fixer has no network access.
 
 Each enabled `hermes@NAME`, `hermes-pf@NAME`, and `hermes-network@NAME` service
 gets a separate read-only `/nix` view containing only its evaluated runtime
-closure. The gateway closure follows its effective PATH, agent package override,
-startup and pre-start scripts, resolver/config files, CA bundle, configured
-plugins, and peer profile configs/plugins. The public-state fixer and network
-helper receive their own closures. Other host store paths and NixOS profile and
-system aliases are hidden; package contents are not stripped.
+closure. The gateway closure follows its effective PATH, agent package
+override, all template and instance lifecycle commands (including
+NixOS-generated hooks), resolver/config files, CA bundle, configured plugins,
+and peer profile configs/plugins. The public-state fixer and network helper
+receive their own closures, including their lifecycle commands. Other host
+store paths and NixOS profile and system aliases are hidden; package contents
+are not stripped.
 
 This is an intentional compatibility boundary: service processes can no longer
 run arbitrary host `/nix/store` paths or discover packages through NixOS profile
