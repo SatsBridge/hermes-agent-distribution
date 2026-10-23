@@ -38,6 +38,19 @@
         ];
         system = "x86_64-linux";
       };
+      hermesAgentClosure = hermesModuleVm.pkgs.closureInfo {
+        rootPaths = [ hermesModuleVm.pkgs.hermes-agent ];
+      };
+      defaultOnProbe = hermesModuleVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            services.hermes-specialised-agent = {
+              installDefaultSkills = lib.mkForce true;
+              agents.vm.headroomEnable = lib.mkForce true;
+            };
+          })
+        ];
+      };
       hermesModuleVmConfigCheck =
         nixpkgs-unstable.legacyPackages.x86_64-linux.runCommand "hermes-module-vm-config-check" { }
           ''
@@ -76,6 +89,18 @@
                 agent = hermesModuleVm.config.services.hermes-specialised-agent;
                 units = hermesModuleVm.config.systemd.services;
                 unitFiles = hermesModuleVm.config.systemd.units;
+                tmpfilesRules = hermesModuleVm.config.systemd.tmpfiles.rules;
+                defaultOnUnits = defaultOnProbe.config.systemd.services;
+                defaultOnTmpfilesRules = defaultOnProbe.config.systemd.tmpfiles.rules;
+                hasMnemosyne = value: nixpkgs-unstable.lib.hasInfix "mnemosyne" value;
+                hasMnemosyneEnvironment =
+                  environment:
+                  builtins.any (name: nixpkgs-unstable.lib.hasPrefix "MNEMOSYNE_" name) (
+                    builtins.attrNames environment
+                  );
+                hasMnemosyneRuntimePath = service: builtins.any hasMnemosyne service.path;
+                hasMnemosyneClosure =
+                  service: builtins.any hasMnemosyne (service.serviceConfig.BindReadOnlyPaths or [ ]);
                 storeBinds =
                   name:
                   map (
@@ -386,6 +411,32 @@
                 &&
                   units."hermes@".serviceConfig.TemporaryFileSystem
                   == hermesModuleVm.config.systemd.services."hermes@".serviceConfig.TemporaryFileSystem
+                && !hasMnemosyneEnvironment units."hermes@".environment
+                && !hasMnemosyneEnvironment units."hermes@vm".environment
+                && !hasMnemosyneRuntimePath units."hermes@"
+                && !hasMnemosyneRuntimePath units."hermes@vm"
+                && !hasMnemosyneClosure units."hermes@"
+                && !hasMnemosyneClosure units."hermes@vm"
+                && !(builtins.elem hermesModuleVm.pkgs.mnemosyne units."hermes@".path)
+                && builtins.all (rule: !(hasMnemosyne rule)) tmpfilesRules
+                && builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule) tmpfilesRules
+                && builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/plugins" rule) tmpfilesRules
+                && !hasMnemosyneEnvironment defaultOnUnits."hermes@".environment
+                && !hasMnemosyneEnvironment defaultOnUnits."hermes@vm".environment
+                && !hasMnemosyneRuntimePath defaultOnUnits."hermes@"
+                && !hasMnemosyneRuntimePath defaultOnUnits."hermes@vm"
+                && !hasMnemosyneClosure defaultOnUnits."hermes@"
+                && !hasMnemosyneClosure defaultOnUnits."hermes@vm"
+                && !(builtins.elem hermesModuleVm.pkgs.mnemosyne defaultOnUnits."hermes@".path)
+                && builtins.elem hermesModuleVm.pkgs.headroom defaultOnUnits."hermes@".path
+                && defaultOnUnits."hermes@vm".serviceConfig.ExecStartPre != [ ]
+                && builtins.any (
+                  path: nixpkgs-unstable.lib.hasInfix "hermes-agent-exec-start-pre" path
+                ) defaultOnUnits."hermes@vm".serviceConfig.BindReadOnlyPaths
+                && builtins.all (rule: !(hasMnemosyne rule)) defaultOnTmpfilesRules
+                && builtins.any (
+                  rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule
+                ) defaultOnTmpfilesRules
                 &&
                   units."hermes-network@".serviceConfig.TemporaryFileSystem
                   == hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig.TemporaryFileSystem
@@ -460,6 +511,7 @@
             test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-public-state-quoted-exec-resource" "quoted\n"}
             test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-gateway-exec-resource" "discarded\n"}
             test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-network-exec-resource" "discarded\n"}
+            ! grep -Fqi 'mnemosyne' ${hermesAgentClosure}/store-paths
             touch "$out"
           '';
       packagesFor =

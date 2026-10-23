@@ -142,6 +142,16 @@ declared agent configuration. The offline VM fixture disables Headroom and
 default skill downloads, so their default-on closure coverage is evaluated and
 built separately; the VM does not exercise their runtime startup.
 
+The module no longer adds Nixpkgs' `mnemosyne` package to Hermes PATH or
+generates a Mnemosyne config, directory, or environment defaults: that package
+is not the Hermes memory plugin. Generic agent settings, environment overrides,
+and `extraPlugins` remain supported. Existing Mnemosyne databases, memories,
+plugin files, and managed config symlinks are not deleted; a stale config
+symlink may remain and can become dangling after its old system closure is
+garbage-collected. Inspect and migrate or remove stale files yourself only if
+you know they are unused. Switching back to the previous NixOS generation
+restores its provisioning rules; it does not restore or purge state.
+
 Each store path is a separate bind mount. The current VM fixture renders about
 1.1k gateway binds per agent, 116 network-helper binds, and 19 public-state
 fixer binds; package-set updates can change these counts and service start time.

@@ -11,7 +11,6 @@
   gitHooks,
   lib,
   mkShell,
-  mnemosyne,
   nodejs,
   olm,
   playwright,
@@ -692,10 +691,7 @@ let
       # web_search backend hermes would otherwise try to pip-install (#8259)
       ddgs
     ];
-    propagate = [
-      tiktoken
-      mnemosyne
-    ];
+    propagate = [ tiktoken ];
   };
 
   parallel-web = python3.pkgs.buildPythonPackage rec {

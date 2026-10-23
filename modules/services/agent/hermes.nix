@@ -311,7 +311,6 @@ let
       gnused
       headroom
       headroom-proxy
-      mnemosyne
       nix
       openssh
       ripgrep
@@ -805,9 +804,6 @@ let
           };
         }
       );
-      mnemosyneConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-mnemosyne-config.yaml" (
-        agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { }
-      );
       profileFarm = pkgs.linkFarm "hermes-${name}-profiles" (
         map ({ fullName, name, ... }: {
           name = fullName;
@@ -872,9 +868,6 @@ let
             };
           }
         ))
-        ((pkgs.formats.yaml { }).generate "hermes-${peer}-mnemosyne-config.yaml" (
-          _agents.${peer}.settings.memory.nix-managed-mnemosyne-hermes or { }
-        ))
         (pkgs.linkFarm "hermes-${peer}-profiles" (
           map ({ fullName, name, ... }: {
             name = fullName;
@@ -896,7 +889,6 @@ let
           gatewayOwnershipExecStartPre
           resolvConf
           agentConfig
-          mnemosyneConfig
           profileFarm
           pkgs.cacert
         ]
@@ -972,36 +964,28 @@ let
           wantedBy = [ "multi-user.target" ];
         };
       };
-      tmpfiles.rules =
-        let
-          mnemosyneConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-mnemosyne-config.yaml" (
-            agentCfg.settings.memory.nix-managed-mnemosyne-hermes or { }
-          );
-        in
-        [
-          "d %S/private 0700 - - - -"
-          "d %S/private/${agentStateId} 2700 - - - -"
-          "L+ ${agentStatePath} - - - - private/${agentStateId}"
-          "d ${hermesAgentStatePath} 2700 - - - -"
-          "f ${hermesAgentStatePath}/.managed 0600 - - - -"
-          "d ${hermesAgentStatePath}/cron 2700 - - - -"
-          "d ${hermesAgentStatePath}/cron/output 2700 - - - -"
-          "d ${hermesAgentStatePath}/logs 2700 - - - -"
-          "d ${hermesAgentStatePath}/memories 2700 - - - -"
-          "d ${hermesAgentStatePath}/sessions 2700 - - - -"
-          "d ${hermesAgentStatePath}/skills 2700 - - - -"
-          "d ${hermesAgentStatePath}/skills/software-development 2700 - - - -"
-          #"L+ ${hermesAgentStatePath}/skills/software-development/agent-delivery-governance - - - - ${./../../../skills/software-development/agent-delivery-governance}"
-          "f ${hermesAgentStatePath}/.env 0600 - - - -"
-          "L+ ${hermesAgentStatePath}/config.yaml - - - - ${agentConfig}"
-          "d ${hermesAgentStatePath}/mnemosyne 2700 - - - -"
-          "L+ ${hermesAgentStatePath}/mnemosyne/config.yaml - - - - ${mnemosyneConfig}"
-          "L+ ${hermesAgentStatePath}/profiles - - - - ${profileFarm}"
-          "d ${hermesAgentStatePath}/plugins 2700 - - - -"
-        ]
-        ++ map (
-          plugin: "L+ ${hermesAgentStatePath}/plugins/nix-managed-${getName plugin} - - - - ${plugin}"
-        ) agentCfg.extraPlugins;
+      tmpfiles.rules = [
+        "d %S/private 0700 - - - -"
+        "d %S/private/${agentStateId} 2700 - - - -"
+        "L+ ${agentStatePath} - - - - private/${agentStateId}"
+        "d ${hermesAgentStatePath} 2700 - - - -"
+        "f ${hermesAgentStatePath}/.managed 0600 - - - -"
+        "d ${hermesAgentStatePath}/cron 2700 - - - -"
+        "d ${hermesAgentStatePath}/cron/output 2700 - - - -"
+        "d ${hermesAgentStatePath}/logs 2700 - - - -"
+        "d ${hermesAgentStatePath}/memories 2700 - - - -"
+        "d ${hermesAgentStatePath}/sessions 2700 - - - -"
+        "d ${hermesAgentStatePath}/skills 2700 - - - -"
+        "d ${hermesAgentStatePath}/skills/software-development 2700 - - - -"
+        #"L+ ${hermesAgentStatePath}/skills/software-development/agent-delivery-governance - - - - ${./../../../skills/software-development/agent-delivery-governance}"
+        "f ${hermesAgentStatePath}/.env 0600 - - - -"
+        "L+ ${hermesAgentStatePath}/config.yaml - - - - ${agentConfig}"
+        "L+ ${hermesAgentStatePath}/profiles - - - - ${profileFarm}"
+        "d ${hermesAgentStatePath}/plugins 2700 - - - -"
+      ]
+      ++ map (
+        plugin: "L+ ${hermesAgentStatePath}/plugins/nix-managed-${getName plugin} - - - - ${plugin}"
+      ) agentCfg.extraPlugins;
     };
   mkAgentTemplate =
     let
@@ -1267,69 +1251,6 @@ let
             HERMES_HOME = hermesAgentStateSystemdPath;
             HERMES_KANBAN_HOME = sharedStatePath;
             HOME = agentStateSystemdPath;
-            MNEMOSYNE_AUTO_MIGRATE = "1";
-            MNEMOSYNE_AUTO_SLEEP_ENABLED = "1";
-            MNEMOSYNE_CROSS_SESSION = "1";
-            MNEMOSYNE_DEFAULT_SCOPE = "global";
-            MNEMOSYNE_DEGRADE_BATCH = "200";
-            MNEMOSYNE_EMBEDDING_MODEL = "text-embedding-3-large";
-            MNEMOSYNE_ENHANCED_RECALL = "1";
-            MNEMOSYNE_EP_LIMIT = "100000";
-            MNEMOSYNE_FACT_RECALL_ENABLED = "1";
-            MNEMOSYNE_FORCE_LOCAL = "0";
-            MNEMOSYNE_FTS_WEIGHT = "0.2";
-            MNEMOSYNE_HOST_LLM_ENABLED = "1";
-            MNEMOSYNE_HOST_LLM_N_CTX = "64000";
-            MNEMOSYNE_IMPORTANCE_WEIGHT = "0.2";
-            MNEMOSYNE_LENIENT_FACT_MATCH = "1";
-            MNEMOSYNE_LLM_CONFLICT_DETECTION = "1";
-            MNEMOSYNE_LLM_ENABLED = "1";
-            MNEMOSYNE_LLM_MAX_TOKENS = "4096";
-            MNEMOSYNE_LLM_N_CTX = "4096";
-            MNEMOSYNE_LLM_N_THREADS = "8";
-            MNEMOSYNE_LLM_TIMEOUT = "120";
-            MNEMOSYNE_PERSONA_DAILY_SYNC_HOUR = "3";
-            MNEMOSYNE_PERSONA_ENABLED = "1";
-            MNEMOSYNE_PERSONA_INTERVAL = "25";
-            MNEMOSYNE_PERSONA_TOKEN_CAP = "2000";
-            MNEMOSYNE_POLYPHONIC_RECALL = "1";
-            MNEMOSYNE_PREFETCH_CONTENT_CHARS = "1000";
-            MNEMOSYNE_PROACTIVE_LINKING = "1";
-            MNEMOSYNE_PROFILE_ISOLATION = "1";
-            MNEMOSYNE_QUERY_INTENT = "1";
-            MNEMOSYNE_RECALL_DIAGNOSTICS = "1";
-            MNEMOSYNE_RECENCY_HALFLIFE = "336";
-            MNEMOSYNE_REFLECT_DISABLED_FOR_CRON = "1";
-            MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION = "5";
-            MNEMOSYNE_SHARED_SURFACE_READ = "1";
-            MNEMOSYNE_SHMR_BATCH_SIZE = "100";
-            MNEMOSYNE_SHMR_HARMONY_THRESHOLD = "0.55";
-            MNEMOSYNE_SHMR_MAX_ITERATIONS = "5";
-            MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE = "2";
-            MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD = "0.65";
-            MNEMOSYNE_SHMR_TEMPERATURE = "0.3";
-            MNEMOSYNE_SLEEP_BATCH = "10000";
-            MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY = "1";
-            MNEMOSYNE_SLEEP_MODEL_REFRESH_ENABLED = "1";
-            MNEMOSYNE_SLEEP_THRESHOLD = "25";
-            MNEMOSYNE_SMART_COMPRESS = "1";
-            MNEMOSYNE_SP_MAX = "5000";
-            MNEMOSYNE_SYNC_ROLES = "user,assistant";
-            MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT = "1500";
-            MNEMOSYNE_SYNC_TURN_USER_LIMIT = "1000";
-            MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS = "48";
-            MNEMOSYNE_TIER1_WEIGHT = "1.0";
-            MNEMOSYNE_TIER2_DAYS = "90";
-            MNEMOSYNE_TIER2_WEIGHT = "0.7";
-            MNEMOSYNE_TIER3_DAYS = "365";
-            MNEMOSYNE_TIER3_MAX_CHARS = "500";
-            MNEMOSYNE_TIER3_WEIGHT = "0.5";
-            MNEMOSYNE_VEC_TYPE = "float32";
-            MNEMOSYNE_VEC_WEIGHT = "0.6";
-            MNEMOSYNE_WM_BUMP_CAP_HOURS = "48";
-            MNEMOSYNE_WM_MAX_ITEMS = "50000";
-            MNEMOSYNE_WM_TTL_HOURS = "720";
-            MNEMOSYNE_WRITE_CLASSIFIER = "strict";
             PONYTAIL_DEFAULT_MODE = "ultra";
             RTK_TELEMETRY_DISABLED = "1";
             SSH_AUTH_SOCK = "%t/${agentStateSystemdId}/ssh-agent.socket";

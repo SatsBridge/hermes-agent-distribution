@@ -179,6 +179,30 @@ let
         cat /etc/resolv.conf >&2 || true
       }
 
+      assert_no_mnemosyne_provisioning() {
+        local unit cgroup proc_file pid config
+        for unit in "''${agent_units[@]}"; do
+          cgroup=$(timeout 5s systemctl show --property=ControlGroup --value "$unit")
+          proc_file="/sys/fs/cgroup$cgroup/cgroup.procs"
+          [[ -r "$proc_file" ]] || { echo "$unit cgroup process list is unavailable: $proc_file" >&2; return 1; }
+          while IFS= read -r pid; do
+            if tr '\0' '\n' <"/proc/$pid/environ" | grep -q '^MNEMOSYNE_'; then
+              echo "$unit process $pid has a module-injected MNEMOSYNE_ environment variable" >&2
+              return 1
+            fi
+          done <"$proc_file"
+        done
+        for config in \
+          /var/lib/hermes-vm/.hermes/mnemosyne/config.yaml \
+          /var/lib/hermes-vm-peer/.hermes/mnemosyne/config.yaml; do
+          [[ ! -e "$config" && ! -L "$config" ]] || {
+            echo "Fresh VM unexpectedly provisioned Mnemosyne config: $config" >&2
+            return 1
+          }
+        done
+        echo "No Mnemosyne environment defaults or generated config in either Hermes service"
+      }
+
       assert_agents_stable() {
         local deadline=$((SECONDS + 10)) unit state substate pid restarts current expected=
         echo "Checking agent stability for 10 seconds"
@@ -223,6 +247,7 @@ let
           done
           if (( ready == 1 )); then
             assert_agents_stable
+            assert_no_mnemosyne_provisioning || return 1
             check_all_store_isolation
             return $?
           fi
