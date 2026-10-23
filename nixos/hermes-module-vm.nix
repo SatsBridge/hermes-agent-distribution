@@ -944,14 +944,14 @@ let
       check_host_permission_revocation() {
         local pid client_pid ready_file=/run/hermes-vm-host-revocation-client.log entry family table chain handle
         echo "Testing a mapped-source-port host connection cannot survive permission revocation"
-        tcp_echo_host "$host_other_ip" 18084 || { echo "Host echo listener positive control failed" >&2; return 1; }
+        tcp_echo_host 198.18.0.5 18084 || { echo "Host echo listener positive control failed" >&2; return 1; }
         pid=$(service_pid hermes@vm-peer.service) || return 1
         for entry in "inet hermes-agent-guard hermes_agent_input_guard" "inet nixos-fw input-allow"; do
           read -r family table chain <<< "$entry"
-          nft insert rule "$family" "$table" "$chain" iifname "ha1" ip saddr 198.18.0.6 ip daddr "$host_other_ip" tcp dport 18084 accept comment "hermes-vm-host-permission-revocation" || return 1
+          nft insert rule "$family" "$table" "$chain" iifname "ha1" ip saddr 198.18.0.6 ip daddr 198.18.0.5 tcp dport 18084 accept comment "hermes-vm-host-permission-revocation" || return 1
         done
         rm -f "$ready_file"
-        run_as_service net "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys,time;s=socket.socket();s.settimeout(2);s.bind(("198.18.0.6",18198));s.connect((sys.argv[1],18084));s.sendall(b"first");assert s.recv(32)==b"first";print("ESTABLISHED",flush=True);time.sleep(2);s.sendall(b"second");assert s.recv(32)==b"second"' "$host_other_ip" >"$ready_file" 2>&1 &
+        run_as_service net "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys,time;s=socket.socket();s.settimeout(2);s.bind(("198.18.0.6",18198));s.connect((sys.argv[1],18084));s.sendall(b"first");assert s.recv(32)==b"first";print("ESTABLISHED",flush=True);time.sleep(2);s.sendall(b"second");assert s.recv(32)==b"second"' 198.18.0.5 >"$ready_file" 2>&1 &
         client_pid=$!
         for _ in {1..50}; do
           if grep -q ESTABLISHED "$ready_file"; then break; fi
