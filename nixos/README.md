@@ -39,9 +39,36 @@ and configure the host namespace; its DNS and TCP proxy children drop to
 agent veths use `haN`/`hbN` interfaces, IPv4 subnets from `198.18.0.0/15`, and
 per-agent ULA IPv6 `/80`s under `fd42:198:18::/48`. Startup fails on overlapping
 host addresses/routes. The host resolver is proxied on each veth's host-side
-addresses; TCP/UDP port 53 to those addresses, required IPv6 neighbor/error control,
-and established replies to loopback dashboard proxies are the only accepted
-agent-to-host traffic. New connections to all other host services are dropped.
+addresses; TCP/UDP port 53 to those addresses and required IPv6 neighbor/error
+control, plus established replies on configured mapping ports, remain narrow
+exceptions. Explicit `networkAllow` rules permit only
+their declared host/private tuples; all other new host connections are dropped.
+Each agent also drops forwarded destinations in IPv4 private/shared/link-local,
+loopback, documentation, benchmarking, multicast and reserved ranges, and IPv6
+ULA, link-local, loopback, documentation, multicast and special-purpose ranges.
+This includes RFC1918, 100.64.0.0/10, 169.254.0.0/16, 198.18.0.0/15,
+233.252.0.0/24 (within the denied IPv4 multicast range), 2001::/32 (Teredo),
+2001:2::/48 (benchmarking), 2001:db8::/32 and 2002::/16 (6to4), plus 3fff::/20.
+Other non-global IANA ranges listed in the policy are blocked too. Unlisted
+addresses are treated as public-like, but may be unrouted or special-use.
+This policy does not prove Internet reachability. Add an exact per-agent
+permission for a private/special destination:
+
+```nix
+services.hermes-specialised-agent.agents.vm.networkAllow = [
+  { address = "10.20.0.2"; port = 443; protocol = "tcp"; }
+  { address = "fd42:1234::2"; protocol = "both"; }
+  { } # The agent's two veth host addresses, either TCP or UDP, any port.
+];
+```
+
+`protocol` is `tcp`, `udp`, or `both` (default); `address` is one literal IPv4
+or IPv6 address (default: that agent's host-side v4 and v6 veth addresses), and
+`port` is 1–65535 (default: any). CIDRs and DNS names are not accepted. Each
+rule is scoped to that agent's interface and source address; peer-agent
+subnets remain denied even if explicitly named. The resolver proxy remains a
+deliberate exception: each agent can query its host-side resolver on TCP/UDP
+53 even without a `networkAllow` entry.
 The network helper waits for `network-online.target` before taking its upstream
 resolver snapshot. Resolver changes after startup are not watched; restart the
 agent service (`systemctl restart hermes@NAME.service`) to rebuild its network
@@ -72,21 +99,26 @@ example:
 
 ```nix
 services.hermes-specialised-agent.agents.vm.portMappings = [
-  { hostPort = 9119; agentPort = 9119; target = "loopback"; }
+  { hostPort = 9119; agentPort = 9119; target = "loopback"; protocol = "both"; }
 ];
 ```
 
-`portMappings = []` disables the localhost proxy. Host ports must be unique and
-greater than 1024. `target = "veth"` (the default) connects directly to a service
-bound on the namespace interface; `target = "loopback"` relays to a loopback-
-bound service such as the dashboard. Mappings are not exposed on the host's non-loopback
-interfaces; this preserves host-only dashboard access without opening a host
-port to the LAN. The host administrator can still connect directly to the
-agent's veth address. NixOS `networking.nat.forwardPorts` is intentionally not
+`portMappings = []` disables the localhost proxy. The `protocol` field accepts
+`tcp`, `udp`, or `both` (default), so existing mappings now also reserve and
+forward UDP unless marked `protocol = "tcp"`. Host ports must be greater than
+1024; the same numeric host port may be used once for TCP and once for UDP,
+but never twice for one transport. The default `target = "veth"` connects
+directly to a service bound on the namespace interface; `target = "loopback"`
+relays to a loopback-bound service such as the dashboard. Mappings are not
+exposed on the host's non-loopback interfaces; this preserves host-only dashboard
+access without opening a host port to the LAN. The host administrator can still
+connect directly to the agent's veth address. NixOS `networking.nat.forwardPorts`
+is intentionally not
 used for the dashboard: it forwards from a configured external interface,
 whereas this mapping is a host-loopback-only proxy.
-Host-local application services/webhooks remain unreachable from agents except
-for DNS. The public-state fixer has no network access.
+Host-local application services/webhooks are unreachable by default except for
+DNS; explicitly permitted tuples are the only additional access. The
+public-state fixer has no network access.
 
 ## Per-service Nix store visibility
 
@@ -117,11 +149,19 @@ systemd timeouts.
 For diagnostics, inspect `systemctl status hermes-network@NAME.service`,
 `readlink /proc/$(systemctl show -p MainPID --value hermes@NAME.service)/ns/net`,
 `ip link show haN`, `nft list table inet hermes-agent-guard`,
+`nft list chain inet hermes-agent-guard hermes_agent_input_guard`,
+`nft list chain inet hermes-agent-guard hermes_agent_forward_guard`,
 `nft list chain inet nixos-fw input-allow`, `nft list chain inet nixos-fw forward-allow`,
-and `ss -ltnp 'sport = :9119'`. Stop/restart of an agent removes and recreates
-its veth, routes, DNS forwarder, and configured localhost proxies. Firewall
-rules are declarative in the NixOS ruleset, not inserted per invocation. Rollback
-by reverting the module change and rebuilding the NixOS configuration.
+`ss -ltnup 'sport = :9119'`, and the configured `hostPort`s. Stop/restart of an
+agent removes and recreates its veth, routes, DNS forwarder, namespace relays,
+and host-loopback proxies. Firewall rules are declarative in the NixOS ruleset,
+not inserted per invocation. Removing a permission blocks subsequent packets
+to that private/host tuple, but does not forcibly close the agent's userspace
+socket; existing connections can remain open and time out. Public egress and
+already-established public flows remain host-uplink dependent. Rollback by
+reverting the module/configuration change and rebuilding or switching to the
+previous NixOS generation; verify the effective guard rules and listeners after
+the rollback.
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#hermes-module-vm-config-check
@@ -165,7 +205,8 @@ restarts, including after profile reads. A failure prints unit status and the
 last 80 journal lines per unit. Successful boots print
 `Hermes VM runtime checks passed` on the serial console.
 Gateway start/restart commands are bounded at 180 seconds and the smoke unit
-at 900 seconds to allow per-store-path mount setup in the 1-GiB guest; the VM's
+at 1200 seconds to allow per-store-path mount setup and the expanded live
+network-policy probes in the 1-GiB guest; the VM's
 RAM and disk limits are unchanged.
 For each real agent, the smoke check also runs `hermes profile list` from that
 agent's captured network namespace with its own `HOME` and verifies its default

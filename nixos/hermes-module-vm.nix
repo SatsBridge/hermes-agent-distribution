@@ -1,20 +1,104 @@
 { lib, pkgs, ... }:
 let
-  vmIpv6HttpServer = pkgs.writeText "hermes-vm-ipv6-http-server.py" ''
+  vmNetworkProbeServer = pkgs.writeText "hermes-vm-network-probe-server.py" ''
     import http.server
+    import select
     import socket
+    import socketserver
     import sys
+    import threading
 
+    class HttpHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"OK")
 
-    class ThreadingHTTPServerV6(http.server.ThreadingHTTPServer):
+        def log_message(self, *_args):
+            pass
+
+    class EchoHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            while True:
+                data = self.request.recv(128)
+                if not data:
+                    break
+                self.request.sendall(data)
+
+    class UdpEchoServer:
+        def __init__(self, addresses):
+            self.sockets = []
+            for family, address, port in addresses:
+                sock = socket.socket(family, socket.SOCK_DGRAM)
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind((address, port))
+                self.sockets.append(sock)
+
+        def serve_forever(self):
+            while True:
+                for sock in select.select(self.sockets, [], [])[0]:
+                    data, peer = sock.recvfrom(4096)
+                    sock.sendto(b"hermes-network-policy-udp-ok", peer)
+
+    class TcpServer6(http.server.ThreadingHTTPServer):
         address_family = socket.AF_INET6
 
         def server_bind(self):
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             super().server_bind()
 
+    class EchoServer4(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
 
-    ThreadingHTTPServerV6((sys.argv[1], int(sys.argv[2])), http.server.SimpleHTTPRequestHandler).serve_forever()
+    mode = sys.argv[1]
+    if mode == "host":
+        tcp_servers = [
+            http.server.ThreadingHTTPServer(("0.0.0.0", 18083), HttpHandler),
+            TcpServer6(("::", 18083), HttpHandler),
+        ]
+        udp_addresses = [
+            (socket.AF_INET, "0.0.0.0", 18083),
+            (socket.AF_INET6, "::", 18083),
+        ]
+    elif mode == "endpoint":
+        tcp_servers = [
+            http.server.ThreadingHTTPServer(("0.0.0.0", 18082), HttpHandler),
+            TcpServer6(("::", 18082), HttpHandler),
+            http.server.ThreadingHTTPServer(("10.20.0.2", 18083), HttpHandler),
+            http.server.ThreadingHTTPServer(("10.20.0.2", 18086), HttpHandler),
+            EchoServer4(("10.20.0.2", 18090), EchoHandler),
+        ]
+        udp_addresses = [
+            (socket.AF_INET, "10.20.0.2", 18082),
+            (socket.AF_INET, "10.20.0.2", 18083),
+            (socket.AF_INET, "10.20.0.2", 18086),
+            (socket.AF_INET, "10.20.0.3", 18082),
+            (socket.AF_INET6, "fd42:198:20::2", 18082),
+        ]
+    else:
+        ipv4, ipv6 = sys.argv[2:4]
+        tcp_servers = [
+            http.server.ThreadingHTTPServer((ipv4, 18084), HttpHandler),
+            TcpServer6((ipv6, 18085), HttpHandler),
+            http.server.ThreadingHTTPServer((ipv4, 18088), HttpHandler),
+            http.server.ThreadingHTTPServer((ipv4, 18090), HttpHandler),
+            http.server.ThreadingHTTPServer(("127.0.0.1", 18087), HttpHandler),
+            http.server.ThreadingHTTPServer(("127.0.0.1", 18089), HttpHandler),
+        ]
+        udp_addresses = [
+            (socket.AF_INET, ipv4, 18086),
+            (socket.AF_INET, ipv4, 18088),
+            (socket.AF_INET, ipv4, 18090),
+            (socket.AF_INET, "127.0.0.1", 18087),
+            (socket.AF_INET, "127.0.0.1", 18089),
+        ]
+
+    for server in tcp_servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    UdpEchoServer(udp_addresses).serve_forever()
   '';
   vmStoreSentinel = pkgs.writeText "hermes-vm-unrelated-store-sentinel" "Hermes VM unrelated store sentinel\n";
   vmAgentRuntimeSmoke = pkgs.writeShellApplication {
@@ -49,19 +133,15 @@ let
       agent_units=(hermes@vm.service hermes@vm-peer.service)
       public_state_units=(hermes-pf@vm.service hermes-pf@vm-peer.service)
       host_probe_pid=
-      host_probe6_pid=
       peer_probe_pids=()
       endpoint_pid=
-      endpoint6_pid=
       permissive_control=0
 
       cleanup_test_network() {
         remove_permissive_control
         [[ -z "$endpoint_pid" ]] || kill "$endpoint_pid" 2>/dev/null || true
-        [[ -z "$endpoint6_pid" ]] || kill "$endpoint6_pid" 2>/dev/null || true
         stop_peer_probes
         [[ -z "$host_probe_pid" ]] || kill "$host_probe_pid" 2>/dev/null || true
-        [[ -z "$host_probe6_pid" ]] || kill "$host_probe6_pid" 2>/dev/null || true
         ip netns del hermes-vm-endpoint 2>/dev/null || true
         ip link delete dev he0 2>/dev/null || true
       }
@@ -259,13 +339,45 @@ let
       tcp_connect_namespace() {
         local pid="$1" address="$2" port="$3"
         "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- \
-          "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_STREAM);s.settimeout(2);s.connect((sys.argv[1],int(sys.argv[2])));s.close()' "$address" "$port" 2>/dev/null
+          "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_STREAM);s.settimeout(1);s.connect((sys.argv[1],int(sys.argv[2])));s.close()' "$address" "$port" 2>/dev/null
       }
 
       tcp_connect_service() {
         local pid="$1" address="$2" port="$3"
         run_as_service net "$pid" "${lib.getExe' pkgs.python3 "python3"}" \
-          -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_STREAM);s.settimeout(2);s.connect((sys.argv[1],int(sys.argv[2])));s.close()' "$address" "$port" 2>/dev/null
+          -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_STREAM);s.settimeout(1);s.connect((sys.argv[1],int(sys.argv[2])));s.close()' "$address" "$port" 2>/dev/null
+      }
+
+      udp_probe() {
+        "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1);s.sendto(b"probe",(sys.argv[1],int(sys.argv[2])));data,_=s.recvfrom(128);assert data==b"hermes-network-policy-udp-ok",data' "$1" "$2"
+      }
+
+      udp_probe_namespace() {
+        local pid="$1" address="$2" port="$3"
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- \
+          "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1);s.sendto(b"probe",(sys.argv[1],int(sys.argv[2])));data,_=s.recvfrom(128);assert data==b"hermes-network-policy-udp-ok",data' "$address" "$port"
+      }
+
+      udp_probe_service() {
+        local pid="$1" address="$2" port="$3"
+        run_as_service net "$pid" "${lib.getExe' pkgs.python3 "python3"}" \
+          -c 'import socket,sys;s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1);s.sendto(b"probe",(sys.argv[1],int(sys.argv[2])));data,_=s.recvfrom(128);assert data==b"hermes-network-policy-udp-ok",data' "$address" "$port" 2>/dev/null
+      }
+
+      tcp_echo_probe() {
+        "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys;s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=2);s.settimeout(2);s.sendall(b"network-policy-echo");assert s.recv(128)==b"network-policy-echo"' "$1" "$2"
+      }
+
+      tcp_echo_probe_namespace() {
+        local pid="$1" address="$2" port="$3"
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- \
+          "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys;s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=2);s.settimeout(2);s.sendall(b"network-policy-echo");assert s.recv(128)==b"network-policy-echo"' "$address" "$port"
+      }
+
+      tcp_echo_probe_service() {
+        local pid="$1" address="$2" port="$3"
+        run_as_service net "$pid" "${lib.getExe' pkgs.python3 "python3"}" \
+          -c 'import socket,sys;s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=2);s.settimeout(2);s.sendall(b"network-policy-echo");assert s.recv(128)==b"network-policy-echo"' "$address" "$port" 2>/dev/null
       }
 
       stop_peer_probes() {
@@ -281,16 +393,25 @@ let
         local unit="$1" address4="$2" address6="$3" pid
         pid=$(service_pid "$unit")
         "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- \
-          "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((sys.argv[1],18084));s.listen(8);time.sleep(600)' "$address4" >/dev/null 2>&1 &
+          "${lib.getExe' pkgs.python3 "python3"}" ${vmNetworkProbeServer} agent "$address4" "$address6" >/run/hermes-vm-probes-"''${unit//[^a-zA-Z0-9]/_}".log 2>&1 &
         peer_probe_pids+=("$!")
-        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- \
-          "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys,time;s=socket.socket(socket.AF_INET6);s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1);s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((sys.argv[1],18085));s.listen(8);time.sleep(600)' "$address6" >/dev/null 2>&1 &
-        peer_probe_pids+=("$!")
-        for _ in {1..30}; do
+        for attempt in {1..20}; do
           if tcp_connect_namespace "$pid" "$address4" 18084 && tcp_connect_namespace "$pid" "$address6" 18085; then
+            if [[ "$unit" == hermes@vm-peer.service ]]; then
+              if ! tcp_connect_namespace "$pid" "$address4" 18088; then sleep 0.1; continue; fi
+              if ! tcp_connect_namespace "$pid" 127.0.0.1 18087; then sleep 0.1; continue; fi
+              if ! tcp_connect_namespace "$pid" 127.0.0.1 18089; then sleep 0.1; continue; fi
+              if ! udp_probe_namespace "$pid" "$address4" 18086; then sleep 0.1; continue; fi
+              if ! udp_probe_namespace "$pid" "$address4" 18088; then sleep 0.1; continue; fi
+              if ! tcp_connect_namespace "$pid" "$address4" 18090; then sleep 0.1; continue; fi
+              if ! udp_probe_namespace "$pid" "$address4" 18090; then sleep 0.1; continue; fi
+              if ! udp_probe_namespace "$pid" 127.0.0.1 18087; then sleep 0.1; continue; fi
+              if ! udp_probe_namespace "$pid" 127.0.0.1 18089; then sleep 0.1; continue; fi
+            fi
             echo "Live peer TCP targets ready in $unit at $address4:18084 and [$address6]:18085"
             return 0
           fi
+          if (( attempt % 5 == 0 )); then echo "Waiting for live peer targets in $unit (attempt $attempt/20)"; fi
           sleep 0.1
         done
         echo "$unit peer TCP targets failed their positive-connect checks" >&2
@@ -302,25 +423,43 @@ let
         (( permissive_control )) || return 0
         for entry in "inet hermes-agent-guard hermes_agent_input_guard" "inet nixos-fw input-allow"; do
           read -r family table chain <<< "$entry"
-          handle=$(nft -a list chain "$family" "$table" "$chain" | awk '/comment "hermes-vm-permissive-control"/ { print $NF; exit }')
-          [[ -z "$handle" ]] || nft delete rule "$family" "$table" "$chain" handle "$handle"
+          while handle=$(nft -a list chain "$family" "$table" "$chain" | awk '/comment "hermes-vm-permissive-control"/ { print $NF; exit }') && [[ -n "$handle" ]]; do
+            nft delete rule "$family" "$table" "$chain" handle "$handle"
+          done
         done
         permissive_control=0
       }
 
       check_permissive_control() {
-        local pid
+        local pid address
         pid=$(service_pid hermes@vm.service)
         permissive_control=1
-        nft insert rule inet hermes-agent-guard hermes_agent_input_guard iifname "ha0" ip daddr 198.18.0.1 tcp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
-        nft insert rule inet nixos-fw input-allow iifname "ha0" ip daddr 198.18.0.1 tcp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+        for address in 198.18.0.5 "$host_other_ip" fd42:198:18:0:1::1 fd42:198:20::1; do
+          if [[ "$address" == *:* ]]; then
+            nft insert rule inet hermes-agent-guard hermes_agent_input_guard iifname "ha0" ip6 saddr fd42:198:18::2 ip6 daddr "$address" tcp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+            nft insert rule inet nixos-fw input-allow iifname "ha0" ip6 saddr fd42:198:18::2 ip6 daddr "$address" tcp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+            nft insert rule inet hermes-agent-guard hermes_agent_input_guard iifname "ha0" ip6 saddr fd42:198:18::2 ip6 daddr "$address" udp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+            nft insert rule inet nixos-fw input-allow iifname "ha0" ip6 saddr fd42:198:18::2 ip6 daddr "$address" udp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+          else
+            nft insert rule inet hermes-agent-guard hermes_agent_input_guard iifname "ha0" ip saddr 198.18.0.2 ip daddr "$address" tcp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+            nft insert rule inet nixos-fw input-allow iifname "ha0" ip saddr 198.18.0.2 ip daddr "$address" tcp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+            nft insert rule inet hermes-agent-guard hermes_agent_input_guard iifname "ha0" ip saddr 198.18.0.2 ip daddr "$address" udp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+            nft insert rule inet nixos-fw input-allow iifname "ha0" ip saddr 198.18.0.2 ip daddr "$address" udp dport 18083 accept comment "hermes-vm-permissive-control" || return 1
+          fi
+        done
         tcp_connect_service "$pid" 198.18.0.1 18083 || { echo "Permissive control failed to connect to live host listener" >&2; return 1; }
-        echo "Permissive-control TCP connect succeeded with temporary allow rules"
+        for address in 198.18.0.5 "$host_other_ip" fd42:198:18:0:1::1 fd42:198:20::1; do
+          tcp_connect_service "$pid" "$address" 18083 || { echo "Permissive control failed to connect to host address $address" >&2; return 1; }
+          udp_probe_service "$pid" "$address" 18083 || { echo "Permissive control failed to get a UDP response from $address" >&2; return 1; }
+        done
+        echo "Permissive-control TCP/UDP probes succeeded for non-veth and peer host addresses"
         remove_permissive_control
-        if tcp_connect_service "$pid" 198.18.0.1 18083; then
-          echo "TCP denial oracle still connects after removing temporary allow rules" >&2
-          return 1
-        fi
+        for address in 198.18.0.5 "$host_other_ip" fd42:198:18:0:1::1 fd42:198:20::1; do
+          if tcp_connect_service "$pid" "$address" 18083 || udp_probe_service "$pid" "$address" 18083; then
+            echo "Host-service denial oracle still succeeds after removing temporary allow rules for $address" >&2
+            return 1
+          fi
+        done
         echo "Denial oracle detected the restored host-service block"
       }
 
@@ -473,30 +612,54 @@ let
         ip link add he0 type veth peer name he1
         ip link set he1 netns hermes-vm-endpoint
         ip address add 198.20.0.1/30 dev he0
+        ip address add 10.20.0.1/29 dev he0
         ip -6 address add fd42:198:20::1/64 dev he0 nodad
+        ip -6 address add 2001:db9::1/64 dev he0 nodad
         ip link set he0 up
         ip -n hermes-vm-endpoint link set lo up
         ip -n hermes-vm-endpoint address add 198.20.0.2/30 dev he1
+        ip -n hermes-vm-endpoint address add 10.20.0.2/29 dev he1
+        ip -n hermes-vm-endpoint address add 10.20.0.3/29 dev he1
         ip -n hermes-vm-endpoint -6 address add fd42:198:20::2/64 dev he1 nodad
+        ip -n hermes-vm-endpoint -6 address add fd42:198:20::3/64 dev he1 nodad
+        ip -n hermes-vm-endpoint -6 address add 2001:db9::2/64 dev he1 nodad
         ip -n hermes-vm-endpoint link set he1 up
         ip -n hermes-vm-endpoint route add default via 198.20.0.1
         ip -n hermes-vm-endpoint -6 route add default via fd42:198:20::1
-        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.python3 "python3"}" -m http.server 18082 --bind 198.20.0.2 >/dev/null 2>&1 &
+        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.python3 "python3"}" ${vmNetworkProbeServer} endpoint >/run/hermes-vm-endpoint-probes.log 2>&1 &
         endpoint_pid=$!
-        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.python3 "python3"}" ${vmIpv6HttpServer} fd42:198:20::2 18082 >/dev/null &
-        endpoint6_pid=$!
-        for _ in {1..30}; do
+        for attempt in {1..20}; do
           if tcp_connect_namespace "$endpoint_pid" 198.20.0.2 18082 \
-            && tcp_connect_namespace "$endpoint6_pid" fd42:198:20::2 18082; then
+            && tcp_connect_namespace "$endpoint_pid" 10.20.0.2 18082 \
+            && tcp_connect_namespace "$endpoint_pid" 10.20.0.3 18082 \
+            && tcp_connect_namespace "$endpoint_pid" fd42:198:20::2 18082 \
+            && tcp_connect_namespace "$endpoint_pid" fd42:198:20::3 18082 \
+            && tcp_connect_namespace "$endpoint_pid" 2001:db9::2 18082 \
+            && tcp_connect_namespace "$endpoint_pid" 10.20.0.2 18083 \
+            && tcp_connect_namespace "$endpoint_pid" 10.20.0.2 18086; then
+            if ! udp_probe_namespace "$endpoint_pid" 10.20.0.2 18082; then sleep 0.1; continue; fi
+            if ! udp_probe_namespace "$endpoint_pid" 10.20.0.2 18083; then sleep 0.1; continue; fi
+            if ! udp_probe_namespace "$endpoint_pid" 10.20.0.2 18086; then sleep 0.1; continue; fi
+            if ! udp_probe_namespace "$endpoint_pid" 10.20.0.3 18082; then sleep 0.1; continue; fi
+            if ! udp_probe_namespace "$endpoint_pid" fd42:198:20::2 18082; then sleep 0.1; continue; fi
+            if ! tcp_echo_probe_namespace "$endpoint_pid" 10.20.0.2 18090; then sleep 0.1; continue; fi
             echo "Controlled endpoint ready in hermes-vm-endpoint at 198.20.0.2 and fd42:198:20::2:18082"
             return 0
           fi
+          if (( attempt % 5 == 0 )); then echo "Waiting for controlled endpoint listeners (attempt $attempt/20)"; fi
           sleep 0.1
         done
         echo "Endpoint IPv4 listeners:" >&2
-        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :18082' >&2 || true
+        ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltunp >&2 || true
         echo "Endpoint IPv6 listeners:" >&2
         ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.iproute2 "ss"}" -6 -H -ltn 'sport = :18082' >&2 || true
+        ip -n hermes-vm-endpoint -6 address show >&2 || true
+        if kill -0 "$endpoint_pid" 2>/dev/null; then
+          echo "Endpoint probe server process still exists: $endpoint_pid" >&2
+        else
+          echo "Endpoint probe server exited: $endpoint_pid" >&2
+        fi
+        cat /run/hermes-vm-endpoint-probes.log >&2 || true
         echo "Controlled endpoint failed to listen" >&2
         return 1
       }
@@ -534,21 +697,61 @@ let
         output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket; print(*sorted({r[4][0] for r in socket.getaddrinfo("hermes-vm.test", None, socket.AF_INET6)}), sep="\\n")') || { echo "$unit service-identity AAAA lookup failed" >&2; return 1; }
         [[ "$output" == *fd42:198:20::2* ]] || { echo "$unit service-identity AAAA lookup was: $output" >&2; return 1; }
         run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --fail --silent --show-error --connect-timeout 2 --max-time 4 http://198.20.0.2:18082/ >/dev/null || return 1
-        run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --fail --silent --show-error --connect-timeout 2 --max-time 4 -g 'http://[fd42:198:20::2]:18082/' >/dev/null || return 1
-        for address in "$host_ip" "$host_other_ip"; do
-          if tcp_connect_service "$pid" "$address" 18083; then
-            echo "$unit unexpectedly reached host service at $address:18083" >&2
+        run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --fail --silent --show-error --connect-timeout 2 --max-time 4 -g 'http://[2001:db9::2]:18082/' >/dev/null || return 1
+        if [[ "$unit" == hermes@vm.service ]]; then
+          run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --fail --silent --show-error --connect-timeout 2 --max-time 4 http://10.20.0.2:18082/ >/dev/null || return 1
+          run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --ipv6 --fail --silent --show-error --connect-timeout 2 --max-time 4 -g 'http://[fd42:198:20::2]:18082/' >/dev/null || return 1
+          tcp_echo_probe_service "$pid" 10.20.0.2 18090 || { echo "$unit explicit TCP permission failed its response check" >&2; return 1; }
+          if tcp_connect_service "$pid" 10.20.0.3 18082 || tcp_connect_service "$pid" fd42:198:20::3 18082 || tcp_connect_service "$pid" 10.20.0.2 18083; then
+            echo "$unit reached an adjacent private address/port outside its exact permissions" >&2
             return 1
           fi
-          echo "Denied $unit -> $address:18083"
-        done
-        for address in "$host_ip6" fd42:198:20::1; do
-          if tcp_connect_service "$pid" "$address" 18083; then
-            echo "$unit unexpectedly reached host IPv6 service at [$address]:18083" >&2
+          udp_probe_service "$pid" 10.20.0.2 18086 || { echo "$unit UDP-only private permission failed its response check" >&2; return 1; }
+          if udp_probe_service "$pid" 10.20.0.2 18082 || udp_probe_service "$pid" fd42:198:20::2 18082 || tcp_connect_service "$pid" 10.20.0.2 18086 || udp_probe_service "$pid" 10.20.0.2 18083 || udp_probe_service "$pid" 10.20.0.3 18082; then
+            echo "$unit crossed a TCP-only/UDP-only protocol, adjacent-port, or address boundary" >&2
             return 1
           fi
-          echo "Denied $unit -> [$address]:18083"
-        done
+          for address in "$host_ip" "$host_ip6"; do
+            if [[ "$address" == *:* ]]; then
+              tcp_connect_service "$pid" "$address" 18083 || { echo "$unit could not use its default host-address permission at [$address]:18083" >&2; return 1; }
+              udp_probe_service "$pid" "$address" 18083 || { echo "$unit could not use its default host UDP permission at [$address]:18083" >&2; return 1; }
+            else
+              tcp_connect_service "$pid" "$address" 18083 || { echo "$unit could not use its default host-address permission at $address:18083" >&2; return 1; }
+              udp_probe_service "$pid" "$address" 18083 || { echo "$unit could not use its default host UDP permission at $address:18083" >&2; return 1; }
+            fi
+          done
+          for address in "$host_other_ip" fd42:198:20::1; do
+            if tcp_connect_service "$pid" "$address" 18083; then
+              echo "$unit unexpectedly reached non-veth host address $address:18083" >&2
+              return 1
+            fi
+            if udp_probe_service "$pid" "$address" 18083; then
+              echo "$unit unexpectedly reached non-veth host UDP address $address:18083" >&2
+              return 1
+            fi
+          done
+        else
+          for endpoint in "10.20.0.2:18082" "10.20.0.2:18090" "10.20.0.3:18082" "$host_ip:18082" "$host_other_ip:18082"; do
+            address="''${endpoint%:*}"
+            port="''${endpoint##*:}"
+            if tcp_connect_service "$pid" "$address" "$port"; then
+              echo "$unit unexpectedly reached private/host service at $address:$port" >&2
+              return 1
+            fi
+          done
+          for address in fd42:198:20::1 fd42:198:20::2 fd42:198:20::3 "$host_ip6"; do
+            if tcp_connect_service "$pid" "$address" 18082; then
+              echo "$unit unexpectedly reached private/host IPv6 service at [$address]:18082" >&2
+              return 1
+            fi
+          done
+          for address in 10.20.0.2 10.20.0.3 "$host_ip" "$host_other_ip" fd42:198:20::1 fd42:198:20::2 fd42:198:20::3 "$host_ip6"; do
+            if udp_probe_service "$pid" "$address" 18083 || udp_probe_service "$pid" "$address" 18082 || udp_probe_service "$pid" "$address" 18086; then
+              echo "$unit unexpectedly received UDP from private/host destination $address" >&2
+              return 1
+            fi
+          done
+        fi
         if tcp_connect_service "$pid" "$blocked_peer" 18084; then
           echo "$unit unexpectedly reached peer agent service at $blocked_peer:18084" >&2
           return 1
@@ -610,9 +813,124 @@ let
           echo "Dashboard mapping is missing or not restricted to host loopback: $listener" >&2
           return 1
         }
+        listener=$(ss -H -lun 'sport = :9119')
+        [[ "$listener" == *127.0.0.1:9119* && "$listener" != *0.0.0.0:9119* ]] || {
+          echo "Default both-protocol dashboard mapping has no host-loopback UDP proxy: $listener" >&2
+          return 1
+        }
         code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:9119/)
         [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || { echo "Dashboard mapping returned no HTTP response: $code" >&2; return 1; }
         echo "Dashboard responds through configured loopback mapping 127.0.0.1:9119 -> agent port 9119 (HTTP $code)"
+      }
+
+      check_port_mappings() {
+        local code listener port
+        for port in 18191 18193 18194 18195 18196; do
+          listener=$(ss -H -ltn "sport = :$port")
+          [[ "$listener" == *"127.0.0.1:$port"* && "$listener" != *"0.0.0.0:$port"* ]] || {
+            echo "TCP mapping $port is missing or not loopback-only: $listener" >&2
+            return 1
+          }
+        done
+        for port in 18192 18193 18194 18195 18197; do
+          listener=$(ss -H -lun "sport = :$port")
+          [[ "$listener" == *"127.0.0.1:$port"* && "$listener" != *"0.0.0.0:$port"* ]] || {
+            echo "UDP mapping $port is missing or not loopback-only: $listener" >&2
+            return 1
+          }
+        done
+        for port in 18191 18196; do
+          if ss -H -lun "sport = :$port" | grep -q .; then echo "TCP-only mapping unexpectedly opened UDP $port" >&2; return 1; fi
+        done
+        for port in 18192 18197; do
+          if ss -H -ltn "sport = :$port" | grep -q .; then echo "UDP-only mapping unexpectedly opened TCP $port" >&2; return 1; fi
+        done
+        tcp_connect_host 127.0.0.1 18191 || return 1
+        for port in 18193 18194 18195 18196; do
+          code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --fail --silent --show-error --max-time 4 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/") || return 1
+          [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || return 1
+        done
+        for port in 18192 18193 18194 18195 18197; do udp_probe 127.0.0.1 "$port" || { echo "Mapped UDP port $port did not return a response" >&2; return 1; }; done
+        echo "TCP-only, UDP-only, explicit-both/default-both veth and loopback mappings returned expected positive controls"
+      }
+
+      check_permission_revocation() {
+        local pid handle client_pid ready_file=/run/hermes-vm-revocation-client.log
+        pid=$(service_pid hermes@vm.service) || return 1
+        rm -f "$ready_file"
+        run_as_service net "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys,time;s=socket.create_connection(("10.20.0.2",18090),timeout=2);s.settimeout(2);s.sendall(b"first");assert s.recv(16)==b"first";print("ESTABLISHED",flush=True);time.sleep(4);s.sendall(b"second");assert s.recv(16)==b"second"' >"$ready_file" 2>&1 &
+        client_pid=$!
+        for _ in {1..50}; do
+          if grep -q ESTABLISHED "$ready_file"; then break; fi
+          if ! kill -0 "$client_pid" 2>/dev/null; then cat "$ready_file" >&2; echo "Private TCP positive control failed before revocation" >&2; return 1; fi
+          sleep 0.1
+        done
+        grep -q ESTABLISHED "$ready_file" || { echo "Private TCP session did not reach its positive-control state" >&2; return 1; }
+        handle=$(nft -a list chain inet hermes-agent-guard hermes_agent_forward_guard | awk '/daddr 10.20.0.2 tcp dport 18090 accept/ { print $NF; exit }')
+        [[ "$handle" =~ ^[0-9]+$ ]] || { echo "Could not find the declarative private TCP permission rule" >&2; return 1; }
+        nft delete rule inet hermes-agent-guard hermes_agent_forward_guard handle "$handle"
+        if wait "$client_pid"; then echo "Established private TCP session continued after its allow rule was revoked" >&2; return 1; fi
+        if tcp_echo_probe_service "$pid" 10.20.0.2 18090; then echo "New private TCP connection survived permission revocation" >&2; return 1; fi
+        echo "Revoked private permission blocked both an established flow's next packet and a new connection"
+        stop_peer_probes
+        timeout --kill-after=5s 30 systemctl restart nftables.service || { diagnose; return 1; }
+        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        wait_for_active || { diagnose; return 1; }
+        assert_distinct_namespaces || return 1
+        start_peer_probes hermes@vm.service 198.18.0.2 fd42:198:18::2 || return 1
+        start_peer_probes hermes@vm-peer.service 198.18.0.6 fd42:198:18:0:1::2 || return 1
+        pid=$(service_pid hermes@vm.service) || return 1
+        tcp_echo_probe_service "$pid" 10.20.0.2 18090 || { echo "Firewall restart did not restore declarative private permission" >&2; return 1; }
+        check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || return 1
+        check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || return 1
+        check_dashboard_mapping || return 1
+        check_port_mappings || return 1
+        echo "Firewall restart preserved host/private policy and TCP/UDP port mappings"
+      }
+
+      check_mapping_failure_cleanup() {
+        local collision_pid port state
+        echo "Testing partial TCP/UDP mapping startup cleanup after an occupied UDP host port"
+        stop_peer_probes
+        timeout --kill-after=5s 60 systemctl stop hermes@vm-peer.service || { diagnose; return 1; }
+        for _ in {1..100}; do
+          state=$(systemctl show --property=ActiveState --value hermes-network@vm-peer.service)
+          [[ "$state" == inactive || "$state" == failed ]] && break
+          sleep 0.1
+        done
+        [[ "$state" == inactive || "$state" == failed ]] || { echo "Peer network helper did not stop before collision test" >&2; return 1; }
+        "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",18192));time.sleep(600)' >/dev/null 2>&1 &
+        collision_pid=$!
+        for _ in {1..50}; do
+          if ss -H -lun 'sport = :18192' | grep -Fq '127.0.0.1:18192'; then break; fi
+          sleep 0.1
+        done
+        ss -H -lun 'sport = :18192' | grep -Fq '127.0.0.1:18192' || { kill "$collision_pid" 2>/dev/null || true; echo "Could not establish UDP mapping collision positive control" >&2; return 1; }
+        timeout 30s systemctl reset-failed hermes@vm-peer.service hermes-network@vm-peer.service
+        if timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service; then
+          kill "$collision_pid" 2>/dev/null || true
+          echo "Peer network helper started despite an occupied UDP mapping host port" >&2
+          return 1
+        fi
+        kill "$collision_pid" 2>/dev/null || true
+        wait "$collision_pid" 2>/dev/null || true
+        if ip link show dev ha1 >/dev/null 2>&1; then echo "Failed mapping setup left its peer veth" >&2; return 1; fi
+        for port in 18191 18192 18193 18194 18195 18196 18197; do
+          if ss -H -ltn "sport = :$port" | grep -q . || ss -H -lun "sport = :$port" | grep -q .; then
+            echo "Failed mapping setup left a host proxy on port $port" >&2
+            return 1
+          fi
+        done
+        if ip -4 route show table all | grep -Fq 198.18.0.4/30 || ip -6 route show table all | grep -Fq fd42:198:18:0:1::/80; then
+          echo "Failed mapping setup left a peer route" >&2
+          return 1
+        fi
+        timeout 30s systemctl reset-failed hermes@vm-peer.service hermes-network@vm-peer.service
+        timeout --kill-after=5s 180 systemctl start hermes@vm-peer.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        wait_for_active || { diagnose; return 1; }
+        start_peer_probes hermes@vm-peer.service 198.18.0.6 fd42:198:18:0:1::2 || return 1
+        check_port_mappings || return 1
+        echo "Partial mapping failure cleaned TCP proxies, UDP listeners, veth and routes; retry succeeded"
       }
 
       assert_network_resources_clean() {
@@ -661,6 +979,10 @@ let
           echo "Stale host dashboard mapping remains after stopping agent $iface" >&2
           return 1
         fi
+        if ss -H -lun 'sport = :9119' | grep -q .; then
+          echo "Stale host dashboard UDP mapping remains after stopping agent $iface" >&2
+          return 1
+        fi
         echo "No stale veth, route, or nftables table for $iface"
       }
 
@@ -698,10 +1020,18 @@ let
       echo "Agent network setup waited for the late host resolver fixture"
       echo "Host UDP/TCP DNS listeners:"
       ss -H -lunpt 'sport = :53'
-      "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("0.0.0.0",18083));s.listen(8);time.sleep(600)' >/dev/null 2>&1 &
+      echo "Starting positive-control host TCP/UDP listeners"
+      "${lib.getExe' pkgs.python3 "python3"}" ${vmNetworkProbeServer} host >/run/hermes-vm-host-probes.log 2>&1 &
       host_probe_pid=$!
-      "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,time;s=socket.socket(socket.AF_INET6);s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1);s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("::",18083));s.listen(8);time.sleep(600)' >/dev/null 2>&1 &
-      host_probe6_pid=$!
+      for _ in {1..30}; do
+        if ss -H -ltn 'sport = :18083' | grep -q . && ss -H -lun 'sport = :18083' | grep -q .; then break; fi
+        sleep 0.1
+      done
+      ss -H -ltn 'sport = :18083' || { cat /run/hermes-vm-host-probes.log >&2; diagnose; exit 1; }
+      ss -H -lun 'sport = :18083' || { cat /run/hermes-vm-host-probes.log >&2; diagnose; exit 1; }
+      udp_probe 127.0.0.1 18083 || { echo "Host UDP echo positive control failed on loopback" >&2; cat /run/hermes-vm-host-probes.log >&2; diagnose; exit 1; }
+      echo "Host TCP/UDP listeners passed loopback positive controls"
+      echo "Starting peer TCP/UDP listeners"
       start_peer_probes hermes@vm.service 198.18.0.2 fd42:198:18::2 || { diagnose; exit 1; }
       start_peer_probes hermes@vm-peer.service 198.18.0.6 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       for address in 198.18.0.1 198.18.0.5 "$host_other_ip"; do
@@ -717,6 +1047,9 @@ let
       check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
       check_dashboard_mapping || { diagnose; exit 1; }
+      check_port_mappings || { diagnose; exit 1; }
+      check_permission_revocation || { diagnose; exit 1; }
+      check_mapping_failure_cleanup || { diagnose; exit 1; }
       check_public_state_network hermes-pf@vm.service || { diagnose; exit 1; }
       check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       stop_peer_probes
@@ -746,6 +1079,7 @@ let
       start_peer_probes hermes@vm.service 198.18.0.2 fd42:198:18::2 || { diagnose; exit 1; }
       start_peer_probes hermes@vm-peer.service 198.18.0.6 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
+      check_port_mappings || { diagnose; exit 1; }
       check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       echo "Restarting vm agent"
       stop_peer_probes
@@ -760,6 +1094,7 @@ let
       check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
       check_dashboard_mapping || { diagnose; exit 1; }
+      check_port_mappings || { diagnose; exit 1; }
       check_public_state_network hermes-pf@vm.service || { diagnose; exit 1; }
       check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
 
@@ -823,6 +1158,29 @@ in
       fullName = "hermes-vm";
       headroomEnable = false;
       headroomPort = 18080;
+      networkAllow = [
+        {
+          address = "10.20.0.2";
+          port = 18082;
+          protocol = "tcp";
+        }
+        {
+          address = "fd42:198:20::2";
+          port = 18082;
+          protocol = "tcp";
+        }
+        {
+          address = "10.20.0.2";
+          port = 18090;
+          protocol = "tcp";
+        }
+        {
+          address = "10.20.0.2";
+          port = 18086;
+          protocol = "udp";
+        }
+        { }
+      ];
       settings.kanban.default_assignee = "hermes-vm";
     };
     agents.vm-peer = {
@@ -830,6 +1188,50 @@ in
       fullName = "hermes-vm-peer";
       headroomEnable = false;
       headroomPort = 18081;
+      portMappings = [
+        {
+          hostPort = 18191;
+          agentPort = 18084;
+          protocol = "tcp";
+        }
+        {
+          hostPort = 18192;
+          agentPort = 18086;
+          protocol = "udp";
+        }
+        {
+          hostPort = 18193;
+          agentPort = 18087;
+          target = "loopback";
+        }
+        {
+          hostPort = 18195;
+          agentPort = 18088;
+          protocol = "both";
+        }
+        {
+          hostPort = 18194;
+          agentPort = 18090;
+          protocol = "tcp";
+        }
+        {
+          hostPort = 18194;
+          agentPort = 18090;
+          protocol = "udp";
+        }
+        {
+          hostPort = 18196;
+          agentPort = 18089;
+          protocol = "tcp";
+          target = "loopback";
+        }
+        {
+          hostPort = 18197;
+          agentPort = 18089;
+          protocol = "udp";
+          target = "loopback";
+        }
+      ];
     };
     installDefaultSkills = false;
   };
@@ -917,7 +1319,7 @@ in
       StandardError = "journal+console";
       StandardOutput = "journal+console";
       # Gateway restarts recreate one mount per closure path in the 1-GiB guest.
-      TimeoutStartSec = "900s";
+      TimeoutStartSec = "1200s";
       Type = "oneshot";
     };
   };

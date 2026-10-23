@@ -71,7 +71,7 @@ let
         portMappings = mkOption {
           default = null;
           description = ''
-            TCP ports forwarded from host loopback to this agent's network namespace.
+            TCP/UDP ports forwarded from host loopback to this agent's network namespace.
             Null uses the main-agent dashboard default (127.0.0.1:9119 -> 9119);
             an explicit empty list disables mappings.
           '';
@@ -82,6 +82,15 @@ let
                 options = {
                   agentPort = mkOption { type = types.port; };
                   hostPort = mkOption { type = types.port; };
+                  protocol = mkOption {
+                    default = "both";
+                    description = "Transport to forward; both TCP and UDP by default.";
+                    type = types.enum [
+                      "tcp"
+                      "udp"
+                      "both"
+                    ];
+                  };
                   target = mkOption {
                     default = "veth";
                     description = "Where to connect inside the namespace: a veth-bound listener, or its loopback interface.";
@@ -93,6 +102,40 @@ let
                 };
               }
             )
+          );
+        };
+        networkAllow = mkOption {
+          default = [ ];
+          description = ''
+            Per-agent permissions for a single host or private destination address.
+            Each entry may set protocol (TCP and UDP by default), address (the
+            agent's host-side IPv4 and IPv6 addresses by default), and port (any
+            port by default). Addresses must be literal IPv4 or IPv6 addresses.
+          '';
+          example = literalExpression ''
+            [ { address = "10.20.0.2"; port = 443; protocol = "tcp"; } ]
+          '';
+          type = types.listOf (
+            types.submodule {
+              options = {
+                address = mkOption {
+                  default = null;
+                  type = types.nullOr types.str;
+                };
+                port = mkOption {
+                  default = null;
+                  type = types.nullOr (types.addCheck types.port (port: port > 0));
+                };
+                protocol = mkOption {
+                  default = "both";
+                  type = types.enum [
+                    "tcp"
+                    "udp"
+                    "both"
+                  ];
+                };
+              };
+            }
           );
         };
         settings = mkOption {
@@ -286,25 +329,140 @@ let
     '';
   };
 
-  activePortMappings =
-    if cfg.enable then
-      lib.concatMap (
-        name:
+  isIPv4Address =
+    address:
+    let
+      octets = lib.splitString "." address;
+      validOctet =
+        octet:
         let
-          configured = cfg.agents.${name}.portMappings;
+          matched = builtins.match "^(0|[1-9][0-9]{0,2})$" octet;
         in
-        if configured == null then
-          optional (cfg.mainAgent == name) {
-            hostPort = 9119;
-            agentPort = 9119;
-            target = "loopback";
-          }
-        else
-          configured
-      ) activeAgentNames
+        matched != null && builtins.fromJSON octet <= 255;
+    in
+    builtins.length octets == 4 && builtins.all validOctet octets;
+  isIP =
+    address:
+    isIPv4Address address
+    || (
+      lib.hasInfix ":" address
+      && !lib.hasInfix "/" address
+      && (builtins.tryEval (
+        let
+          parsed = lib.network.ipv6.fromString address;
+        in
+        parsed.prefixLength == 128 && builtins.stringLength parsed.address > 0
+      )).value
+    );
+  # shortcut: curated special-use prefixes, not every IANA allocation; update before tightening public-like egress policy.
+  privateIPv4 = "0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.31.196.0/24, 192.52.193.0/24, 192.88.99.0/24, 192.168.0.0/16, 192.175.48.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4";
+  privateIPv6 = "::/96, ::ffff:0:0/96, 64:ff9b:1::/48, 100::/64, 100:0:0:1::/64, 2001::/32, 2001:2::/48, 2001:10::/28, 2001:db8::/32, 2002::/16, 3fff::/20, 5f00::/16, fc00::/7, fe80::/10, ff00::/8";
+  permissionAddresses =
+    network: permission:
+    if permission.address == null then
+      [
+        network.hostIp
+        network.hostIpv6
+      ]
     else
-      [ ];
+      [ permission.address ];
+  protocolsFor =
+    protocol:
+    if protocol == "both" then
+      [
+        "tcp"
+        "udp"
+      ]
+    else
+      [ protocol ];
+  permissionRules =
+    network: permissions:
+    concatStringsSep "\n" (
+      lib.concatMap (
+        permission:
+        lib.concatMap (
+          address:
+          map (
+            protocol:
+            ''iifname "${network.hostIf}" ${
+              if isIPv4Address address then
+                "ip saddr ${network.agentIp} ip daddr"
+              else
+                "ip6 saddr ${network.agentIpv6} ip6 daddr"
+            } ${address} ${
+              if permission.port == null then
+                "meta l4proto ${protocol}"
+              else
+                "${protocol} dport ${toString permission.port}"
+            } accept''
+          ) (protocolsFor permission.protocol)
+        ) (permissionAddresses network permission)
+      ) permissions
+    );
+  permissionReplyRules =
+    network: permissions:
+    concatStringsSep "\n" (
+      lib.concatMap (
+        permission:
+        lib.concatMap (
+          address:
+          map (
+            protocol:
+            ''oifname "${network.hostIf}" ${
+              if isIPv4Address address then
+                "ip daddr ${network.agentIp} ip saddr"
+              else
+                "ip6 daddr ${network.agentIpv6} ip6 saddr"
+            } ${address} ${
+              if permission.port == null then
+                "meta l4proto ${protocol}"
+              else
+                "${protocol} sport ${toString permission.port}"
+            } ct state established accept''
+          ) (protocolsFor permission.protocol)
+        ) (permissionAddresses network permission)
+      ) permissions
+    );
+  mappingProtocols = mapping: protocolsFor (mapping.protocol or "both");
+  expandMappings =
+    mappings:
+    lib.concatMap (
+      mapping: map (protocol: mapping // { inherit protocol; }) (mappingProtocols mapping)
+    ) mappings;
+  portMappingsForAgent =
+    name:
+    let
+      configured = cfg.agents.${name}.portMappings;
+    in
+    if configured == null then
+      optional (cfg.mainAgent == name) {
+        hostPort = 9119;
+        agentPort = 9119;
+        protocol = "both";
+        target = "loopback";
+      }
+    else
+      configured;
+  mappingReplyRules =
+    network: mappings:
+    concatStringsSep "\n" (
+      lib.concatMap (
+        mapping:
+        map (
+          protocol:
+          ''iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} ${protocol} sport ${toString mapping.agentPort} ct state established accept''
+        ) (mappingProtocols mapping)
+      ) mappings
+    );
+  activePortMappings =
+    if cfg.enable then lib.concatMap portMappingsForAgent activeAgentNames else [ ];
   mappedHostPorts = map (mapping: mapping.hostPort) activePortMappings;
+  mappedHostReservations = lib.concatMap (
+    mapping: map (protocol: "${protocol}:${toString mapping.hostPort}") (mappingProtocols mapping)
+  ) activePortMappings;
+  configuredNetworkPermissions = lib.concatMap (name: cfg.agents.${name}.networkAllow) (
+    builtins.attrNames cfg.agents
+  );
   agentNetworks = builtins.listToAttrs (
     lib.imap0 (
       index: name:
@@ -327,7 +485,7 @@ let
       {
         inherit name;
         value = {
-          inherit index network;
+          inherit index name network;
           hostIf = "ha${toString index}";
           peerIf = "hb${toString index}";
           hostIp = "198.${toString octet2}.${toString octet3}.${toString (octet4 + 1)}";
@@ -347,18 +505,26 @@ let
       iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
       iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
       iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
+      ${permissionRules network cfg.agents.${network.name}.networkAllow}
     '') (builtins.attrValues agentNetworks)
   );
   agentInputGuardRules = concatStringsSep "\n" (
-    map (network: ''
-      iifname "${network.hostIf}" ct state established,related accept
-      iifname "${network.hostIf}" meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} udp dport 53 accept
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
-      iifname "${network.hostIf}" drop
-    '') (builtins.attrValues agentNetworks)
+    map (
+      network:
+      let
+        mappings = portMappingsForAgent network.name;
+      in
+      ''
+        iifname "${network.hostIf}" ip6 saddr { ${network.agentIpv6}, fe80::/10 } meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
+        iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} udp dport 53 accept
+        iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
+        iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
+        iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
+        ${mappingReplyRules network mappings}
+        ${permissionRules network cfg.agents.${network.name}.networkAllow}
+        iifname "${network.hostIf}" drop
+      ''
+    ) (builtins.attrValues agentNetworks)
   );
   agentForwardGuardRules = concatStringsSep "\n" (
     map (
@@ -373,11 +539,19 @@ let
             iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${other.ipv6Subnet} drop
           '') otherNetworks
         );
+        permissions = cfg.agents.${network.name}.networkAllow;
       in
       ''
         ${peerDrops}
         iifname "${network.hostIf}" ip saddr != ${network.agentIp} drop
         iifname "${network.hostIf}" ip6 saddr != ${network.agentIpv6} drop
+        ${permissionRules network permissions}
+        iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr { ${privateIPv4} } drop
+        iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr { ${privateIPv6} } drop
+        ${permissionReplyRules network permissions}
+        oifname "${network.hostIf}" meta l4proto ipv6-icmp ct state related accept
+        oifname "${network.hostIf}" ip daddr ${network.agentIp} ip saddr { ${privateIPv4} } drop
+        oifname "${network.hostIf}" ip6 daddr ${network.agentIpv6} ip6 saddr { ${privateIPv6} } drop
         oifname "${network.hostIf}" ip daddr ${network.agentIp} ct state established,related accept
         oifname "${network.hostIf}" ip6 daddr ${network.agentIpv6} ct state established,related accept
         oifname "${network.hostIf}" ip daddr ${network.agentIp} drop
@@ -394,54 +568,78 @@ let
   mkAgentNetworkSetup =
     name: network: portMappings:
     let
-      loopbackPorts = lib.unique (
-        map (mapping: mapping.agentPort) (
-          builtins.filter (mapping: mapping.target == "loopback") portMappings
-        )
+      loopbackMappings = lib.unique (
+        lib.concatMap (
+          mapping:
+          map (protocol: {
+            inherit protocol;
+            inherit (mapping) agentPort;
+          }) (mappingProtocols mapping)
+        ) (builtins.filter (mapping: mapping.target == "loopback") portMappings)
       );
       namespaceRelayCommands = concatStringsSep "\n" (
-        map (agentPort: ''
-          ${lib.getExe' pkgs.util-linux "setpriv"} --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
-            ${lib.getExe' pkgs.socat "socat"} \
-            TCP4-LISTEN:${toString agentPort},bind=${network.agentIp},reuseaddr,fork \
-            TCP4:127.0.0.1:${toString agentPort} >/dev/null 2>&1 &
-          relay_pid=$!
-          relay_pids+=("$relay_pid")
-          for _ in {1..50}; do
-            if ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn "sport = :${toString agentPort}" | grep -Fq "${network.agentIp}:${toString agentPort}"; then break; fi
-            sleep 0.1
-          done
-          ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn "sport = :${toString agentPort}" | grep -Fq "${network.agentIp}:${toString agentPort}" || {
-            echo "Loopback relay failed to bind namespace port ${toString agentPort}" >&2
-            exit 1
-          }
-        '') loopbackPorts
+        map (
+          mapping:
+          let
+            checkFlags = if mapping.protocol == "tcp" then "-ltn" else "-lun";
+            relay =
+              if mapping.protocol == "tcp" then
+                "TCP4-LISTEN:${toString mapping.agentPort},bind=${network.agentIp},reuseaddr,fork TCP4:127.0.0.1:${toString mapping.agentPort}"
+              else
+                "UDP4-RECVFROM:${toString mapping.agentPort},bind=${network.agentIp},fork UDP4-SENDTO:127.0.0.1:${toString mapping.agentPort}";
+          in
+          ''
+            ${lib.getExe' pkgs.util-linux "setpriv"} --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
+              ${lib.getExe' pkgs.socat "socat"} \
+              ${relay} >/dev/null 2>&1 &
+            relay_pid=$!
+            relay_pids+=("$relay_pid")
+            for _ in {1..50}; do
+              if ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "${network.agentIp}:${toString mapping.agentPort}"; then break; fi
+              sleep 0.1
+            done
+            ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "${network.agentIp}:${toString mapping.agentPort}" || {
+              echo "${mapping.protocol} loopback relay failed to bind namespace port ${toString mapping.agentPort}" >&2
+              exit 1
+            }
+          ''
+        ) loopbackMappings
       );
       hostForwardCommands = concatStringsSep "\n" (
-        map (mapping: ''
-          if host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn "sport = :${toString mapping.hostPort}" | grep -q .; then
-            echo "Host loopback port ${toString mapping.hostPort} is already in use" >&2
-            exit 1
-          fi
-          ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.util-linux "setpriv"} \
-            --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
-            ${lib.getExe' pkgs.socat "socat"} \
-            TCP4-LISTEN:${toString mapping.hostPort},bind=127.0.0.1,reuseaddr,fork \
-            TCP4:${network.agentIp}:${toString mapping.agentPort} >/dev/null &
-          proxy_pid=$!
-          proxy_pids+=("$proxy_pid")
-          for _ in {1..50}; do
-            if host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}"; then
-              echo "Forwarding host 127.0.0.1:${toString mapping.hostPort} to hermes@${name} port ${toString mapping.agentPort}"
-              break
+        map (
+          mapping:
+          let
+            checkFlags = if mapping.protocol == "tcp" then "-ltn" else "-lun";
+            proxy =
+              if mapping.protocol == "tcp" then
+                "TCP4-LISTEN:${toString mapping.hostPort},bind=127.0.0.1,reuseaddr,fork TCP4:${network.agentIp}:${toString mapping.agentPort}"
+              else
+                "UDP4-RECVFROM:${toString mapping.hostPort},bind=127.0.0.1,fork UDP4-SENDTO:${network.agentIp}:${toString mapping.agentPort}";
+          in
+          ''
+            if host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -q .; then
+              echo "Host loopback port ${toString mapping.hostPort} is already in use" >&2
+              exit 1
             fi
-            sleep 0.1
-          done
-          host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}" || {
-            echo "Host loopback forwarding proxy failed to bind port ${toString mapping.hostPort}" >&2
-            exit 1
-          }
-        '') portMappings
+            ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.util-linux "setpriv"} \
+              --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
+              ${lib.getExe' pkgs.socat "socat"} \
+              ${proxy} >/dev/null &
+            proxy_pid=$!
+            proxy_pids+=("$proxy_pid")
+            for _ in {1..50}; do
+              if host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}"; then
+                echo "Forwarding host 127.0.0.1:${toString mapping.hostPort} (${mapping.protocol}) to hermes@${name} port ${toString mapping.agentPort}"
+                break
+              fi
+              sleep 0.1
+            done
+            host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}" || {
+              echo "Host loopback ${mapping.protocol} forwarding proxy failed to bind port ${toString mapping.hostPort}" >&2
+              exit 1
+            }
+          ''
+        ) (expandMappings portMappings)
       );
     in
     pkgs.writeShellApplication {
@@ -499,7 +697,7 @@ let
                   exit 0
                 fi
                 [[ "''${1:-setup}" == setup ]] || { echo "usage: $0 [setup|cleanup]" >&2; exit 2; }
-                trap cleanup ERR INT TERM
+                trap cleanup ERR INT TERM EXIT
 
                 if host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$host_if" >/dev/null 2>&1 \
                   || host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$peer_if" >/dev/null 2>&1; then
@@ -573,7 +771,7 @@ let
                 (( dns_ready )) || { echo "DNS forwarder did not bind $host_ip/$host_ip6:53" >&2; exit 1; }
                 ${namespaceRelayCommands}
                 ${hostForwardCommands}
-                trap - ERR INT TERM
+                trap - ERR INT TERM EXIT
                 echo "Configured $host_if <-> $peer_if for hermes@${name}: $agent_ip/$agent_ip6 via $host_ip/$host_ip6; DNS upstreams: ''${dns_upstreams[*]}"
       '';
     };
@@ -602,15 +800,7 @@ let
       agentStatePath = "%S/${agentStateId}";
       hermesAgentStatePath = "${agentStatePath}/.hermes";
       agentNetwork = agentNetworks.${name};
-      portMappings =
-        if agentCfg.portMappings == null then
-          optional (cfg.mainAgent == name) {
-            hostPort = 9119;
-            agentPort = 9119;
-            target = "loopback";
-          }
-        else
-          agentCfg.portMappings;
+      portMappings = portMappingsForAgent name;
       networkSetup = mkAgentNetworkSetup name agentNetwork portMappings;
       resolvConf = pkgs.writeText "${agentStateId}-resolv.conf" "nameserver ${agentNetwork.hostIp}\nnameserver ${agentNetwork.hostIpv6}\noptions attempts:1 timeout:2\n";
       agentConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
@@ -1267,12 +1457,19 @@ in
         message = "services.hermes-agent: the host firewall must be enabled to enforce per-agent network isolation";
       }
       {
-        assertion = builtins.length mappedHostPorts == builtins.length (lib.unique mappedHostPorts);
-        message = "services.hermes-agent: each host port mapping must use a unique host port";
+        assertion =
+          builtins.length mappedHostReservations == builtins.length (lib.unique mappedHostReservations);
+        message = "services.hermes-agent: host port mappings may not reserve the same protocol and host port twice";
       }
       {
         assertion = builtins.all (port: port > 1024) mappedHostPorts;
         message = "services.hermes-agent: host port mappings must use unprivileged ports above 1024";
+      }
+      {
+        assertion = builtins.all (
+          permission: (permission.address == null || isIP permission.address)
+        ) configuredNetworkPermissions;
+        message = "services.hermes-agent: network permission addresses must be literal IPv4 or IPv6 addresses";
       }
     ];
 
