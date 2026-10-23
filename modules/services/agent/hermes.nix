@@ -443,17 +443,7 @@ let
       }
     else
       configured;
-  mappingReplyRules =
-    network: mappings:
-    concatStringsSep "\n" (
-      lib.concatMap (
-        mapping:
-        map (
-          protocol:
-          ''iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} ${protocol} sport ${toString mapping.agentPort} ct state established accept''
-        ) (mappingProtocols mapping)
-      ) mappings
-    );
+
   activePortMappings =
     if cfg.enable then lib.concatMap portMappingsForAgent activeAgentNames else [ ];
   mappedHostPorts = map (mapping: mapping.hostPort) activePortMappings;
@@ -509,22 +499,17 @@ let
     '') (builtins.attrValues agentNetworks)
   );
   agentInputGuardRules = concatStringsSep "\n" (
-    map (
-      network:
-      let
-        mappings = portMappingsForAgent network.name;
-      in
-      ''
-        iifname "${network.hostIf}" ip6 saddr { ${network.agentIpv6}, fe80::/10 } meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
-        iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} udp dport 53 accept
-        iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
-        iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
-        iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
-        ${mappingReplyRules network mappings}
-        ${permissionRules network cfg.agents.${network.name}.networkAllow}
-        iifname "${network.hostIf}" drop
-      ''
-    ) (builtins.attrValues agentNetworks)
+    map (network: ''
+      iifname "${network.hostIf}" ip6 saddr { ${network.agentIpv6}, fe80::/10 } meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
+      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} udp dport 53 accept
+      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
+      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
+      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
+      iifname "${network.hostIf}" ip saddr ${network.agentIp} ct direction reply ct state established accept
+      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ct direction reply ct state established accept
+      ${permissionRules network cfg.agents.${network.name}.networkAllow}
+      iifname "${network.hostIf}" drop
+    '') (builtins.attrValues agentNetworks)
   );
   agentForwardGuardRules = concatStringsSep "\n" (
     map (
@@ -691,13 +676,22 @@ let
                     host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
                   fi
                 }
+                setup_error() {
+                  local status=$?
+                  trap - ERR EXIT
+                  cleanup
+                  exit "$status"
+                }
 
                 if [[ "''${1:-setup}" == cleanup ]]; then
                   cleanup
                   exit 0
                 fi
                 [[ "''${1:-setup}" == setup ]] || { echo "usage: $0 [setup|cleanup]" >&2; exit 2; }
-                trap cleanup ERR INT TERM EXIT
+                trap cleanup EXIT
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
+                trap setup_error ERR
 
                 if host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$host_if" >/dev/null 2>&1 \
                   || host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$peer_if" >/dev/null 2>&1; then

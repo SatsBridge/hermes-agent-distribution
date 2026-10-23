@@ -185,6 +185,60 @@
                     )
                   ];
                 };
+                assertionCheckFails =
+                  probe:
+                  let
+                    result = builtins.tryEval (builtins.all (assertion: assertion.assertion) probe.config.assertions);
+                  in
+                  !result.success || !result.value;
+                duplicateMappingProbe = hermesModuleVm.extendModules {
+                  modules = [
+                    {
+                      services.hermes-specialised-agent.agents.vm-peer.portMappings = [
+                        {
+                          hostPort = 18194;
+                          agentPort = 18090;
+                          protocol = "tcp";
+                        }
+                      ];
+                    }
+                  ];
+                };
+                dashboardMappingCollisionProbe = hermesModuleVm.extendModules {
+                  modules = [
+                    {
+                      services.hermes-specialised-agent.agents.vm-peer.portMappings = [
+                        {
+                          hostPort = 9119;
+                          agentPort = 18199;
+                          protocol = "udp";
+                        }
+                      ];
+                    }
+                  ];
+                };
+                invalidAddressProbe = hermesModuleVm.extendModules {
+                  modules = [
+                    {
+                      services.hermes-specialised-agent.agents.vm.networkAllow = [
+                        { address = "10.0.0.1/24"; }
+                      ];
+                    }
+                  ];
+                };
+                invalidProtocolProbe = hermesModuleVm.extendModules {
+                  modules = [
+                    {
+                      services.hermes-specialised-agent.agents.vm-peer.portMappings = [
+                        {
+                          hostPort = 18199;
+                          agentPort = 18199;
+                          protocol = "sctp";
+                        }
+                      ];
+                    }
+                  ];
+                };
                 closureProbeUnits = closureProbe.config.systemd.services;
                 closureProbeBinds = name: closureProbeUnits.${name}.serviceConfig.BindReadOnlyPaths or [ ];
                 hasJobScripts =
@@ -240,7 +294,14 @@
                   && (nixpkgs-unstable.lib.hasInfix "BindReadOnlyPaths=/nix/store/" unitFiles.${name}.text);
               in
               if
-                agent.enable
+                assertionCheckFails duplicateMappingProbe
+                && assertionCheckFails dashboardMappingCollisionProbe
+                && assertionCheckFails invalidAddressProbe
+                && assertionCheckFails invalidProtocolProbe
+                &&
+                  nixpkgs-unstable.lib.hasInfix "ct direction reply"
+                    hermesModuleVm.config.networking.nftables.tables."hermes-agent-guard".content
+                && agent.enable
                 && agent.mainAgent == "vm"
                 && !agent.installDefaultSkills
                 && agent.agents.vm.enable

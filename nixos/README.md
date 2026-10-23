@@ -40,9 +40,11 @@ agent veths use `haN`/`hbN` interfaces, IPv4 subnets from `198.18.0.0/15`, and
 per-agent ULA IPv6 `/80`s under `fd42:198:18::/48`. Startup fails on overlapping
 host addresses/routes. The host resolver is proxied on each veth's host-side
 addresses; TCP/UDP port 53 to those addresses and required IPv6 neighbor/error
-control, plus established replies on configured mapping ports, remain narrow
-exceptions. Explicit `networkAllow` rules permit only
-their declared host/private tuples; all other new host connections are dropped.
+control, plus established conntrack replies to host-initiated connections, remain
+narrow exceptions. Only `ct direction reply` is accepted, so an agent-originated
+established connection cannot use a mapped source port to bypass a revoked
+permission. Explicit `networkAllow` rules permit only their declared host/private
+tuples; all other new host connections are dropped.
 Each agent also drops forwarded destinations in IPv4 private/shared/link-local,
 loopback, documentation, benchmarking, multicast and reserved ranges, and IPv6
 ULA, link-local, loopback, documentation, multicast and special-purpose ranges.
