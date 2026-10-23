@@ -100,6 +100,14 @@
                       { pkgs, ... }:
                       let
                         directExecProbe = pkgs.writeShellScriptBin "hermes-direct-exec-probe" "exit 0";
+                        gatewayResource = pkgs.writeText "hermes-gateway-exec-resource" "resource\n";
+                        gatewayQuotedResource = pkgs.writeText "hermes-gateway-quoted-exec-resource" "quoted\n";
+                        networkResource = pkgs.writeText "hermes-network-exec-resource" "resource\n";
+                        networkQuotedResource = pkgs.writeText "hermes-network-quoted-exec-resource" "quoted\n";
+                        publicStateResource = pkgs.writeText "hermes-public-state-exec-resource" "resource\n";
+                        publicStateQuotedResource = pkgs.writeText "hermes-public-state-quoted-exec-resource" "quoted\n";
+                        discardedGatewayResource = pkgs.writeText "hermes-discarded-gateway-exec-resource" "discarded\n";
+                        discardedNetworkResource = pkgs.writeText "hermes-discarded-network-exec-resource" "discarded\n";
                       in
                       {
                         systemd.services."hermes@vm".preStart = "${pkgs.hello}/bin/hello";
@@ -117,6 +125,17 @@
                         systemd.services."hermes-pf@vm".serviceConfig.ExecStartPre =
                           "${directExecProbe}/bin/hermes-direct-exec-probe";
                         systemd.services."hermes-network@vm".serviceConfig.ExecReload = "${pkgs.figlet}/bin/figlet";
+                        systemd.services."hermes@vm".serviceConfig.ExecReloadPost = [
+                          "${pkgs.coreutils}/bin/cat ${gatewayResource} -- \"${gatewayQuotedResource}\""
+                        ];
+                        systemd.services."hermes-network@vm".serviceConfig.ExecReloadPost = [
+                          "${pkgs.coreutils}/bin/cat ${networkResource} -- \"${networkQuotedResource}\""
+                        ];
+                        systemd.services."hermes-pf@vm".serviceConfig.ExecReloadPost = [
+                          "${pkgs.coreutils}/bin/cat ${publicStateResource} -- \"${publicStateQuotedResource}\""
+                        ];
+                        systemd.services."hermes@".serviceConfig.ExecReload = "${discardedGatewayResource}";
+                        systemd.services."hermes-network@".serviceConfig.ExecStop = "${discardedNetworkResource}";
                       }
                     )
                     (
@@ -147,6 +166,23 @@
                         };
                       }
                     )
+                    (
+                      { lib, pkgs, ... }:
+                      {
+                        systemd.services."hermes@".serviceConfig = lib.mkForce (
+                          hermesModuleVm.config.systemd.services."hermes@".serviceConfig
+                          // {
+                            ExecStartPost = "${pkgs.coreutils}/bin/true";
+                          }
+                        );
+                        systemd.services."hermes-network@".serviceConfig = lib.mkForce (
+                          hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig
+                          // {
+                            ExecStartPost = "${pkgs.coreutils}/bin/true";
+                          }
+                        );
+                      }
+                    )
                   ];
                 };
                 closureProbeUnits = closureProbe.config.systemd.services;
@@ -170,12 +206,22 @@
                 effectiveCondition = closureProbeUnits."hermes@vm".serviceConfig.ExecCondition;
                 effectivePfStopPost = closureProbeUnits."hermes-pf@vm".serviceConfig.ExecStopPost;
                 effectiveTemplateExecPost = closureProbeUnits."hermes-network@".serviceConfig.ExecStartPost;
+                effectiveGatewayReload = closureProbeUnits."hermes@".serviceConfig.ExecReload or null;
+                effectiveNetworkStop = closureProbeUnits."hermes-network@".serviceConfig.ExecStop or null;
                 effectivePeerExec = closureProbeUnits."hermes-network@vm-peer".serviceConfig.ExecStartPost;
                 disabledPeerExec = closureProbeUnits."hermes-pf@vm-peer".serviceConfig;
                 directExec = closureProbeUnits."hermes@vm".serviceConfig.ExecStartPost;
                 gatewayTemplateScript = builtins.head closureProbeUnits."hermes@".jobScripts;
                 networkTemplateScript = builtins.head closureProbeUnits."hermes-network@".jobScripts;
                 publicStateTemplateScript = builtins.head closureProbeUnits."hermes-pf@".jobScripts;
+                gatewayResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-gateway-exec-resource" "resource\n";
+                gatewayQuotedResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-gateway-quoted-exec-resource" "quoted\n";
+                networkResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-network-exec-resource" "resource\n";
+                networkQuotedResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-network-quoted-exec-resource" "quoted\n";
+                publicStateResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-public-state-exec-resource" "resource\n";
+                publicStateQuotedResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-public-state-quoted-exec-resource" "quoted\n";
+                discardedGatewayResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-gateway-exec-resource" "discarded\n";
+                discardedNetworkResource = nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-network-exec-resource" "discarded\n";
                 hasSandbox =
                   name: template:
                   let
@@ -230,6 +276,11 @@
                 && hasTemplateJobScripts "hermes@vm" "hermes@"
                 && hasStoreRoot directExec (closureProbeBinds "hermes@vm")
                 && !(hasStoreRoot directExec (closureProbeBinds "hermes@vm-peer"))
+                && hasStoreRoot gatewayResource (closureProbeBinds "hermes@vm")
+                && hasStoreRoot gatewayQuotedResource (closureProbeBinds "hermes@vm")
+                && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes@vm-peer"))
+                && !(hasStoreRoot networkResource (closureProbeBinds "hermes@vm"))
+                && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes@vm"))
                 && !(hasStoreRoot gatewayTemplateScript (
                   closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
                 ))
@@ -238,6 +289,11 @@
                 && hasTemplateJobScripts "hermes-network@vm" "hermes-network@"
                 && hasStoreRoot directExec (closureProbeBinds "hermes-network@vm")
                 && !(hasStoreRoot directExec (closureProbeBinds "hermes-network@vm-peer"))
+                && hasStoreRoot networkResource (closureProbeBinds "hermes-network@vm")
+                && hasStoreRoot networkQuotedResource (closureProbeBinds "hermes-network@vm")
+                && !(hasStoreRoot networkResource (closureProbeBinds "hermes-network@vm-peer"))
+                && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes-network@vm"))
+                && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes-network@vm"))
                 && !(hasStoreRoot networkTemplateScript (closureProbeBinds "hermes-pf@"))
                 && hasStoreRoot hello (closureProbeBinds "hermes-pf@vm")
                 && hasJobScripts "hermes-pf@vm"
@@ -245,6 +301,11 @@
                 && hasStoreRoot hello (closureProbeBinds "hermes-pf@")
                 && hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm")
                 && !(hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm-peer"))
+                && hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm")
+                && hasStoreRoot publicStateQuotedResource (closureProbeBinds "hermes-pf@vm")
+                && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm-peer"))
+                && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes-pf@vm"))
+                && !(hasStoreRoot networkResource (closureProbeBinds "hermes-pf@vm"))
                 && hasStoreRoot figlet (closureProbeBinds "hermes@vm")
                 && effectiveCondition == figlet
                 && builtins.elem cowsay effectiveReloadPost
@@ -259,6 +320,20 @@
                 && hasStoreRoot effectiveTemplateExecPost (closureProbeBinds "hermes-network@vm")
                 && !(hasStoreRoot toilet (closureProbeBinds "hermes-network@"))
                 && effectiveReload == "${closureProbe.pkgs.coreutils}/bin/true"
+                && effectiveGatewayReload == null
+                && effectiveNetworkStop == null
+                &&
+                  units."hermes@".serviceConfig.TemporaryFileSystem
+                  == hermesModuleVm.config.systemd.services."hermes@".serviceConfig.TemporaryFileSystem
+                &&
+                  units."hermes-network@".serviceConfig.TemporaryFileSystem
+                  == hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig.TemporaryFileSystem
+                && !(hasStoreRoot discardedGatewayResource (
+                  closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
+                ))
+                && !(hasStoreRoot discardedNetworkResource (
+                  closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
+                ))
                 && !(hasStoreRoot figlet (
                   closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
                 ))
@@ -316,6 +391,14 @@
               else
                 "false"
             } = true
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-gateway-exec-resource" "resource\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-gateway-quoted-exec-resource" "quoted\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-network-exec-resource" "resource\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-network-quoted-exec-resource" "quoted\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-public-state-exec-resource" "resource\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-public-state-quoted-exec-resource" "quoted\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-gateway-exec-resource" "discarded\n"}
+            test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-network-exec-resource" "discarded\n"}
             touch "$out"
           '';
       packagesFor =

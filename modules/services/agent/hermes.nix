@@ -127,26 +127,37 @@ let
   serviceExecRoots =
     unitName:
     let
-      unitOption =
-        (options.systemd.services.type.getSubOptions [ ]).serviceConfig.type.nestedTypes.elemType;
+      serviceConfigOption = (options.systemd.services.type.getSubOptions [ ]).serviceConfig.type;
+      execOptions = [
+        "ExecCondition"
+        "ExecStartPre"
+        "ExecStart"
+        "ExecStartPost"
+        "ExecReload"
+        "ExecReloadPost"
+        "ExecStop"
+        "ExecStopPost"
+      ];
       projectPath =
-        path: value:
+        path: missing: value:
         if path == [ ] then
           value
         else if !builtins.isAttrs value then
-          null
+          missing
         else if value ? _type then
           if value._type == "merge" then
             let
-              projected = builtins.filter (item: item != null) (map (item: projectPath path item) value.contents);
+              projected = builtins.filter (item: item != null) (
+                map (item: projectPath path missing item) value.contents
+              );
             in
-            if projected == [ ] then null else lib.mkMerge projected
+            if projected == [ ] then missing else lib.mkMerge projected
           else
             let
-              projected = projectPath path value.content;
+              projected = projectPath path missing value.content;
             in
             if projected == null then
-              null
+              missing
             else if value._type == "if" then
               lib.mkIf value.condition projected
             else if value._type == "override" then
@@ -159,52 +170,79 @@ let
           let
             key = builtins.head path;
           in
-          if builtins.hasAttr key value then projectPath (lib.tail path) value.${key} else null;
-      commands =
-        lib.concatMap
-          (
-            name:
+          if builtins.hasAttr key value then projectPath (lib.tail path) missing value.${key} else missing;
+      projectExecConfig =
+        value:
+        if !builtins.isAttrs value then
+          value
+        else if value ? _type then
+          if value._type == "merge" then
+            lib.mkMerge (map projectExecConfig value.contents)
+          else
             let
-              definitions = lib.concatMap (
-                definition:
-                let
-                  value = projectPath [ unitName "serviceConfig" name ] definition.value;
-                in
-                lib.optional (value != null) {
-                  inherit (definition) file;
-                  inherit value;
-                }
-              ) options.systemd.services.definitionsWithLocations;
-              merged = lib.modules.mergeDefinitions [
-                "systemd"
-                "services"
-                unitName
-                "serviceConfig"
-                name
-              ] unitOption definitions;
+              projected = projectExecConfig value.content;
             in
-            if !merged.isDefined then
-              [ ]
-            else if builtins.isList merged.mergedValue then
-              merged.mergedValue
+            if value._type == "if" then
+              lib.mkIf value.condition projected
+            else if value._type == "override" then
+              lib.mkOverride value.priority projected
+            else if value._type == "order" then
+              lib.mkOrder value.priority projected
             else
-              lib.optional (builtins.isString merged.mergedValue) merged.mergedValue
-          )
-          [
-            "ExecCondition"
-            "ExecStartPre"
-            "ExecStart"
-            "ExecStartPost"
-            "ExecReload"
-            "ExecReloadPost"
-            "ExecStop"
-            "ExecStopPost"
-          ];
+              value
+        else
+          builtins.listToAttrs (
+            map (name: {
+              inherit name;
+              value = value.${name};
+            }) (builtins.filter (name: builtins.hasAttr name value) execOptions)
+          );
+      commands = lib.concatMap (
+        name:
+        let
+          definitions = lib.concatMap (
+            definition:
+            let
+              service = projectPath [ unitName ] null definition.value;
+              config = if service == null then null else projectPath [ "serviceConfig" ] { } service;
+              value = if config == null then null else projectExecConfig config;
+            in
+            lib.optional (value != null) {
+              inherit (definition) file;
+              inherit value;
+            }
+          ) options.systemd.services.definitionsWithLocations;
+          merged = lib.modules.mergeDefinitions [
+            "systemd"
+            "services"
+            unitName
+            "serviceConfig"
+          ] serviceConfigOption definitions;
+          serviceConfig = merged.mergedValue or { };
+        in
+        if !merged.isDefined || !(builtins.hasAttr name serviceConfig) then
+          [ ]
+        else if builtins.isList serviceConfig.${name} then
+          serviceConfig.${name}
+        else
+          lib.optional (builtins.isString serviceConfig.${name}) serviceConfig.${name}
+      ) execOptions;
     in
     lib.concatMap (
       command:
-      map (part: builtins.toPath "/nix/store/${builtins.head (lib.splitString "/" part)}") (
-        builtins.filter (part: part != "") (lib.tail (lib.splitString "/nix/store/" command))
+      let
+        storeRoot =
+          suffix:
+          let
+            storeName = builtins.match "^([a-zA-Z0-9+._?=-]+).*" suffix;
+          in
+          if storeName == null then
+            null
+          else
+            "/nix/store/${builtins.substring 0 (builtins.stringLength (builtins.head storeName)) suffix}";
+      in
+      builtins.filter (path: path != null) (
+        map storeRoot (lib.tail (lib.splitString "/nix/store/" command))
       )
     ) commands;
   nixStoreAliasPaths = [
