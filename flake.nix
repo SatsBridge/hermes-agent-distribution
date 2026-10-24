@@ -51,6 +51,23 @@
           })
         ];
       };
+      explicitDashboardProbe = hermesModuleVm.extendModules {
+        modules = [
+          {
+            services.hermes-specialised-agent.agents.vm.portMappings = [
+              {
+                hostPort = 18199;
+                agentPort = 9119;
+                target = "loopback";
+                protocol = "both";
+              }
+            ];
+          }
+        ];
+      };
+      hermesModuleVmGatewayStart =
+        hermesModuleVm.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
+      defaultOnGatewayStart = defaultOnProbe.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
       hermesModuleVmConfigCheck =
         nixpkgs-unstable.legacyPackages.x86_64-linux.runCommand "hermes-module-vm-config-check" { }
           ''
@@ -454,6 +471,19 @@
                 ))
                 && units."hermes@vm".serviceConfig ? ExecStart
                 && units."hermes@vm-peer".serviceConfig ? ExecStart
+                && !(builtins.elem "multi-user.target" unitFiles."hermes@.service".wantedBy)
+                && !(builtins.elem "multi-user.target" unitFiles."hermes-network@.service".wantedBy)
+                && builtins.elem "multi-user.target" unitFiles."hermes@vm.service".wantedBy
+                && builtins.elem "multi-user.target" unitFiles."hermes@vm-peer.service".wantedBy
+                &&
+                  explicitDashboardProbe.config.services.hermes-specialised-agent.agents.vm.portMappings == [
+                    {
+                      hostPort = 18199;
+                      agentPort = 9119;
+                      target = "loopback";
+                      protocol = "both";
+                    }
+                  ]
                 && units."hermes@".serviceConfig.PrivateNetwork
                 && builtins.elem "hermes-network@%i.service" units."hermes@".bindsTo
                 && builtins.elem "hermes-network@%i.service" units."hermes@".after
@@ -511,6 +541,9 @@
             test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-public-state-quoted-exec-resource" "quoted\n"}
             test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-gateway-exec-resource" "discarded\n"}
             test -f ${nixpkgs-unstable.legacyPackages.x86_64-linux.writeText "hermes-discarded-network-exec-resource" "discarded\n"}
+            test -f ${hermesModuleVmGatewayStart}
+            test -f ${defaultOnGatewayStart}
+            ! grep -Fq -- '--intercept-tool-results' ${defaultOnGatewayStart}
             ! grep -Fqi 'mnemosyne' ${hermesAgentClosure}/store-paths
             touch "$out"
           '';
@@ -587,6 +620,7 @@
       };
       nixosModules.hermes-specialised-agent = ./modules/services/agent/hermes.nix;
       nixosConfigurations.hermes-module-vm = hermesModuleVm;
+      nixosConfigurations.hermes-module-vm-explicit-dashboard = explicitDashboardProbe;
       overlays.default =
         final: prev:
         let

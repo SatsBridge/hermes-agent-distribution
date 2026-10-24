@@ -75,7 +75,7 @@ let
             Null uses the main-agent dashboard default (127.0.0.1:9119 -> 9119);
             an explicit empty list disables mappings.
           '';
-          example = literalExpression "[{ hostPort = 9119; agentPort = 9119; }]";
+          example = literalExpression "[{ hostPort = 18199; agentPort = 9119; target = \"loopback\"; }]";
           type = types.nullOr (
             types.listOf (
               types.submodule {
@@ -815,13 +815,14 @@ let
         runtimeInputs = [ agentCfg.package ] ++ optional agentCfg.headroomEnable pkgs.headroom;
         text = ''
           cd ~/
+          headroom_pid=
           ${lib.optionalString agentCfg.headroomEnable ''
             headroom proxy \
               --port ${toString agentCfg.headroomPort} \
-              --intercept-tool-results \
               --memory \
               --learn \
               --code-graph &
+            headroom_pid=$!
           ''}
           ${
             concatStringsSep " " (
@@ -832,6 +833,8 @@ let
               ++ agentCfg.extraArgs
             )
           } &
+          gateway_pid=$!
+          dashboard_pid=
           ${lib.optionalString (cfg.mainAgent == name) ''
             ${
               concatStringsSep " " [
@@ -840,8 +843,22 @@ let
                 "--no-open"
               ]
             } &
+            dashboard_pid=$!
           ''}
-          wait -n
+          exited_child=
+          if wait -n -p exited_child; then
+            child_status=0
+          else
+            child_status=$?
+          fi
+          case "$exited_child" in
+            "$headroom_pid") child_name="Headroom proxy" ;;
+            "$gateway_pid") child_name="Hermes gateway" ;;
+            "$dashboard_pid") child_name="Hermes dashboard" ;;
+            *) child_name="unknown child" ;;
+          esac
+          echo "$child_name (pid $exited_child) exited with status $child_status" >&2
+          exit "$child_status"
         '';
       };
       installSkillsExecStartPre = pkgs.writeShellApplication {
@@ -1343,7 +1360,6 @@ let
             User = agentStateSystemdId;
           };
           unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
-          wantedBy = [ "multi-user.target" ];
         };
       };
     };

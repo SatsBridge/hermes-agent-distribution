@@ -101,9 +101,18 @@ example:
 
 ```nix
 services.hermes-specialised-agent.agents.vm.portMappings = [
-  { hostPort = 9119; agentPort = 9119; target = "loopback"; protocol = "both"; }
+  {
+    hostPort = 18199;
+    agentPort = 9119;
+    target = "loopback";
+    protocol = "both";
+  }
 ];
 ```
+
+An explicit list replaces the automatic main-agent mapping; use `target = "loopback"`
+for the loopback-bound dashboard. Omitting that target uses the existing veth-bound
+default and will not reach the dashboard.
 
 `portMappings = []` disables the localhost proxy. The `protocol` field accepts
 `tcp`, `udp`, or `both` (default), so existing mappings now also reserve and
@@ -139,8 +148,10 @@ run arbitrary host `/nix/store` paths or discover packages through NixOS profile
 aliases. Add runtime tools through the service PATH/package configuration,
 plugins through `extraPlugins`, or reference store-backed resources in the
 declared agent configuration. The offline VM fixture disables Headroom and
-default skill downloads, so their default-on closure coverage is evaluated and
-built separately; the VM does not exercise their runtime startup.
+default-skill pre-install, so their default-on closure coverage is evaluated
+separately; the standard VM run does not exercise their runtime startup. The
+five default skills are packaged locally; these installs do not require a network
+download.
 
 The module no longer adds Nixpkgs' `mnemosyne` package to Hermes PATH or
 generates a Mnemosyne config, directory, or environment defaults: that package
@@ -164,16 +175,22 @@ For diagnostics, inspect `systemctl status hermes-network@NAME.service`,
 `nft list chain inet hermes-agent-guard hermes_agent_input_guard`,
 `nft list chain inet hermes-agent-guard hermes_agent_forward_guard`,
 `nft list chain inet nixos-fw input-allow`, `nft list chain inet nixos-fw forward-allow`,
-`ss -ltnup 'sport = :9119'`, and the configured `hostPort`s. Stop/restart of an
-agent removes and recreates its veth, routes, DNS forwarder, namespace relays,
-and host-loopback proxies. Firewall rules are declarative in the NixOS ruleset,
-not inserted per invocation. Removing a permission blocks subsequent packets
-to that private/host tuple, but does not forcibly close the agent's userspace
-socket; existing connections can remain open and time out. Public egress and
-already-established public flows remain host-uplink dependent. Rollback by
-reverting the module/configuration change and rebuilding or switching to the
-previous NixOS generation; verify the effective guard rules and listeners after
-the rollback.
+`ss -ltnup 'sport = :9119'`, and the configured `hostPort`s. Gateway startup
+logs identify which child process exited and its status; a zero status from one
+child is still propagated, and the unit's normal restart policy remains in force.
+When enabled, Headroom uses stable-supported proxy flags; the module does not
+enable canary-only features. Template units are not directly wanted by
+`multi-user.target`; only configured per-agent instances are enabled.
+Stop/restart of an agent removes and recreates its veth, routes, DNS forwarder,
+namespace relays, and host-loopback proxies. Firewall rules are declarative in
+the NixOS ruleset; rules are not inserted per invocation. Removing a permission
+blocks subsequent packets to that private/host tuple but does not forcibly close
+the agent's userspace socket; existing connections can remain open and time out.
+Public egress and already-established public flows remain host-uplink dependent.
+Rollback by reverting the module/configuration change, then rebuilding or
+switching to the previous NixOS generation; verify the effective guard rules and
+listeners after rollback. Switching generations does not delete or overwrite
+profile state or user-modified skills.
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#hermes-module-vm-config-check
@@ -184,6 +201,13 @@ If `nixos-rebuild` is not installed, its equivalent VM build is:
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm.config.system.build.vm
+```
+
+To exercise a main-agent dashboard configured through an explicit loopback
+mapping (`127.0.0.1:18199 -> agent loopback:9119`), build the companion variant:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm-explicit-dashboard.config.system.build.vm
 ```
 
 Run `./result/bin/run-nixos-vm` from a directory where the guest disk

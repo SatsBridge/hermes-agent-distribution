@@ -1,5 +1,20 @@
-{ lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 let
+  dashboardHostPort =
+    let
+      mappings = config.services.hermes-specialised-agent.agents.vm.portMappings;
+      dashboardMapping =
+        if mappings == null then
+          null
+        else
+          lib.findFirst (mapping: mapping.agentPort == 9119 && mapping.target == "loopback") null mappings;
+    in
+    if dashboardMapping == null then 9119 else dashboardMapping.hostPort;
   vmNetworkProbeServer = pkgs.writeText "hermes-vm-network-probe-server.py" ''
     import http.server
     import select
@@ -141,6 +156,8 @@ let
       peer_probe_pids=()
       endpoint_pid=
       permissive_control=0
+      startup_phases_reported=0
+      dashboard_host_port="$HERMES_VM_DASHBOARD_HOST_PORT"
 
       cleanup_test_network() {
         remove_permissive_control
@@ -230,6 +247,33 @@ let
         echo "Hermes agents stable for 10 seconds: $expected"
       }
 
+      report_startup_phases() {
+        local unit
+        echo "Hermes startup phases (monotonic timestamps in usec; ExecStartPre includes per-command start/stop times):"
+        for unit in hermes-network@vm.service "''${agent_units[@]}"; do
+          systemctl show --no-pager \
+            --property=MainPID \
+            --property=NRestarts \
+            --property=ExecMainStartTimestampMonotonic \
+            --property=ExecMainExitTimestampMonotonic \
+            --property=ActiveEnterTimestampMonotonic \
+            --property=ExecStartPre \
+            "$unit"
+        done
+        echo "Initial agent readiness guest uptime: $(awk '{print $1}' /proc/uptime) seconds"
+      }
+
+      assert_no_stray_template_instances() {
+        local failed
+        failed=$(systemctl --failed --no-legend --plain)
+        if grep -Fq 'hermes@multi-user.service' <<< "$failed" || grep -Fq 'hermes-network@multi-user.service' <<< "$failed"; then
+          echo "Unexpected failed hermes@multi-user or hermes-network@multi-user template instance:" >&2
+          grep -F -e 'hermes@multi-user.service' -e 'hermes-network@multi-user.service' <<< "$failed" >&2
+          return 1
+        fi
+        echo "No failed hermes@multi-user.service or hermes-network@multi-user.service instances"
+      }
+
       wait_for_active() {
         local deadline=$((SECONDS + 120)) next_report=$SECONDS ready state unit
         while (( SECONDS < deadline )); do
@@ -246,6 +290,12 @@ let
             fi
           done
           if (( ready == 1 )); then
+            if (( startup_phases_reported == 0 )); then
+              report_startup_phases
+              startup_phases_reported=1
+              assert_no_stray_template_instances || return 1
+              dashboard_http_ok "$dashboard_host_port" 50 || return 1
+            fi
             assert_agents_stable
             assert_no_mnemosyne_provisioning || return 1
             check_all_store_isolation
@@ -873,8 +923,32 @@ let
         echo "$unit has only loopback and cannot reach external, host, or peer endpoints"
       }
 
+      dashboard_http_ok() {
+        local port="$1" retries="$2" attempt code=000 body_file error_file title_seen asset_seen
+        body_file=$(mktemp)
+        error_file=$(mktemp)
+        for ((attempt = 1; attempt <= retries; attempt++)); do
+          if code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --silent --show-error --connect-timeout 1 --max-time 2 -o "$body_file" -w '%{http_code}' "http://127.0.0.1:$port/" 2>"$error_file"); then
+            if [[ "$code" == 200 ]] && grep -Fq '<title>Hermes Agent - Dashboard</title>' "$body_file" && grep -Fq 'src="/assets/index-' "$body_file" && grep -Fq '.js"' "$body_file"; then
+              rm -f "$body_file" "$error_file"
+              echo "Packaged Hermes dashboard UI returned HTTP 200 via 127.0.0.1:$port at guest uptime $(awk '{print $1}' /proc/uptime)s"
+              return 0
+            fi
+          fi
+          sleep 0.2
+        done
+        title_seen=0
+        asset_seen=0
+        grep -Fq '<title>Hermes Agent - Dashboard</title>' "$body_file" && title_seen=1 || true
+        grep -Fq 'src="/assets/index-' "$body_file" && grep -Fq '.js"' "$body_file" && asset_seen=1 || true
+        echo "Dashboard UI check rejected 127.0.0.1:$port: HTTP $code, title marker=$title_seen, packaged JS marker=$asset_seen" >&2
+        [[ ! -s "$error_file" ]] || cat "$error_file" >&2
+        rm -f "$body_file" "$error_file"
+        return 1
+      }
+
       check_dashboard_mapping() {
-        local pid listener code ready=0
+        local pid listener ready=0 response_file code
         for _ in {1..100}; do
           pid=$(service_pid hermes@vm.service) || return 1
           if "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ss"}" -H -ltn 'sport = :9119' | grep -Fq '127.0.0.1:9119' \
@@ -885,36 +959,52 @@ let
           sleep 0.1
         done
         (( ready )) || { echo "The real Hermes dashboard is not listening on its namespace port 9119" >&2; return 1; }
-        listener=$(ss -H -ltn 'sport = :9119')
-        [[ "$listener" == *127.0.0.1:9119* && "$listener" != *0.0.0.0:9119* ]] || {
+        listener=$(ss -H -ltn "sport = :$dashboard_host_port")
+        if [[ "$listener" != *"127.0.0.1:$dashboard_host_port"* ]] || ! awk -v port="$dashboard_host_port" '$4 == "127.0.0.1:" port || $4 == "[::1]:" port { next } { bad=1 } END { exit (NR > 0 && !bad ? 0 : 1) }' <<< "$listener"; then
           echo "Dashboard mapping is missing or not restricted to host loopback: $listener" >&2
           return 1
-        }
-        listener=$(ss -H -lun 'sport = :9119')
-        [[ "$listener" == *127.0.0.1:9119* && "$listener" != *0.0.0.0:9119* ]] || {
-          echo "Default both-protocol dashboard mapping has no host-loopback UDP proxy: $listener" >&2
+        fi
+        listener=$(ss -H -lun "sport = :$dashboard_host_port")
+        if [[ "$listener" != *"127.0.0.1:$dashboard_host_port"* ]] || ! awk -v port="$dashboard_host_port" '$4 == "127.0.0.1:" port || $4 == "[::1]:" port { next } { bad=1 } END { exit (NR > 0 && !bad ? 0 : 1) }' <<< "$listener"; then
+          echo "Both-protocol dashboard mapping has no host-loopback UDP proxy: $listener" >&2
           return 1
-        }
-        code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:9119/)
-        [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || { echo "Dashboard mapping returned no HTTP response: $code" >&2; return 1; }
-        echo "Dashboard responds through configured loopback mapping 127.0.0.1:9119 -> agent port 9119 (HTTP $code)"
+        fi
+        dashboard_http_ok "$dashboard_host_port" 50 || return 1
+        echo "Dashboard UI mapping 127.0.0.1:$dashboard_host_port -> agent loopback:9119 is host-loopback-only"
+        response_file=$(mktemp)
+        if ! code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --fail --silent --show-error --connect-timeout 1 --max-time 2 -o "$response_file" -w '%{http_code}' http://127.0.0.1:18193/); then
+          rm -f "$response_file"
+          echo "Explicit loopback mapping 127.0.0.1:18193 did not return its positive-control response" >&2
+          return 1
+        fi
+        if [[ "$code" != 200 || "$(<"$response_file")" != OK ]]; then
+          rm -f "$response_file"
+          echo "Explicit loopback mapping 127.0.0.1:18193 returned an unexpected HTTP/body response (HTTP $code)" >&2
+          return 1
+        fi
+        rm -f "$response_file"
+        if dashboard_http_ok 18193 1; then
+          echo "Dashboard HTTP oracle accepted a misdirected HTTP 200 loopback response on port 18193" >&2
+          return 1
+        fi
+        echo "HTTP oracle rejected the explicit loopback positive-control response as a misdirected dashboard (HTTP 200, body OK)"
       }
 
       check_port_mappings() {
         local code listener port
         for port in 18191 18193 18194 18195 18196 18198; do
           listener=$(ss -H -ltn "sport = :$port")
-          [[ "$listener" == *"127.0.0.1:$port"* && "$listener" != *"0.0.0.0:$port"* ]] || {
+          if [[ "$listener" != *"127.0.0.1:$port"* ]] || ! awk -v port="$port" '$4 == "127.0.0.1:" port || $4 == "[::1]:" port { next } { bad=1 } END { exit (NR > 0 && !bad ? 0 : 1) }' <<< "$listener"; then
             echo "TCP mapping $port is missing or not loopback-only: $listener" >&2
             return 1
-          }
+          fi
         done
         for port in 18192 18193 18194 18195 18197; do
           listener=$(ss -H -lun "sport = :$port")
-          [[ "$listener" == *"127.0.0.1:$port"* && "$listener" != *"0.0.0.0:$port"* ]] || {
+          if [[ "$listener" != *"127.0.0.1:$port"* ]] || ! awk -v port="$port" '$4 == "127.0.0.1:" port || $4 == "[::1]:" port { next } { bad=1 } END { exit (NR > 0 && !bad ? 0 : 1) }' <<< "$listener"; then
             echo "UDP mapping $port is missing or not loopback-only: $listener" >&2
             return 1
-          }
+          fi
         done
         for port in 18191 18196 18198; do
           if ss -H -lun "sport = :$port" | grep -q .; then echo "TCP-only mapping unexpectedly opened UDP $port" >&2; return 1; fi
@@ -924,8 +1014,8 @@ let
         done
         tcp_connect_host 127.0.0.1 18191 || return 1
         for port in 18193 18194 18195 18196; do
-          code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --fail --silent --show-error --max-time 4 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/") || return 1
-          [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || return 1
+          code=$("${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --fail --silent --show-error --connect-timeout 1 --max-time 4 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/") || return 1
+          [[ "$code" == 200 ]] || { echo "Mapped HTTP port $port returned HTTP $code instead of 200" >&2; return 1; }
         done
         for port in 18192 18193 18194 18195 18197; do udp_probe 127.0.0.1 "$port" || { echo "Mapped UDP port $port did not return a response" >&2; return 1; }; done
         echo "TCP-only, UDP-only, explicit-both/default-both veth and loopback mappings returned expected positive controls"
@@ -1076,11 +1166,11 @@ let
           echo "Stale Hermes IPv6 route remains after stopping agent $iface" >&2
           return 1
         fi
-        if ss -H -ltn 'sport = :9119' | grep -q .; then
+        if ss -H -ltn "sport = :$dashboard_host_port" | grep -q .; then
           echo "Stale host dashboard mapping remains after stopping agent $iface" >&2
           return 1
         fi
-        if ss -H -lun 'sport = :9119' | grep -q .; then
+        if ss -H -lun "sport = :$dashboard_host_port" | grep -q .; then
           echo "Stale host dashboard UDP mapping remains after stopping agent $iface" >&2
           return 1
         fi
@@ -1463,6 +1553,7 @@ in
       "hermes-pf@vm-peer.service"
     ];
     wantedBy = [ "multi-user.target" ];
+    environment.HERMES_VM_DASHBOARD_HOST_PORT = toString dashboardHostPort;
     serviceConfig = {
       ExecStart = lib.getExe vmAgentRuntimeSmoke;
       StandardError = "journal+console";
