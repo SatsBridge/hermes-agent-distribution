@@ -585,6 +585,7 @@
       githubActions = nix-github-actions.lib.mkGithubMatrix {
         checks = nixpkgs.lib.getAttrs systems self.checks;
       };
+      nixosModules.hermes-specialised-agent = ./modules/services/agent/hermes.nix;
       nixosConfigurations.hermes-module-vm = hermesModuleVm;
       overlays.default =
         final: prev:
