@@ -191,6 +191,9 @@ let
         getfacl -p -- /var/lib/hermes-vm /var/lib/hermes-vm/.hermes /var/lib/hermes-vm-peer /var/lib/hermes-vm-peer/.hermes >&2 || true
         ip -o link show >&2 || true
         ip -4 route show table all >&2 || true
+        ip -6 route show table all >&2 || true
+        nft list table ip nixos-nat >&2 || true
+        nft list table ip6 nixos-nat >&2 || true
         nft list ruleset >&2 || true
         ss -H -lunpt 'sport = :53' >&2 || true
         cat /etc/resolv.conf >&2 || true
@@ -248,7 +251,7 @@ let
       }
 
       report_startup_phases() {
-        local unit
+        local unit network_online_usec network_active_usec main_active_usec peer_start_usec peer_active_usec
         echo "Hermes startup phases (monotonic timestamps in usec; ExecStartPre includes per-command start/stop times):"
         for unit in hermes-network@vm.service "''${agent_units[@]}"; do
           systemctl show --no-pager \
@@ -261,6 +264,34 @@ let
             "$unit"
         done
         echo "Initial agent readiness guest uptime: $(awk '{print $1}' /proc/uptime) seconds"
+        network_online_usec=$(systemctl show --property=ActiveEnterTimestampMonotonic --value network-online.target)
+        network_active_usec=$(systemctl show --property=ActiveEnterTimestampMonotonic --value hermes-network@vm.service)
+        main_active_usec=$(systemctl show --property=ActiveEnterTimestampMonotonic --value hermes@vm.service)
+        peer_start_usec=$(systemctl show --property=ExecMainStartTimestampMonotonic --value hermes@vm-peer.service)
+        peer_active_usec=$(systemctl show --property=ActiveEnterTimestampMonotonic --value hermes@vm-peer.service)
+        awk -v online="$network_online_usec" -v network="$network_active_usec" -v main="$main_active_usec" -v peer_start="$peer_start_usec" -v peer_active="$peer_active_usec" -v ready="$dashboard_ready_usec" 'BEGIN { printf "Activation timestamps: network-online=%.3fs, agent network ready=%.3fs, main active=%.3fs, dashboard READY=%.3fs\nPeer timing: ExecStart=%.3fs (%.3fs after main active, %+.3fs after dashboard READY); active=%.3fs (%.3fs after main active, %+.3fs after dashboard READY); own activation=%.3fs\n", online/1000000, network/1000000, main/1000000, ready/1000000, peer_start/1000000, (peer_start-main)/1000000, (peer_start-ready)/1000000, peer_active/1000000, (peer_active-main)/1000000, (peer_active-ready)/1000000, (peer_active-peer_start)/1000000 }'
+      }
+
+      check_dashboard_startup() {
+        local mode="$1" boundary="$2" record pid first_usec ready_usec first_latency ready_latency boundary_boot
+        for _ in {1..150}; do
+          record=$(timeout 5s journalctl -b -u hermes@vm.service -u hermes-network@vm.service --no-pager -o json | "${lib.getExe' pkgs.python3 "python3"}" -c 'import json,sys; mode=sys.argv[1]; boundary=int(sys.argv[2]); rows=[json.loads(line) for line in sys.stdin if line.strip()]; ready_rows=sorted((row for row in rows if row.get("MESSAGE")=="HERMES_DASHBOARD_READY port=9119"),key=lambda row:int(row["__MONOTONIC_TIMESTAMP"])); ready=ready_rows[0] if mode=="boot" else next(row for row in ready_rows if int(row["__MONOTONIC_TIMESTAMP"])>=boundary); ready_usec=int(ready["__MONOTONIC_TIMESTAMP"]); boundary=min(int(row["__MONOTONIC_TIMESTAMP"]) for row in rows if row.get("MESSAGE","").startswith("Starting Configure isolated network for Hermes agent vm") and int(row["__MONOTONIC_TIMESTAMP"])<=ready_usec) if mode=="boot" else boundary; pid=ready["_PID"]; first=min((row for row in rows if row.get("_PID")==pid and int(row["__MONOTONIC_TIMESTAMP"])>=boundary),key=lambda row:int(row["__MONOTONIC_TIMESTAMP"])); print(boundary,pid,first["__MONOTONIC_TIMESTAMP"],ready["__MONOTONIC_TIMESTAMP"])' "$mode" "$boundary" 2>/dev/null) && break
+          sleep 0.1
+        done
+        [[ -n "$record" ]] || { echo "Could not find a real dashboard PID log and HERMES_DASHBOARD_READY for $mode boundary" >&2; return 1; }
+        read -r boundary pid first_usec ready_usec <<< "$record"
+        dashboard_ready_usec="$ready_usec"
+        boundary_boot=$(awk -v value="$boundary" 'BEGIN { printf "%.3f", value / 1000000 }')
+        first_latency=$(awk -v start="$boundary" -v finish="$first_usec" 'BEGIN { printf "%.3f", (finish - start) / 1000000 }')
+        ready_latency=$(awk -v start="$boundary" -v finish="$ready_usec" 'BEGIN { printf "%.3f", (finish - start) / 1000000 }')
+        echo "Dashboard startup boundary=$mode at guest uptime ''${boundary_boot}s; first real dashboard PID=$pid log at $(awk -v value="$first_usec" 'BEGIN { printf "%.3f", value / 1000000 }')s (''${first_latency}s after boundary); HERMES_DASHBOARD_READY at $(awk -v value="$ready_usec" 'BEGIN { printf "%.3f", value / 1000000 }')s (''${ready_latency}s after boundary)"
+        if awk -v value="$first_latency" 'BEGIN { exit !(value > 15) }'; then
+          echo "Startup latency requirement MISSED: first real dashboard log exceeds 15 seconds; timing is reported, not used to gate this smoke"
+        elif awk -v value="$first_latency" 'BEGIN { exit !(value > 10) }'; then
+          echo "Startup latency target missed: first real dashboard log is within the 15-second maximum"
+        else
+          echo "Startup latency target met: first real dashboard log is within 10 seconds"
+        fi
       }
 
       assert_no_stray_template_instances() {
@@ -291,6 +322,8 @@ let
           done
           if (( ready == 1 )); then
             if (( startup_phases_reported == 0 )); then
+              dashboard_ready_usec=0
+              check_dashboard_startup boot 0 || return 1
               report_startup_phases
               startup_phases_reported=1
               assert_no_stray_template_instances || return 1
@@ -494,12 +527,14 @@ let
       }
 
       start_peer_probes() {
-        local unit="$1" address4="$2" address6="$3" pid
+        local unit="$1" address4="$2" address6="$3" pid probe_pid probe_log
         pid=$(service_pid "$unit")
+        probe_log="/run/hermes-vm-probes-''${unit//[^a-zA-Z0-9]/_}.log"
+        echo "Starting peer probe server for $unit in its live network namespace (target PID=$pid, log=$probe_log)"
         "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- \
-          "${lib.getExe' pkgs.python3 "python3"}" ${vmNetworkProbeServer} agent "$address4" "$address6" >/run/hermes-vm-probes-"''${unit//[^a-zA-Z0-9]/_}".log 2>&1 &
+          "${lib.getExe' pkgs.python3 "python3"}" ${vmNetworkProbeServer} agent "$address4" "$address6" >"$probe_log" 2>&1 &
         peer_probe_pids+=("$!")
-        for attempt in {1..20}; do
+        for attempt in {1..120}; do
           if tcp_connect_namespace "$pid" "$address4" 18084 && tcp_connect_namespace "$pid" "$address6" 18085; then
             if [[ "$unit" == hermes@vm-peer.service ]]; then
               if ! tcp_connect_namespace "$pid" "$address4" 18088; then sleep 0.1; continue; fi
@@ -515,9 +550,19 @@ let
             echo "Live peer TCP targets ready in $unit at $address4:18084 and [$address6]:18085"
             return 0
           fi
-          if (( attempt % 5 == 0 )); then echo "Waiting for live peer targets in $unit (attempt $attempt/20)"; fi
+          if (( attempt % 5 == 0 )); then echo "Waiting for live peer targets in $unit (attempt $attempt/120)"; fi
           sleep 0.1
         done
+        for probe_pid in "''${peer_probe_pids[@]}"; do
+          if [[ -r "/proc/$probe_pid/cmdline" ]]; then
+            echo "$unit probe launcher PID=$probe_pid cmdline=$(tr '\0' ' ' <"/proc/$probe_pid/cmdline")" >&2
+          else
+            echo "$unit probe launcher PID=$probe_pid has exited" >&2
+          fi
+        done
+        echo "$unit probe-server log:" >&2
+        cat "$probe_log" >&2 || true
+        "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ss"}" -H -lntup >&2 || true
         echo "$unit peer TCP targets failed their positive-connect checks" >&2
         return 1
       }
@@ -732,7 +777,7 @@ let
         ip -n hermes-vm-endpoint -6 route add default via fd42:198:20::1
         ip netns exec hermes-vm-endpoint "${lib.getExe' pkgs.python3 "python3"}" ${vmNetworkProbeServer} endpoint >/run/hermes-vm-endpoint-probes.log 2>&1 &
         endpoint_pid=$!
-        for attempt in {1..20}; do
+        for attempt in {1..120}; do
           if tcp_connect_namespace "$endpoint_pid" 198.20.0.2 18082 \
             && tcp_connect_namespace "$endpoint_pid" 10.20.0.2 18082 \
             && tcp_connect_namespace "$endpoint_pid" 10.20.0.3 18082 \
@@ -753,7 +798,7 @@ let
             echo "Controlled endpoint ready in hermes-vm-endpoint at 198.20.0.2 and fd42:198:20::2:18082"
             return 0
           fi
-          if (( attempt % 5 == 0 )); then echo "Waiting for controlled endpoint listeners (attempt $attempt/20)"; fi
+          if (( attempt % 5 == 0 )); then echo "Waiting for controlled endpoint listeners (attempt $attempt/120)"; fi
           sleep 0.1
         done
         echo "Endpoint IPv4 listeners:" >&2
@@ -921,6 +966,52 @@ let
         done
         [[ $(service_pid "$unit") == "$pid" ]] || { echo "$unit restarted during network-denial probes" >&2; return 1; }
         echo "$unit has only loopback and cannot reach external, host, or peer endpoints"
+      }
+
+      check_public_internet() {
+        local unit pid expected_dns output response dns_ip
+        echo "Real-Internet regression: validating guest host DNS/TLS and QEMU default route"
+        ip route show default | grep -q '^default ' || { echo "Guest has no QEMU-provided IPv4 default route" >&2; return 1; }
+        "${lib.getExe' pkgs.dnsutils "dig"}" +time=3 +tries=1 +short example.com A | grep -Eq '^[0-9]+\.' || {
+          echo "Guest host resolver could not resolve example.com; configured resolver follows" >&2
+          cat /etc/resolv.conf >&2
+          echo "Guest IPv4 route table and route selection for the public resolver:" >&2
+          ip -4 route show table all >&2
+          ip -4 route get 1.1.1.1 >&2 || true
+          echo "Direct public DNS control via 1.1.1.1:" >&2
+          "${lib.getExe' pkgs.dnsutils "dig"}" +time=3 +tries=1 +short @1.1.1.1 example.com A >&2 || true
+          echo "Loopback DNS forwarder control via 127.0.0.1:" >&2
+          "${lib.getExe' pkgs.dnsutils "dig"}" +time=3 +tries=1 +short @127.0.0.1 example.com A >&2 || true
+          return 1
+        }
+        "${lib.getExe' pkgs.curl "curl"}" --noproxy '*' --fail --silent --show-error --connect-timeout 3 --max-time 10 https://example.com/ | grep -Fq 'Example Domain' || {
+          echo "Guest host HTTPS positive control failed (DNS, route, upstream, or CA trust)" >&2
+          return 1
+        }
+        for unit in "''${agent_units[@]}"; do
+          pid=$(service_pid "$unit") || return 1
+          if [[ "$unit" == hermes@vm.service ]]; then expected_dns=198.18.0.1; else expected_dns=198.18.0.5; fi
+          echo "$unit: verify generated resolver, public DNS, TCP/443, HTTPS and CapEff=0 as service identity"
+          output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket,sys; expected=sys.argv[1]; resolv=open("/etc/resolv.conf",encoding="ascii").read(); assert "nameserver "+expected in resolv,"unexpected generated resolver: "+resolv; addresses=sorted({answer[4][0] for answer in socket.getaddrinfo("example.com",443,socket.AF_INET,socket.SOCK_STREAM)}); assert addresses,"public DNS returned no IPv4 addresses"; sock=socket.create_connection((addresses[0],443),timeout=4); sock.close(); caps=next(line.split()[1] for line in open("/proc/self/status") if line.startswith("CapEff:")); assert int(caps,16)==0,"effective capabilities are nonzero: "+caps; print("PUBLIC_DNS_IP="+addresses[0]); print("resolver="+expected+" DNS="+",".join(addresses)+" TCP/443=connected CapEff="+caps)' "$expected_dns") || {
+            echo "$unit failed public DNS/TCP from its service namespace; resolver/routes follow" >&2
+            "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --mount --root -- cat /etc/resolv.conf >&2 || true
+            "${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.iproute2 "ip"}" route show table all >&2 || true
+            return 1
+          }
+          echo "$output"
+          dns_ip=$(awk -F= '$1 == "PUBLIC_DNS_IP" { print $2; exit }' <<< "$output")
+          [[ "$dns_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "$unit returned no single IPv4 address for the HTTPS probe: $output" >&2; return 1; }
+          response=$(run_as_service net "$pid" "${lib.getExe' pkgs.curl "curl"}" --resolve "example.com:443:$dns_ip" --noproxy '*' --fail --silent --show-error --connect-timeout 3 --max-time 10 https://example.com/ -w '%{http_code}') || {
+            echo "$unit certificate-verified HTTPS failed; certificate verification is not disabled" >&2
+            return 1
+          }
+          [[ "$response" == *"Example Domain"* && "''${response: -3}" == 200 ]] || {
+            echo "$unit HTTPS response was not the expected public Example Domain HTTP 200" >&2
+            return 1
+          }
+          echo "$unit returned verified HTTPS HTTP 200 with the expected public content"
+        done
+        echo "Public IPv6 Internet reachability remains unverified"
       }
 
       dashboard_http_ok() {
@@ -1237,7 +1328,15 @@ let
       if ! wait_for_active; then diagnose; exit 1; fi
       host_other_ip=$(ip -o -4 address show scope global | awk '$2 != "ha0" && $2 != "ha1" { split($4, a, "/"); print a[1]; exit }')
       [[ -n "$host_other_ip" ]] || { echo "No non-veth host interface address is available for the isolation probe" >&2; diagnose; exit 1; }
-      grep -Fq 'nameserver 127.0.0.1' /etc/resolv.conf || { echo "VM host resolver does not use the loopback stub fixture" >&2; cat /etc/resolv.conf >&2; exit 1; }
+      if [[ "$HERMES_VM_INTERNET_TEST" == 1 ]]; then
+        if ! grep -Fq 'nameserver 127.0.0.1' /etc/resolv.conf || ! grep -Fq 'nameserver 1.1.1.1' /etc/resolv.conf; then
+          echo "Internet fixture host resolver must retain the local test stub and include the explicit public resolver" >&2
+          cat /etc/resolv.conf >&2
+          exit 1
+        fi
+      else
+        grep -Fq 'nameserver 127.0.0.1' /etc/resolv.conf || { echo "Offline fixture host resolver does not use the loopback stub" >&2; cat /etc/resolv.conf >&2; exit 1; }
+      fi
       [[ -e /run/hermes-vm-resolver-ready ]] || { echo "Late resolver fixture did not finish before agent startup" >&2; exit 1; }
       echo "Agent network setup waited for the late host resolver fixture"
       echo "Host UDP/TCP DNS listeners:"
@@ -1272,6 +1371,7 @@ let
       check_permissive_control || { diagnose; exit 1; }
       check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
+      if [[ "$HERMES_VM_INTERNET_TEST" == 1 ]]; then check_public_internet || { diagnose; exit 1; }; fi
       check_host_permission_revocation || { diagnose; exit 1; }
       check_dashboard_mapping || { diagnose; exit 1; }
       check_port_mappings || { diagnose; exit 1; }
@@ -1310,9 +1410,14 @@ let
       check_public_state_network hermes-pf@vm-peer.service || { diagnose; exit 1; }
       echo "Restarting vm agent"
       stop_peer_probes
+      peer_pid_before=$(service_pid hermes@vm-peer.service)
+      restart_request_usec=$(awk '{ printf "%.0f", $1 * 1000000 }' /proc/uptime)
       timeout --kill-after=5s 180 systemctl restart hermes@vm.service || { diagnose; exit 1; }
+      check_dashboard_startup restart "$restart_request_usec" || { diagnose; exit 1; }
       echo "Requiring peer restart after main restart"
       timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service || { diagnose; exit 1; }
+      peer_pid_after=$(service_pid hermes@vm-peer.service)
+      [[ "$peer_pid_after" != "$peer_pid_before" ]] || { echo "Peer did not restart after the main agent restart" >&2; diagnose; exit 1; }
       timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
       if ! wait_for_active; then diagnose; exit 1; fi
       assert_distinct_namespaces || { diagnose; exit 1; }
@@ -1320,6 +1425,7 @@ let
       start_peer_probes hermes@vm-peer.service 198.18.0.6 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       check_agent_network hermes@vm.service hb0 198.18.0.1 198.18.0.2 198.18.0.6 fd42:198:18::1 fd42:198:18::2 fd42:198:18:0:1::2 || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 198.18.0.5 198.18.0.6 198.18.0.2 fd42:198:18:0:1::1 fd42:198:18:0:1::2 fd42:198:18::2 || { diagnose; exit 1; }
+      if [[ "$HERMES_VM_INTERNET_TEST" == 1 ]]; then check_public_internet || { diagnose; exit 1; }; fi
       check_host_initiated_replies || { diagnose; exit 1; }
       check_dashboard_mapping || { diagnose; exit 1; }
       check_port_mappings || { diagnose; exit 1; }
@@ -1553,7 +1659,10 @@ in
       "hermes-pf@vm-peer.service"
     ];
     wantedBy = [ "multi-user.target" ];
-    environment.HERMES_VM_DASHBOARD_HOST_PORT = toString dashboardHostPort;
+    environment = {
+      HERMES_VM_DASHBOARD_HOST_PORT = toString dashboardHostPort;
+      HERMES_VM_INTERNET_TEST = "0";
+    };
     serviceConfig = {
       ExecStart = lib.getExe vmAgentRuntimeSmoke;
       StandardError = "journal+console";

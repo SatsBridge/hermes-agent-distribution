@@ -203,6 +203,33 @@ If `nixos-rebuild` is not installed, its equivalent VM build is:
 nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm.config.system.build.vm
 ```
 
+The default fixture intentionally uses restricted QEMU networking and remains an
+offline policy test; it does not claim Internet reachability. To run the separate
+real-Internet regression, the host must have working outbound DNS and HTTPS, and
+the guest must be allowed to use QEMU user-mode egress. Build and run the explicit
+variant:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm-internet.config.system.build.vm
+QEMU_NET_OPTS='restrict=off' ./result/bin/run-nixos-vm
+```
+
+This variant sets `restrictNetwork = false` only for the test guest, and the
+launcher explicitly uses `restrict=off`. Its late resolver retains the local
+deterministic test stub and adds `1.1.1.1`; dnsmasq forwards public queries there
+while preserving local `.test` records. The test guest and host
+must have outbound DNS and HTTPS access to that resolver and `example.com`.
+It does not change the Hermes module's firewall or per-agent permissions. The
+runtime smoke requires guest host-namespace DNS and certificate-verified HTTPS
+positive controls, then verifies the generated per-agent resolver, public DNS,
+TCP/443, certificate-verified HTTPS 200 and expected page content as each service
+identity with zero effective capabilities. It repeats the public checks after the
+main agent/network restart. External DNS, route, endpoint, or CA failures fail the
+test and print guest routes, resolver configuration and nftables diagnostics;
+there is no skip or local endpoint substitute. Public IPv6 reachability is not
+tested. Use the standard restricted VM for offline runs without external
+connectivity or model credentials.
+
 To exercise a main-agent dashboard configured through an explicit loopback
 mapping (`127.0.0.1:18199 -> agent loopback:9119`), build the companion variant:
 
@@ -240,6 +267,22 @@ restart count with `active/running` state for 10 seconds after startup and
 restarts, including after profile reads. A failure prints unit status and the
 last 80 journal lines per unit. Successful boots print
 `Hermes VM runtime checks passed` on the serial console.
+For cold boot, the timing regression uses the systemd start event for
+`hermes-network@vm.service` as the relevant activation boundary and reports
+guest-boot-relative timestamps for `network-online.target`, the network helper,
+main activation, the first real dashboard-process log, and
+`HERMES_DASHBOARD_READY`. Restart timing starts immediately before
+`systemctl restart hermes@vm.service`. It reports whether first-log latency met
+the 10-second target or 15-second maximum, but timing is informational and does
+not fail the broader smoke; the startup NFR remains unmet on the unchanged runtime
+and this report is not an exception or evidence of compliance.
+`HERMES_DASHBOARD_READY` and the independent loopback packaged-UI HTTP check
+remain required. No startup optimization was accepted: the proposed materialized
+closure view's storage cost cannot rely on reflinks or deduplication. It also
+reports peer `ExecStart`/active latency relative to main
+activation and dashboard readiness, and verifies that a main-agent restart
+replaces the peer process. `ExecMainStartTimestampMonotonic` is reported
+separately and is not used as the sole startup boundary.
 Gateway start/restart commands are bounded at 180 seconds and the smoke unit
 at 1200 seconds to allow per-store-path mount setup and the expanded live
 network-policy probes in the 1-GiB guest; the VM's

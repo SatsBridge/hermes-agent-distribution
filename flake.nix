@@ -65,6 +65,20 @@
           }
         ];
       };
+      internetEnabledVm = hermesModuleVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            virtualisation.restrictNetwork = lib.mkForce false;
+            services.dnsmasq.settings.server = lib.mkForce [ "1.1.1.1" ];
+            systemd.services.hermes-vm-late-resolver.script = lib.mkForce ''
+              sleep 5
+              printf 'nameserver 127.0.0.1\nnameserver 1.1.1.1\n' > /run/hermes-vm-resolv.conf
+              touch /run/hermes-vm-resolver-ready
+            '';
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST = lib.mkForce "1";
+          })
+        ];
+      };
       hermesModuleVmGatewayStart =
         hermesModuleVm.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
       defaultOnGatewayStart = defaultOnProbe.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
@@ -454,6 +468,14 @@
                 && builtins.any (
                   rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule
                 ) defaultOnTmpfilesRules
+                && hermesModuleVm.config.virtualisation.restrictNetwork
+                && !internetEnabledVm.config.virtualisation.restrictNetwork
+                &&
+                  internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
+                  == "1"
+                && builtins.elem "1.1.1.1" internetEnabledVm.config.services.dnsmasq.settings.server
+                && nixpkgs-unstable.lib.hasInfix "nameserver 127.0.0.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
+                && nixpkgs-unstable.lib.hasInfix "nameserver 1.1.1.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
                 &&
                   units."hermes-network@".serviceConfig.TemporaryFileSystem
                   == hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig.TemporaryFileSystem
@@ -621,6 +643,7 @@
       nixosModules.hermes-specialised-agent = ./modules/services/agent/hermes.nix;
       nixosConfigurations.hermes-module-vm = hermesModuleVm;
       nixosConfigurations.hermes-module-vm-explicit-dashboard = explicitDashboardProbe;
+      nixosConfigurations.hermes-module-vm-internet = internetEnabledVm;
       overlays.default =
         final: prev:
         let
