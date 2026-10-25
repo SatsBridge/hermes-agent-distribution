@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@71cf2267d89c5cb81562390fa70a37fa40b1305e # v6-beta
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
       - id: set-matrix
         name: Generate Nix Matrix
         run: |
@@ -29,7 +29,63 @@ jobs:
       - uses: actions/checkout@71cf2267d89c5cb81562390fa70a37fa40b1305e # v6-beta
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+      - name: Prepare Nix binary cache directory
+        run: mkdir -p "$NIX_BINARY_CACHE"
+        env:
+          NIX_BINARY_CACHE: ${{ runner.temp }}/nix-binary-cache
+      # Exact keys include lock/source; fallback reuses only the same target/system/format.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: nix-cache
+        name: Restore Nix build closure cache
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/nix-binary-cache
+          key: nix-binary-cache-v1:${{ matrix.system }}:${{ matrix.name }}:${{ hashFiles('flake.lock') }}:${{ github.sha }}
+          restore-keys: |
+            nix-binary-cache-v1:${{ matrix.system }}:${{ matrix.name }}:
+      - name: Import cached Nix build closure
+        continue-on-error: true
+        run: |
+          started=$SECONDS
+          if ! find "$NIX_BINARY_CACHE" -type f -name '*.narinfo' -print -quit | grep -q .; then
+            echo "Nix build cache miss ($((SECONDS - started)) s)"
+            exit 0
+          fi
+          # Trust this unsigned repo-scoped cache only here; Nix still verifies NAR hashes.
+          if nix copy --no-check-sigs --all --from "file://$NIX_BINARY_CACHE"; then
+            echo "Imported Nix build cache ($(du -sh "$NIX_BINARY_CACHE" | cut -f1), $((SECONDS - started)) s)"
+          else
+            echo "::warning::Nix build cache import failed; discard it and build normally"
+            rm -rf -- "$NIX_BINARY_CACHE"
+            mkdir -p "$NIX_BINARY_CACHE"
+          fi
+        env:
+          NIX_BINARY_CACHE: ${{ runner.temp }}/nix-binary-cache
       - run: nix build -L ".#${MATRIX}"
         env:
           MATRIX: ${{ matrix.attr }}
+      - id: export-cache
+        name: Export built Nix closure to cache
+        continue-on-error: true
+        run: |
+          started=$SECONDS
+          # The result identifies a successful derivation; Nix skips only an identical check on a hit.
+          # Keep shared toolchains on normal substituters instead of duplicating them in this cache.
+          rm -rf -- "$NIX_BINARY_CACHE"
+          mkdir -p "$NIX_BINARY_CACHE"
+          if nix copy --no-check-sigs --to "file://$NIX_BINARY_CACHE" "$(readlink -f result)"; then
+            echo "Exported Nix build cache ($(du -sh "$NIX_BINARY_CACHE" | cut -f1), $((SECONDS - started)) s)"
+            echo "cache_exported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Nix build cache export failed; the build remains successful"
+          fi
+        env:
+          NIX_BINARY_CACHE: ${{ runner.temp }}/nix-binary-cache
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        name: Save Nix build closure cache
+        if: steps.export-cache.outputs.cache_exported == 'true'
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/nix-binary-cache
+          key: ${{ steps.nix-cache.outputs.cache-primary-key }}
