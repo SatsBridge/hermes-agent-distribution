@@ -360,11 +360,26 @@ let
     network: permission:
     if permission.address == null then
       [
-        network.hostIp
-        network.hostIpv6
+        {
+          family = 4;
+          address = "@${network.host4Set}";
+          source = "@${network.peer4Set}";
+        }
+        {
+          family = 6;
+          address = "@${network.host6Set}";
+          source = "@${network.peer6Set}";
+        }
       ]
     else
-      [ permission.address ];
+      [
+        {
+          family = if isIPv4Address permission.address then 4 else 6;
+          inherit (permission) address;
+          source =
+            if isIPv4Address permission.address then "@${network.peer4Set}" else "@${network.peer6Set}";
+        }
+      ];
   protocolsFor =
     protocol:
     if protocol == "both" then
@@ -380,14 +395,15 @@ let
       lib.concatMap (
         permission:
         lib.concatMap (
-          address:
+          {
+            family,
+            address,
+            source,
+          }:
           map (
             protocol:
             ''iifname "${network.hostIf}" ${
-              if isIPv4Address address then
-                "ip saddr ${network.agentIp} ip daddr"
-              else
-                "ip6 saddr ${network.agentIpv6} ip6 daddr"
+              if family == 4 then "ip saddr ${source} ip daddr" else "ip6 saddr ${source} ip6 daddr"
             } ${address} ${
               if permission.port == null then
                 "meta l4proto ${protocol}"
@@ -404,14 +420,15 @@ let
       lib.concatMap (
         permission:
         lib.concatMap (
-          address:
+          {
+            family,
+            address,
+            source,
+          }:
           map (
             protocol:
             ''oifname "${network.hostIf}" ${
-              if isIPv4Address address then
-                "ip daddr ${network.agentIp} ip saddr"
-              else
-                "ip6 daddr ${network.agentIpv6} ip6 saddr"
+              if family == 4 then "ip daddr ${source} ip saddr" else "ip6 daddr ${source} ip6 saddr"
             } ${address} ${
               if permission.port == null then
                 "meta l4proto ${protocol}"
@@ -453,59 +470,39 @@ let
     builtins.attrNames cfg.agents
   );
   agentNetworks = builtins.listToAttrs (
-    lib.imap0 (
-      index: name:
-      let
-        block = index - (builtins.div index 16384) * 16384;
-        octet2 = 18 + builtins.div index 16384;
-        octet3 = builtins.div block 64;
-        octet4 = (index - (builtins.div index 64) * 64) * 4;
-        network = "198.${toString octet2}.${toString octet3}.${toString octet4}";
-        ipv6High = builtins.div index 256;
-        ipv6Low = index - ipv6High * 256;
-        ipv6Network =
-          if ipv6High == 0 && ipv6Low == 0 then
-            "fd42:198:18::"
-          else if ipv6Low == 0 then
-            "fd42:198:18:${toString ipv6High}::"
-          else
-            "fd42:198:18:${toString ipv6High}:${toString ipv6Low}::";
-      in
-      {
-        inherit name;
-        value = {
-          inherit index name network;
+    lib.imap0 (index: name: {
+      inherit name;
+      value =
+        let
+          macHash = builtins.substring 0 10 (builtins.hashString "sha256" name);
+        in
+        {
+          inherit index name;
           hostIf = "ha${toString index}";
           peerIf = "hb${toString index}";
-          hostIp = "198.${toString octet2}.${toString octet3}.${toString (octet4 + 1)}";
-          agentIp = "198.${toString octet2}.${toString octet3}.${toString (octet4 + 2)}";
-          subnet = "${network}/30";
-          inherit ipv6Network;
-          hostIpv6 = "${ipv6Network}1";
-          agentIpv6 = "${ipv6Network}2";
-          ipv6Subnet = "${ipv6Network}/80";
+          peerMac = "02:${builtins.substring 0 2 macHash}:${builtins.substring 2 2 macHash}:${builtins.substring 4 2 macHash}:${builtins.substring 6 2 macHash}:${builtins.substring 8 2 macHash}";
+          host4Set = "ha${toString index}_host4";
+          peer4Set = "ha${toString index}_peer4";
+          host6Set = "ha${toString index}_host6";
+          peer6Set = "ha${toString index}_peer6";
         };
-      }
-    ) activeAgentNames
+    }) activeAgentNames
   );
+  # The priority -150 guard owns per-agent authorization before these NixOS chain passthroughs.
   agentFirewallInputRules = concatStringsSep "\n" (
-    map (network: ''
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} udp dport 53 accept
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
-      ${permissionRules network cfg.agents.${network.name}.networkAllow}
-    '') (builtins.attrValues agentNetworks)
+    map (network: ''iifname "${network.hostIf}" accept'') (builtins.attrValues agentNetworks)
   );
   agentInputGuardRules = concatStringsSep "\n" (
     map (network: ''
-      iifname "${network.hostIf}" ip6 saddr { ${network.agentIpv6}, fe80::/10 } meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} udp dport 53 accept
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${network.hostIp} tcp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} udp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${network.hostIpv6} tcp dport 53 accept
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} ct direction reply ct state established accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ct direction reply ct state established accept
+      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+      iifname "${network.hostIf}" ip6 saddr { ::, fe80::/10 } meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+      iifname "${network.hostIf}" udp sport 68 udp dport 67 accept
+      iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr @${network.host4Set} udp dport 53 accept
+      iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr @${network.host4Set} tcp dport 53 accept
+      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr @${network.host6Set} udp dport 53 accept
+      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr @${network.host6Set} tcp dport 53 accept
+      iifname "${network.hostIf}" ip saddr @${network.peer4Set} ct direction reply ct state established accept
+      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ct direction reply ct state established accept
       ${permissionRules network cfg.agents.${network.name}.networkAllow}
       iifname "${network.hostIf}" drop
     '') (builtins.attrValues agentNetworks)
@@ -519,35 +516,33 @@ let
         );
         peerDrops = concatStringsSep "\n" (
           map (other: ''
-            iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr ${other.subnet} drop
-            iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr ${other.ipv6Subnet} drop
+            iifname "${network.hostIf}" oifname "${other.hostIf}" drop
+            oifname "${network.hostIf}" iifname "${other.hostIf}" drop
           '') otherNetworks
         );
         permissions = cfg.agents.${network.name}.networkAllow;
       in
       ''
         ${peerDrops}
-        iifname "${network.hostIf}" ip saddr != ${network.agentIp} drop
-        iifname "${network.hostIf}" ip6 saddr != ${network.agentIpv6} drop
+        iifname "${network.hostIf}" ip saddr != @${network.peer4Set} drop
+        iifname "${network.hostIf}" ip6 saddr != @${network.peer6Set} drop
         ${permissionRules network permissions}
-        iifname "${network.hostIf}" ip saddr ${network.agentIp} ip daddr { ${privateIPv4} } drop
-        iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} ip6 daddr { ${privateIPv6} } drop
+        iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr { ${privateIPv4} } drop
+        iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr { ${privateIPv6} } drop
         ${permissionReplyRules network permissions}
         oifname "${network.hostIf}" meta l4proto ipv6-icmp ct state related accept
-        oifname "${network.hostIf}" ip daddr ${network.agentIp} ip saddr { ${privateIPv4} } drop
-        oifname "${network.hostIf}" ip6 daddr ${network.agentIpv6} ip6 saddr { ${privateIPv6} } drop
-        oifname "${network.hostIf}" ip daddr ${network.agentIp} ct state established,related accept
-        oifname "${network.hostIf}" ip6 daddr ${network.agentIpv6} ct state established,related accept
-        oifname "${network.hostIf}" ip daddr ${network.agentIp} drop
-        oifname "${network.hostIf}" ip6 daddr ${network.agentIpv6} drop
+        oifname "${network.hostIf}" ip daddr @${network.peer4Set} ip saddr { ${privateIPv4} } drop
+        oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} ip6 saddr { ${privateIPv6} } drop
+        oifname "${network.hostIf}" ip daddr @${network.peer4Set} ct state established,related accept
+        oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} ct state established,related accept
+        oifname "${network.hostIf}" ip daddr @${network.peer4Set} drop
+        oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} drop
       ''
     ) (builtins.attrValues agentNetworks)
   );
+  # The earlier forward guard owns source, destination, peer, and port policy.
   agentFirewallForwardRules = concatStringsSep "\n" (
-    map (network: ''
-      iifname "${network.hostIf}" ip saddr ${network.agentIp} accept
-      iifname "${network.hostIf}" ip6 saddr ${network.agentIpv6} accept
-    '') (builtins.attrValues agentNetworks)
+    map (network: ''iifname "${network.hostIf}" accept'') (builtins.attrValues agentNetworks)
   );
   mkAgentNetworkSetup =
     name: network: portMappings:
@@ -568,9 +563,9 @@ let
             checkFlags = if mapping.protocol == "tcp" then "-ltn" else "-lun";
             relay =
               if mapping.protocol == "tcp" then
-                "TCP4-LISTEN:${toString mapping.agentPort},bind=${network.agentIp},reuseaddr,fork TCP4:127.0.0.1:${toString mapping.agentPort}"
+                "TCP4-LISTEN:${toString mapping.agentPort},bind=\"$agent_ip\",reuseaddr,fork TCP4:127.0.0.1:${toString mapping.agentPort}"
               else
-                "UDP4-RECVFROM:${toString mapping.agentPort},bind=${network.agentIp},fork UDP4-SENDTO:127.0.0.1:${toString mapping.agentPort}";
+                "UDP4-RECVFROM:${toString mapping.agentPort},bind=\"$agent_ip\",fork UDP4-SENDTO:127.0.0.1:${toString mapping.agentPort}";
           in
           ''
             ${lib.getExe' pkgs.util-linux "setpriv"} --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
@@ -579,10 +574,10 @@ let
             relay_pid=$!
             relay_pids+=("$relay_pid")
             for _ in {1..50}; do
-              if ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "${network.agentIp}:${toString mapping.agentPort}"; then break; fi
+              if ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "$agent_ip:${toString mapping.agentPort}"; then break; fi
               sleep 0.1
             done
-            ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "${network.agentIp}:${toString mapping.agentPort}" || {
+            ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "$agent_ip:${toString mapping.agentPort}" || {
               echo "${mapping.protocol} loopback relay failed to bind namespace port ${toString mapping.agentPort}" >&2
               exit 1
             }
@@ -596,9 +591,9 @@ let
             checkFlags = if mapping.protocol == "tcp" then "-ltn" else "-lun";
             proxy =
               if mapping.protocol == "tcp" then
-                "TCP4-LISTEN:${toString mapping.hostPort},bind=127.0.0.1,reuseaddr,fork TCP4:${network.agentIp}:${toString mapping.agentPort}"
+                "TCP4-LISTEN:${toString mapping.hostPort},bind=127.0.0.1,reuseaddr,fork TCP4:\"$agent_ip\":${toString mapping.agentPort}"
               else
-                "UDP4-RECVFROM:${toString mapping.hostPort},bind=127.0.0.1,fork UDP4-SENDTO:${network.agentIp}:${toString mapping.agentPort}";
+                "UDP4-RECVFROM:${toString mapping.hostPort},bind=127.0.0.1,fork UDP4-SENDTO:\"$agent_ip\":${toString mapping.agentPort}";
           in
           ''
             if host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -q .; then
@@ -634,138 +629,288 @@ let
           gawk
           gnugrep
           iproute2
+          nftables
           python3
+          systemd
           util-linux
+          dnsmasq
+          socat
           ;
       };
       text = ''
-                host() { ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- "$@"; }
-                host_if=${network.hostIf}
-                peer_if=${network.peerIf}
-                host_ip=${network.hostIp}
-                agent_ip=${network.agentIp}
-                subnet=${network.subnet}
-                host_ip6=${network.hostIpv6}
-                agent_ip6=${network.agentIpv6}
-                subnet6=${network.ipv6Subnet}
-                alias=hermes-agent-${name}
+        host() { ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- "$@"; }
+        host_if=${lib.escapeShellArg network.hostIf}
+        peer_if=${lib.escapeShellArg network.peerIf}
+        peer_mac=${lib.escapeShellArg network.peerMac}
+        alias=${lib.escapeShellArg "hermes-agent-${name}"}
+        host4_set=${lib.escapeShellArg network.host4Set}
+        peer4_set=${lib.escapeShellArg network.peer4Set}
+        host6_set=${lib.escapeShellArg network.host6Set}
+        peer6_set=${lib.escapeShellArg network.peer6Set}
+        ra_dropin=/run/systemd/network/40-hermes-agent-${toString network.index}.network.d/50-hermes-ipv6-prefix.conf
+        runtime_dir=/run/hermes-agent-network-${toString network.index}
 
-                dns_pid=
-                proxy_pids=()
-                relay_pids=()
-                created_link=0
+        dns_pid=
+        proxy_pids=()
+        relay_pids=()
+        created_link=0
 
-                cleanup() {
-                  set +e
-                  if [[ -n "$dns_pid" ]]; then
-                    kill "$dns_pid" 2>/dev/null || true
-                    wait "$dns_pid" 2>/dev/null || true
-                  fi
-                  for proxy_pid in "''${proxy_pids[@]}"; do
-                    kill "$proxy_pid" 2>/dev/null || true
-                    wait "$proxy_pid" 2>/dev/null || true
-                  done
-                  for relay_pid in "''${relay_pids[@]}"; do
-                    kill "$relay_pid" 2>/dev/null || true
-                    wait "$relay_pid" 2>/dev/null || true
-                  done
-                  if (( created_link )); then
-                    host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
-                  elif host ${lib.getExe' pkgs.iproute2 "ip"} -details link show dev "$host_if" 2>/dev/null | grep -Fq "alias $alias"; then
-                    host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
-                  fi
-                }
-                setup_error() {
-                  local status=$?
-                  trap - ERR EXIT
-                  cleanup
-                  exit "$status"
-                }
+        read_addresses() {
+          local family="$1" device="$2" prefix="$3" output
+          if [[ "$device" == "$host_if" ]]; then
+            output=$(host ${lib.getExe' pkgs.iproute2 "ip"} -j "$family" address show dev "$device")
+          else
+            output=$(${lib.getExe' pkgs.iproute2 "ip"} -j "$family" address show dev "$device")
+          fi
+          ${lib.getExe' pkgs.python3 "python3"} -c '
+        import json, sys
+        expected_family, expected_prefix = sys.argv[1:]
+        data = json.load(sys.stdin)
+        for link in data:
+            for item in link.get("addr_info", []):
+                if item.get("family") != expected_family or item.get("prefixlen") != int(expected_prefix) or item.get("scope") != "global":
+                    continue
+                if set(item.get("flags", [])) & {"tentative", "dadfailed", "deprecated"}:
+                    continue
+                print(item["local"])
+        ' "$([[ "$family" == -4 ]] && printf inet || printf inet6)" "$prefix" <<<"$output" | sort -u
+        }
 
-                if [[ "''${1:-setup}" == cleanup ]]; then
-                  cleanup
-                  exit 0
-                fi
-                [[ "''${1:-setup}" == setup ]] || { echo "usage: $0 [setup|cleanup]" >&2; exit 2; }
-                trap cleanup EXIT
-                trap 'exit 130' INT
-                trap 'exit 143' TERM
-                trap setup_error ERR
+        flush_firewall() {
+          {
+            printf 'flush set inet hermes-agent-guard %s\n' "$host4_set" "$peer4_set" "$host6_set" "$peer6_set"
+          } | host ${lib.getExe' pkgs.nftables "nft"} -f - 2>/dev/null || true
+        }
 
-                if host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$host_if" >/dev/null 2>&1 \
-                  || host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$peer_if" >/dev/null 2>&1; then
-                  echo "Refusing to replace an existing Hermes network interface: $host_if/$peer_if" >&2
-                  exit 1
-                fi
-                routes="$(host ${lib.getExe' pkgs.iproute2 "ip"} -4 route show table all)"
-                addresses="$(host ${lib.getExe' pkgs.iproute2 "ip"} -o -4 address show)"
-                routes6="$(host ${lib.getExe' pkgs.iproute2 "ip"} -6 route show table all)"
-                addresses6="$(host ${lib.getExe' pkgs.iproute2 "ip"} -o -6 address show)"
-                ${lib.getExe' pkgs.python3 "python3"} - "$subnet" "$routes" "$addresses" "$subnet6" "$routes6" "$addresses6" <<'PY'
+        networkd_reload() {
+          ${lib.getExe' pkgs.util-linux "flock"} --exclusive --wait 15 /run/systemd/network/.hermes-networkd.lock \
+            ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.systemd "networkctl"} reload
+        }
+
+        networkd_reconfigure() {
+          # shellcheck disable=SC2016
+          ${lib.getExe' pkgs.util-linux "flock"} --exclusive --wait 15 /run/systemd/network/.hermes-networkd.lock \
+            ${lib.getExe' pkgs.bash "bash"} -c '
+              ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.systemd "networkctl"} reload &&
+              ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.systemd "networkctl"} reconfigure "$1"
+            ' -- "$host_if"
+        }
+
+        cleanup() {
+          set +e
+          flush_firewall
+          if [[ -n "$dns_pid" ]]; then
+            kill "$dns_pid" 2>/dev/null || true
+            wait "$dns_pid" 2>/dev/null || true
+          fi
+          for proxy_pid in "''${proxy_pids[@]}"; do
+            kill "$proxy_pid" 2>/dev/null || true
+            wait "$proxy_pid" 2>/dev/null || true
+          done
+          for relay_pid in "''${relay_pids[@]}"; do
+            kill "$relay_pid" 2>/dev/null || true
+            wait "$relay_pid" 2>/dev/null || true
+          done
+          if [[ -e "$ra_dropin" ]]; then
+            rm -f -- "$ra_dropin"
+            networkd_reload >/dev/null 2>&1 || true
+          fi
+          if (( created_link )); then
+            host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
+          elif [[ "''${1:-setup}" != ready ]] && host ${lib.getExe' pkgs.iproute2 "ip"} -details link show dev "$host_if" 2>/dev/null | grep -Fq "alias $alias"; then
+            host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
+          fi
+        }
+        setup_error() {
+          local status=$?
+          trap - ERR EXIT
+          cleanup
+          exit "$status"
+        }
+
+        check_routes() {
+          local subnet4="$1" subnet6="$2" routes4 routes6 addresses4 addresses6
+          routes4="$(host ${lib.getExe' pkgs.iproute2 "ip"} -4 route show table all)"
+          routes6="$(host ${lib.getExe' pkgs.iproute2 "ip"} -6 route show table all)"
+          addresses4="$(host ${lib.getExe' pkgs.iproute2 "ip"} -o -4 address show)"
+          addresses6="$(host ${lib.getExe' pkgs.iproute2 "ip"} -o -6 address show)"
+          ${lib.getExe' pkgs.python3 "python3"} - "$subnet4" "$subnet6" "$host_if" "$routes4" "$routes6" "$addresses4" "$addresses6" <<'PY'
         import ipaddress
         import sys
 
-        def check(target_text, routes_text, addresses_text, family):
-            target = ipaddress.ip_network(target_text)
-            address_key = "inet6" if family == 6 else "inet"
-            for line in routes_text.splitlines():
-                destination = line.split()[0]
-                if destination == "default":
+        subnet4, subnet6, interface, routes4, routes6, addresses4, addresses6 = sys.argv[1:]
+        for target, routes, addresses, family, key in (
+            (subnet4, routes4, addresses4, 4, "inet"),
+            (subnet6, routes6, addresses6, 6, "inet6"),
+        ):
+            target = ipaddress.ip_network(target)
+            for line in routes.splitlines():
+                if f"dev {interface}" in line or line.split()[0] == "default":
                     continue
                 try:
-                    route = ipaddress.ip_network(destination, strict=False)
+                    route = ipaddress.ip_network(line.split()[0], strict=False)
                 except ValueError:
                     continue
                 if route.version == family and route.prefixlen and target.overlaps(route):
                     raise SystemExit(f"Hermes subnet {target} overlaps host route {route}: {line}")
-            for line in addresses_text.splitlines():
+            for line in addresses.splitlines():
                 fields = line.split()
+                if len(fields) < 4 or fields[1] == interface:
+                    continue
                 try:
-                    address = ipaddress.ip_interface(fields[fields.index(address_key) + 1])
+                    address = ipaddress.ip_interface(fields[fields.index(key) + 1])
                 except (ValueError, IndexError):
                     continue
                 if target.overlaps(address.network):
                     raise SystemExit(f"Hermes subnet {target} overlaps host address {address}: {line}")
-
-        check(sys.argv[1], sys.argv[2], sys.argv[3], 4)
-        check(sys.argv[4], sys.argv[5], sys.argv[6], 6)
         PY
+        }
 
-                host ${lib.getExe' pkgs.iproute2 "ip"} link add "$host_if" type veth peer name "$peer_if"
-                created_link=1
-                host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" alias "$alias"
-                host ${lib.getExe' pkgs.iproute2 "ip"} address add "$host_ip/30" dev "$host_if"
-                host ${lib.getExe' pkgs.iproute2 "ip"} -6 address add "$host_ip6/80" dev "$host_if" nodad
-                host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" netns "$$"
-                ${lib.getExe' pkgs.iproute2 "ip"} address add "$agent_ip/30" dev "$peer_if"
-                ${lib.getExe' pkgs.iproute2 "ip"} -6 address add "$agent_ip6/80" dev "$peer_if" nodad
-                ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" up
-                ${lib.getExe' pkgs.iproute2 "ip"} route add default via "$host_ip" dev "$peer_if"
-                ${lib.getExe' pkgs.iproute2 "ip"} -6 route add default via "$host_ip6" dev "$peer_if"
+        if [[ "''${1:-setup}" == cleanup ]]; then
+          cleanup
+          exit 0
+        fi
+        if [[ "''${1:-setup}" == ready ]]; then
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          trap setup_error ERR
+          for attempt in {1..300}; do
+            mapfile -t host4 < <(read_addresses -4 "$host_if" 30)
+            mapfile -t peer4 < <(read_addresses -4 "$peer_if" 30)
+            mapfile -t host6 < <(read_addresses -6 "$host_if" 64)
+            if (( ''${#host4[@]} == 1 && ''${#peer4[@]} == 1 && ''${#host6[@]} > 0 )); then
+              host_ip="''${host4[0]}"
+              agent_ip="''${peer4[0]}"
+              host_ip6="''${host6[0]}"
+              prefix6=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/64").network)' "$host_ip6")
+              mapfile -t peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); print("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
+              if (( ''${#peer6[@]} > 0 )) \
+                && ${lib.getExe' pkgs.iproute2 "ip"} -4 route show default | grep -Fq "via $host_ip dev $peer_if" \
+                && ${lib.getExe' pkgs.iproute2 "ip"} -6 route show default | grep -Fq "dev $peer_if"; then
+                break
+              fi
+            fi
+            if (( attempt == 300 )); then echo "${name}: DHCP/SLAAC readiness timed out on $peer_if" >&2; exit 1; fi
+            sleep 0.1
+          done
+          subnet4=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/30").network)' "$host_ip")
+          check_routes "$subnet4" "$prefix6"
+          {
+            for set in "$host4_set" "$peer4_set" "$host6_set" "$peer6_set"; do printf 'flush set inet hermes-agent-guard %s\n' "$set"; done
+            printf 'add element inet hermes-agent-guard %s { %s }\n' "$host4_set" "$host_ip"
+            printf 'add element inet hermes-agent-guard %s { %s }\n' "$peer4_set" "$agent_ip"
+            for address in "''${host6[@]}"; do printf 'add element inet hermes-agent-guard %s { %s }\n' "$host6_set" "$address"; done
+            for address in "''${peer6[@]}"; do printf 'add element inet hermes-agent-guard %s { %s }\n' "$peer6_set" "$address"; done
+          } | host ${lib.getExe' pkgs.nftables "nft"} -f -
+          verify_set() {
+            local set="$1" expected="$2" actual
+            actual=$(host ${lib.getExe' pkgs.nftables "nft"} -n list set inet hermes-agent-guard "$set" | ${lib.getExe' pkgs.python3 "python3"} -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"elements\s*=\s*\{([^}]*)\}",s); print(",".join(sorted(x.strip() for x in m.group(1).split(",") if x.strip())) if m else "")')
+            [[ "$actual" == "$expected" ]]
+          }
+          expected_host6=$(printf '%s\n' "''${host6[@]}" | sort -u | paste -sd,)
+          expected_peer6=$(printf '%s\n' "''${peer6[@]}" | sort -u | paste -sd,)
+          if ! verify_set "$host4_set" "$host_ip" || ! verify_set "$peer4_set" "$agent_ip" \
+            || ! verify_set "$host6_set" "$expected_host6" || ! verify_set "$peer6_set" "$expected_peer6"; then
+            echo "${name}: firewall set readback did not match allocation" >&2
+            exit 1
+          fi
+          install -d -m 0750 "$runtime_dir"
+          printf 'nameserver %s\nnameserver %s\noptions attempts:1 timeout:2\n' "$host_ip" "$host_ip6" >"$runtime_dir/resolv.conf.tmp"
+          chmod 0644 "$runtime_dir/resolv.conf.tmp"
+          mv -f -- "$runtime_dir/resolv.conf.tmp" "$runtime_dir/resolv.conf"
+          mapfile -t dns_upstreams < <(awk '$1 == "nameserver" && NF >= 2 { print $2 }' /run/hermes-host-resolv.conf)
+          ((''${#dns_upstreams[@]} > 0)) || { echo "No host nameservers in /etc/resolv.conf" >&2; exit 1; }
+          dns_args=()
+          for dns_upstream in "''${dns_upstreams[@]}"; do dns_args+=("--server=$dns_upstream"); done
+          ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.dnsmasq "dnsmasq"} \
+            --no-daemon --no-resolv --no-hosts --bind-dynamic --listen-address="$host_ip" --listen-address="$host_ip6" \
+            --user=nobody --group=nogroup --port=53 "''${dns_args[@]}" >/dev/null 2>&1 &
+          dns_pid=$!
+          ${namespaceRelayCommands}
+          ${hostForwardCommands}
+          for _ in {1..50}; do
+            if host ${lib.getExe' pkgs.iproute2 "ss"} -H -lun 'sport = :53' | grep -Fq "$host_ip:53" \
+              && host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn 'sport = :53' | grep -Fq "$host_ip:53" \
+              && host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -lun 'sport = :53' | grep -Fq "$host_ip6" \
+              && host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -ltn 'sport = :53' | grep -Fq "$host_ip6"; then break; fi
+            sleep 0.1
+          done
+          if ! host ${lib.getExe' pkgs.iproute2 "ss"} -H -lun 'sport = :53' | grep -Fq "$host_ip:53" \
+            || ! host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn 'sport = :53' | grep -Fq "$host_ip:53" \
+            || ! host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -lun 'sport = :53' | grep -Fq "$host_ip6" \
+            || ! host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -ltn 'sport = :53' | grep -Fq "$host_ip6"; then
+            echo "${name}: DNS listener readiness failed for $host_ip/$host_ip6" >&2
+            exit 1
+          fi
+          generation=$(printf '%s\n' "$host_ip" "$agent_ip" "''${host6[*]}" "''${peer6[*]}" | sha256sum | cut -d' ' -f1)
+          ${lib.getExe' pkgs.systemd "systemd-notify"} --ready --status="${name} network generation $generation verified"
+          echo "${name}: network generation $generation ready on $host_if/$peer_if; DHCPv4, SLAAC, DNS and nftables verified"
+          while sleep 1; do
+            mapfile -t current_host4 < <(read_addresses -4 "$host_if" 30)
+            mapfile -t current_peer4 < <(read_addresses -4 "$peer_if" 30)
+            mapfile -t current_host6 < <(read_addresses -6 "$host_if" 64)
+            mapfile -t current_peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); print("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
+            if [[ "''${current_host4[*]}" == "''${host4[*]}" && "''${current_peer4[*]}" == "''${peer4[*]}" \
+              && "''${current_host6[*]}" == "''${host6[*]}" && "''${current_peer6[*]}" == "''${peer6[*]}" ]] \
+              && ${lib.getExe' pkgs.iproute2 "ip"} -4 route show default | grep -Fq "via $host_ip dev $peer_if" \
+              && ${lib.getExe' pkgs.iproute2 "ip"} -6 route show default | grep -Fq "dev $peer_if"; then
+              :
+            else
+              flush_firewall
+              echo "${name}: DHCP/SLAAC address or route changed; ordinary traffic revoked" >&2
+              exit 1
+            fi
+            if ! verify_set "$host4_set" "$host_ip" || ! verify_set "$peer4_set" "$agent_ip" \
+              || ! verify_set "$host6_set" "$expected_host6" || ! verify_set "$peer6_set" "$expected_peer6"; then
+              flush_firewall
+              echo "${name}: firewall generation lost; ordinary traffic revoked" >&2
+              exit 1
+            fi
+          done
+        fi
+        [[ "''${1:-setup}" == setup ]] || { echo "usage: $0 [setup|ready|cleanup]" >&2; exit 2; }
+        [[ "''${1:-setup}" == setup ]] || { echo "usage: $0 [setup|ready|cleanup]" >&2; exit 2; }
+        trap cleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap setup_error ERR
 
-                host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" up
-                mapfile -t dns_upstreams < <(awk '$1 == "nameserver" && NF >= 2 { print $2 }' /run/hermes-host-resolv.conf)
-                ((''${#dns_upstreams[@]} > 0)) || { echo "No host nameservers in /etc/resolv.conf" >&2; exit 1; }
-                dns_args=()
-                for dns_upstream in "''${dns_upstreams[@]}"; do dns_args+=("--server=$dns_upstream"); done
-                ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.dnsmasq "dnsmasq"} \
-                  --no-daemon --no-resolv --no-hosts --bind-dynamic \
-                  --listen-address="$host_ip" --listen-address="$host_ip6" \
-                  --user=nobody --group=nogroup --port=53 "''${dns_args[@]}" >/dev/null 2>&1 &
-                dns_pid=$!
-                dns_ready=0
-                for _ in {1..50}; do
-                  if host ${lib.getExe' pkgs.iproute2 "ss"} -H -lun 'sport = :53' | grep -Fq "$host_ip:53"; then
-                    dns_ready=1
-                    break
-                  fi
-                  sleep 0.1
-                done
-                (( dns_ready )) || { echo "DNS forwarder did not bind $host_ip/$host_ip6:53" >&2; exit 1; }
-                ${namespaceRelayCommands}
-                ${hostForwardCommands}
-                trap - ERR INT TERM EXIT
-                echo "Configured $host_if <-> $peer_if for hermes@${name}: $agent_ip/$agent_ip6 via $host_ip/$host_ip6; DNS upstreams: ''${dns_upstreams[*]}"
+        if host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$host_if" >/dev/null 2>&1 \
+          || host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$peer_if" >/dev/null 2>&1; then
+          echo "Refusing to replace an existing Hermes network interface: $host_if/$peer_if" >&2
+          exit 1
+        fi
+        if [[ -e "$ra_dropin" ]]; then
+          rm -f -- "$ra_dropin"
+          networkd_reload
+        fi
+        host ${lib.getExe' pkgs.iproute2 "ip"} link add "$host_if" type veth peer name "$peer_if"
+        created_link=1
+        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" alias "$alias"
+        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" address "$peer_mac"
+        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" netns "$$"
+        ${lib.getExe' pkgs.iproute2 "ip"} link set dev lo up
+        ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" up
+        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" up
+        host_ip=
+        host_ip6=
+        for attempt in {1..300}; do
+          mapfile -t host4 < <(read_addresses -4 "$host_if" 30)
+          mapfile -t host6 < <(read_addresses -6 "$host_if" 64)
+          if (( ''${#host4[@]} == 1 && ''${#host6[@]} > 0 )); then host_ip="''${host4[0]}"; host_ip6="''${host6[0]}"; break; fi
+          sleep 0.1
+        done
+        [[ -n "$host_ip" && -n "$host_ip6" ]] || { echo "${name}: networkd did not allocate host veth addresses within 30s" >&2; exit 1; }
+        subnet4=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/30").network)' "$host_ip")
+        subnet6=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/64").network)' "$host_ip6")
+        check_routes "$subnet4" "$subnet6"
+        install -d -m 0755 "''${ra_dropin%/*}"
+        printf '[IPv6Prefix]\nPrefix=%s\nAddressAutoconfiguration=yes\nOnLink=yes\n' "$subnet6" >"$ra_dropin"
+        chmod 0644 "$ra_dropin"
+        networkd_reconfigure
+        trap - ERR INT TERM EXIT
+        echo "${name}: networkd allocated $host_if $host_ip/$subnet4 and $host_ip6/$subnet6; dynamic SLAAC prefix published"
       '';
     };
   cfg = config.services.hermes-specialised-agent;
@@ -795,7 +940,14 @@ let
       agentNetwork = agentNetworks.${name};
       portMappings = portMappingsForAgent name;
       networkSetup = mkAgentNetworkSetup name agentNetwork portMappings;
-      resolvConf = pkgs.writeText "${agentStateId}-resolv.conf" "nameserver ${agentNetwork.hostIp}\nnameserver ${agentNetwork.hostIpv6}\noptions attempts:1 timeout:2\n";
+      dhcpExecStart = pkgs.writeShellApplication {
+        name = "hermes-dhcp-${toString agentNetwork.index}";
+        runtimeInputs = [ pkgs.dhcpcd ];
+        text = ''
+          exec ${lib.getExe pkgs.dhcpcd} --nobackground --waitip=4 --timeout=25 \
+            --nohook=resolv.conf,hostname,ntp.conf --config=/dev/null ${agentNetwork.peerIf}
+        '';
+      };
       agentConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
         lib.recursiveUpdate agentCfg.settings {
           kanban = {
@@ -904,7 +1056,6 @@ let
           agentCfg.package
           execStart
           gatewayOwnershipExecStartPre
-          resolvConf
           agentConfig
           profileFarm
           pkgs.cacert
@@ -923,6 +1074,10 @@ let
         ++ serviceExecRoots "hermes-network@${name}"
         ++ [ networkSetup ]
       );
+      dhcpClosure = closureStorePaths [
+        dhcpExecStart
+        pkgs.dhcpcd
+      ];
       publicStateClosure = closureStorePaths (
         lib.subtractLists config.systemd.services."hermes-pf@".path
           config.systemd.services."hermes-pf@${name}".path
@@ -940,6 +1095,27 @@ let
             ExecStopPost = "${lib.getExe networkSetup} cleanup";
           };
         };
+        "hermes-dhcp@${name}" = {
+          after = [ "hermes-network@${name}.service" ];
+          bindsTo = [ "hermes-network@${name}.service" ];
+          overrideStrategy = "asDropin";
+          serviceConfig = {
+            BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ] ++ dhcpClosure;
+            ExecStart = lib.getExe dhcpExecStart;
+          };
+        };
+        "hermes-network-ready@${name}" = {
+          overrideStrategy = "asDropin";
+          serviceConfig = {
+            BindReadOnlyPaths = [ "/etc/resolv.conf:/run/hermes-host-resolv.conf" ] ++ networkClosure;
+            ExecStart = "${lib.getExe networkSetup} ready";
+            RuntimeDirectory = [ "hermes-agent-network-${toString agentNetwork.index}" ];
+            ReadWritePaths = [
+              "/run/systemd/network"
+              "/run/hermes-agent-network-${toString agentNetwork.index}"
+            ];
+          };
+        };
         "hermes-pf@${name}" = {
           overrideStrategy = "asDropin";
           serviceConfig.BindReadOnlyPaths = publicStateClosure;
@@ -949,11 +1125,13 @@ let
           after = [
             "network-online.target"
             "hermes-network@${name}.service"
+            "hermes-network-ready@${name}.service"
           ]
           ++ optional (cfg.mainAgent != name) "hermes@${cfg.mainAgent}.service";
           bindsTo = [
             "network-online.target"
             "hermes-network@${name}.service"
+            "hermes-network-ready@${name}.service"
           ]
           ++ optional (cfg.mainAgent != name) "hermes@${cfg.mainAgent}.service";
           environment = {
@@ -972,7 +1150,10 @@ let
             ++ map ({ name, ... }: "%S/${name}") (
               builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames
             );
-            BindReadOnlyPaths = [ "${resolvConf}:/etc/resolv.conf" ] ++ gatewayClosure;
+            BindReadOnlyPaths = [
+              "/run/hermes-agent-network-${toString agentNetwork.index}/resolv.conf:/etc/resolv.conf"
+            ]
+            ++ gatewayClosure;
             InaccessiblePaths = nixStoreAliasPaths;
             TemporaryFileSystem = [ "/nix:ro" ];
             ExecStartPre = optional cfg.installDefaultSkills (lib.getExe installSkillsExecStartPre);
@@ -1134,13 +1315,19 @@ let
           after = [
             "network-online.target"
             "nftables.service"
+            "systemd-networkd.service"
           ];
           description = "Configure isolated network for Hermes agent %i";
           partOf = [
             "nftables.service"
+            "systemd-networkd.service"
+            "hermes-network-ready@%i.service"
             "hermes@%i.service"
           ];
-          requires = [ "nftables.service" ];
+          requires = [
+            "nftables.service"
+            "systemd-networkd.service"
+          ];
           wants = [ "network-online.target" ];
           serviceConfig = {
             AmbientCapabilities = [ ];
@@ -1160,6 +1347,7 @@ let
             PrivateTmp = true;
             ProtectHome = true;
             ProtectSystem = "strict";
+            ReadWritePaths = [ "/run/systemd/network" ];
             RestrictAddressFamilies = [
               "AF_INET"
               "AF_INET6"
@@ -1171,6 +1359,154 @@ let
             TimeoutStopSec = "15s";
             Type = "oneshot";
             RemainAfterExit = true;
+          };
+        };
+        "hermes-dhcp@" = {
+          after = [ "hermes-network@%i.service" ];
+          bindsTo = [ "hermes-network@%i.service" ];
+          description = "Acquire the isolated DHCP lease for Hermes agent %i";
+          unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
+          serviceConfig = {
+            AmbientCapabilities = [
+              "CAP_NET_ADMIN"
+              "CAP_NET_BIND_SERVICE"
+              "CAP_NET_RAW"
+            ];
+            CapabilityBoundingSet = [
+              "CAP_NET_ADMIN"
+              "CAP_NET_BIND_SERVICE"
+              "CAP_NET_RAW"
+            ];
+            NoNewPrivileges = true;
+            BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ];
+            CoredumpFilter = "0x00";
+            DevicePolicy = "closed";
+            InaccessiblePaths = nixStoreAliasPaths;
+            KeyringMode = "private";
+            LockPersonality = true;
+            MemoryKSM = true;
+            PrivateDevices = true;
+            PrivateNetwork = true;
+            PrivateMounts = true;
+            PrivateTmp = true;
+            MountAPIVFS = true;
+            ProtectClock = true;
+            ProtectControlGroups = "strict";
+            ProtectHome = true;
+            ProtectHostname = "private";
+            ProtectKernelLogs = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectProc = "invisible";
+            ProtectSystem = "strict";
+            ReadWritePaths = [
+              "/run"
+              "/var/run"
+              "/var/lib/dhcpcd"
+            ];
+            RootDirectory = "%t/hermes-dhcp-%i/root";
+            RuntimeDirectory = [
+              "hermes-dhcp-%i"
+              "hermes-dhcp-%i/root"
+              "hermes-dhcp-%i/root/etc"
+              "hermes-dhcp-%i/root/run"
+              "hermes-dhcp-%i/root/var"
+              "hermes-dhcp-%i/root/var/lib"
+              "hermes-dhcp-%i/root/var/lib/dhcpcd"
+              "hermes-dhcp-%i/root/var/run"
+              "hermes-dhcp-%i/root/var/run/dhcpcd"
+            ];
+            RuntimeDirectoryMode = "0700";
+            RuntimeDirectoryPreserve = false;
+            RestrictAddressFamilies = [
+              "AF_INET"
+              "AF_INET6"
+              "AF_NETLINK"
+              "AF_PACKET"
+              "AF_UNIX"
+            ];
+            RestrictNamespaces = true;
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            RemoveIPC = true;
+            SystemCallArchitectures = "native";
+            SystemCallErrorNumber = "EPERM";
+            SystemCallFilter = [
+              "@system-service"
+              "~@resources"
+              "~@privileged"
+            ];
+            TemporaryFileSystem = [
+              "/nix:ro"
+              "/run"
+              "/var/run"
+              "/var/lib/dhcpcd"
+            ];
+            TimeoutStartSec = "30s";
+            TimeoutStopSec = "15s";
+            Type = "exec";
+            Restart = "no";
+            UMask = "0077";
+          };
+        };
+        "hermes-network-ready@" = {
+          after = [
+            "hermes-network@%i.service"
+            "hermes-dhcp@%i.service"
+          ];
+          bindsTo = [
+            "hermes-network@%i.service"
+            "hermes-dhcp@%i.service"
+          ];
+          description = "Verify DHCP, SLAAC and firewall readiness for Hermes agent %i";
+          partOf = [
+            "nftables.service"
+            "systemd-networkd.service"
+            "hermes@%i.service"
+          ];
+          requires = [
+            "hermes-network@%i.service"
+            "hermes-dhcp@%i.service"
+          ];
+          unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
+          serviceConfig = {
+            AmbientCapabilities = [
+              "CAP_NET_ADMIN"
+              "CAP_NET_BIND_SERVICE"
+              "CAP_SETGID"
+              "CAP_SETUID"
+              "CAP_SYS_ADMIN"
+              "CAP_SYS_PTRACE"
+            ];
+            CapabilityBoundingSet = [
+              "CAP_NET_ADMIN"
+              "CAP_NET_BIND_SERVICE"
+              "CAP_SETGID"
+              "CAP_SETUID"
+              "CAP_SYS_ADMIN"
+              "CAP_SYS_PTRACE"
+            ];
+            InaccessiblePaths = nixStoreAliasPaths;
+            NoNewPrivileges = true;
+            NotifyAccess = "all";
+            PrivateDevices = true;
+            PrivateIPC = true;
+            PrivateNetwork = true;
+            PrivateTmp = true;
+            ProtectHome = true;
+            ProtectSystem = "strict";
+            ReadWritePaths = [ "/run/systemd/network" ];
+            RestrictAddressFamilies = [
+              "AF_INET"
+              "AF_INET6"
+              "AF_NETLINK"
+              "AF_UNIX"
+            ];
+            TemporaryFileSystem = [ "/nix:ro" ];
+            TimeoutStartSec = "40s";
+            TimeoutStopSec = "15s";
+            Type = "notify";
+            Restart = "no";
           };
         };
         "hermes-pf@" = {
@@ -1253,10 +1589,16 @@ let
           after = [
             "network-online.target"
             "hermes-network@%i.service"
+            "hermes-network-ready@%i.service"
           ];
           bindsTo = [
             "network-online.target"
             "hermes-network@%i.service"
+            "hermes-network-ready@%i.service"
+          ];
+          partOf = [
+            "nftables.service"
+            "systemd-networkd.service"
           ];
           description = "Hermes Agent Gateway";
           enableDefaultPath = false;
@@ -1384,6 +1726,14 @@ in
         message = "services.hermes-agent: at most 32768 active agents can be assigned isolated IPv4 veth subnets";
       }
       {
+        assertion =
+          builtins.length (map (network: network.peerMac) (builtins.attrValues agentNetworks))
+          == builtins.length (
+            lib.unique (map (network: network.peerMac) (builtins.attrValues agentNetworks))
+          );
+        message = "services.hermes-agent: generated DHCP client MAC addresses must be unique";
+      }
+      {
         assertion = !cfg.enable || activeAgentNames == [ ] || config.networking.firewall.enable;
         message = "services.hermes-agent: the host firewall must be enabled to enforce per-agent network isolation";
       }
@@ -1413,9 +1763,43 @@ in
     networking.firewall.extraForwardRules = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
       lib.mkBefore agentFirewallForwardRules
     );
+    environment.etc = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
+      lib.mapAttrs' (_: network: {
+        name = "systemd/network/40-hermes-agent-${toString network.index}.network";
+        value.text = ''
+          [Match]
+          Name=${network.hostIf}
+
+          [Link]
+          RequiredForOnline=no
+
+          [Network]
+          Address=0.0.0.0/30
+          Address=::/64
+          DHCPServer=yes
+          IPv4Forwarding=yes
+          IPv6Forwarding=yes
+          IPv6SendRA=yes
+
+          [DHCPServer]
+          PersistLeases=runtime
+          PoolOffset=2
+          PoolSize=1
+          Router=_server_address
+        '';
+      }) agentNetworks
+    );
     networking.nftables.tables."hermes-agent-guard" = lib.mkIf (cfg.enable && activeAgentNames != [ ]) {
       family = "inet";
       content = ''
+        ${concatStringsSep "\n" (
+          lib.concatMap (network: [
+            "set ${network.host4Set} { type ipv4_addr; }"
+            "set ${network.peer4Set} { type ipv4_addr; }"
+            "set ${network.host6Set} { type ipv6_addr; }"
+            "set ${network.peer6Set} { type ipv6_addr; }"
+          ]) (builtins.attrValues agentNetworks)
+        )}
         chain hermes_agent_input_guard {
           type filter hook input priority -150; policy accept;
           ${agentInputGuardRules}
@@ -1426,6 +1810,7 @@ in
         }
       '';
     };
+    networking.dhcpcd.denyInterfaces = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [ "ha*" ];
     networking.nat = lib.mkIf (cfg.enable && activeAgentNames != [ ]) {
       enable = true;
       enableIPv6 = true;
@@ -1434,7 +1819,26 @@ in
     nix.settings.allowed-users = map (name: "hermes-${name}") (builtins.attrNames cfg.agents);
 
     systemd = mkMerge (
-      (mapAttrsToList (mkAgent cfg.agents agentFullNames) cfg.agents)
+      [
+        {
+          tmpfiles.rules = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [
+            "d /run/systemd/network 0755 root root - -"
+          ];
+          additionalUpstreamSystemUnits =
+            lib.mkIf (cfg.enable && activeAgentNames != [ ] && !config.systemd.network.enable)
+              [
+                "systemd-networkd.service"
+                "systemd-networkd.socket"
+              ];
+          sockets.systemd-networkd.wantedBy = lib.mkIf (
+            cfg.enable && activeAgentNames != [ ] && !config.systemd.network.enable
+          ) [ "sockets.target" ];
+          services.systemd-networkd.wantedBy = lib.mkIf (
+            cfg.enable && activeAgentNames != [ ] && !config.systemd.network.enable
+          ) [ "multi-user.target" ];
+        }
+      ]
+      ++ (mapAttrsToList (mkAgent cfg.agents agentFullNames) cfg.agents)
       ++ [
         mkAgentTemplate
         sharedState

@@ -123,6 +123,15 @@
                 tmpfilesRules = hermesModuleVm.config.systemd.tmpfiles.rules;
                 defaultOnUnits = defaultOnProbe.config.systemd.services;
                 defaultOnTmpfilesRules = defaultOnProbe.config.systemd.tmpfiles.rules;
+                disabledAgentProbe = hermesModuleVm.extendModules {
+                  modules = [
+                    ({ lib, ... }: {
+                      services.hermes-specialised-agent.enable = lib.mkForce false;
+                    })
+                  ];
+                };
+                hostNetworkConfig =
+                  hermesModuleVm.config.environment.etc."systemd/network/40-hermes-agent-0.network".text;
                 hasMnemosyne = value: nixpkgs-unstable.lib.hasInfix "mnemosyne" value;
                 hasMnemosyneEnvironment =
                   environment:
@@ -515,6 +524,47 @@
                 && builtins.hasAttr "hermes-vm-late-resolver" units
                 && builtins.elem "network-online.target" units.hermes-vm-late-resolver.before
                 && !hermesModuleVm.config.networking.resolvconf.enable
+                && !hermesModuleVm.config.networking.useNetworkd
+                && units."hermes-dhcp@".serviceConfig.RootDirectory == "%t/hermes-dhcp-%i/root"
+                && units."hermes-dhcp@".serviceConfig.PrivateNetwork
+                && units."hermes-dhcp@".serviceConfig.NoNewPrivileges
+                && units."hermes-dhcp@".serviceConfig.ProtectSystem == "strict"
+                && units."hermes-dhcp@".serviceConfig.ProtectProc == "invisible"
+                && units."hermes-dhcp@".serviceConfig.RestrictNamespaces
+                && units."hermes-dhcp@".serviceConfig.DevicePolicy == "closed"
+                &&
+                  units."hermes-dhcp@".serviceConfig.SystemCallFilter == [
+                    "@system-service"
+                    "~@resources"
+                    "~@privileged"
+                  ]
+                &&
+                  units."hermes-dhcp@".serviceConfig.CapabilityBoundingSet == [
+                    "CAP_NET_ADMIN"
+                    "CAP_NET_BIND_SERVICE"
+                    "CAP_NET_RAW"
+                  ]
+                &&
+                  units."hermes-dhcp@".serviceConfig.AmbientCapabilities == [
+                    "CAP_NET_ADMIN"
+                    "CAP_NET_BIND_SERVICE"
+                    "CAP_NET_RAW"
+                  ]
+                && units."hermes-dhcp@".unitConfig.JoinsNamespaceOf == [ "hermes-network@%i.service" ]
+                && units."hermes-dhcp@vm".serviceConfig ? ExecStart
+                && builtins.any (
+                  path: nixpkgs-unstable.lib.hasInfix "dhcpcd-10.3.2" path
+                ) units."hermes-dhcp@vm".serviceConfig.BindReadOnlyPaths
+                && builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".requires
+                && builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".bindsTo
+                && units."hermes-network-ready@".serviceConfig.Type == "notify"
+                && units."hermes-network-ready@".serviceConfig.Restart == "no"
+                && builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo
+                && nixpkgs-unstable.lib.hasInfix "Address=0.0.0.0/30" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "Address=::/64" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "DHCPServer=yes" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "IPv6SendRA=yes" hostNetworkConfig
+                && !(disabledAgentProbe.config.environment.etc ? "systemd/network/40-hermes-agent-0.network")
                 && units."hermes-network@".serviceConfig.PrivateNetwork
                 && units."hermes-network@".serviceConfig.Type == "oneshot"
                 && units."hermes-network@vm".serviceConfig ? ExecStart

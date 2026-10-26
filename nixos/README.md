@@ -24,27 +24,34 @@ qcow2 metadata/physical allocation.
 
 Each enabled `hermes@NAME.service` keeps effective `PrivateNetwork=yes` and joins
 the namespace of its `hermes-network@NAME.service` companion via
-`JoinsNamespaceOf=`. The companion owns the otherwise isolated namespace, creates
-one veth pair and starts the DNS/localhost port proxies. The nftables input and
-forward rules are declared through `networking.firewall.extraInputRules`,
-`networking.firewall.extraForwardRules`, and an early input guard table; the
-firewall fails closed before a veth is brought up. It fails the agent start if
-veth or DNS setup fails. `hermes-pf@NAME` remains in its own `PrivateNetwork=yes`
-namespace with `RestrictAddressFamilies=AF_UNIX`.
+`JoinsNamespaceOf=`. The companion creates the veth pair; host-side networkd
+configures only the generated `haN` links, while `hermes-dhcp@NAME.service`
+runs dhcpcd in the agent namespace. `hermes-network-ready@NAME.service` is the
+startup barrier: it requires the DHCPv4 lease, usable SLAAC address/default
+route, verified per-agent nftables sets, resolver file, and DNS/proxy listeners
+before notifying systemd that the gateway may start. Address/route or firewall
+generation loss revokes the sets and stops the gateway. `hermes-pf@NAME` remains
+in its own `PrivateNetwork=yes` namespace with `RestrictAddressFamilies=AF_UNIX`.
 The short-lived companion setup process is trusted host-networking code and is
-granted `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE` to move the veth
-and configure the host namespace; its DNS and TCP proxy children drop to
-`nobody` before serving requests.
+granted `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE`; the DHCP client
+has only its private-network configuration capabilities, and the gateway gets
+none. DNS and TCP proxy children drop to `nobody` before serving requests.
 
-agent veths use `haN`/`hbN` interfaces, IPv4 subnets from `198.18.0.0/15`, and
-per-agent ULA IPv6 `/80`s under `fd42:198:18::/48`. Startup fails on overlapping
-host addresses/routes. The host resolver is proxied on each veth's host-side
-addresses; TCP/UDP port 53 to those addresses and required IPv6 neighbor/error
-control, plus established conntrack replies to host-initiated connections, remain
-narrow exceptions. Only `ct direction reply` is accepted, so an agent-originated
-established connection cannot use a mapped source port to bypass a revoked
-permission. Explicit `networkAllow` rules permit only their declared host/private
-tuples; all other new host connections are dropped.
+agent veths use `haN`/`hbN` interfaces. networkd allocates a host IPv4 `/30`
+from its system pool and serves one DHCPv4 address; it allocates a host IPv6
+`/64` and advertises that concrete prefix for peer SLAAC. No upstream prefix
+delegation is required. Allocations are dynamic and are not stable per-agent
+addresses; consumers must discover them at runtime. Startup fails closed on
+overlapping host routes/addresses. A trusted lifecycle process atomically
+publishes exact host/peer addresses into typed nftables sets; declared protocol,
+port, anti-spoofing, and peer-denial rules remain in the earlier guard table.
+The host resolver is proxied on allocated host-side addresses; TCP/UDP port 53
+and required IPv6 neighbor/error/router-solicitation control, plus established
+conntrack replies to host-initiated connections, remain narrow exceptions. Only
+`ct direction reply` is accepted, so an agent-originated established connection
+cannot use a mapped source port to bypass a revoked permission. Explicit
+`networkAllow` rules permit only their declared host/private tuples; all other
+new host connections are dropped.
 Each agent also drops forwarded destinations in IPv4 private/shared/link-local,
 loopback, documentation, benchmarking, multicast and reserved ranges, and IPv6
 ULA, link-local, loopback, documentation, multicast and special-purpose ranges.
@@ -72,10 +79,19 @@ subnets remain denied even if explicitly named. The resolver proxy remains a
 deliberate exception: each agent can query its host-side resolver on TCP/UDP
 53 even without a `networkAllow` entry.
 The network helper waits for `network-online.target` before taking its upstream
-resolver snapshot. Resolver changes after startup are not watched; restart the
-agent service (`systemctl restart hermes@NAME.service`) to rebuild its network
-and refresh the DNS upstreams. If host network readiness never completes, the
-agent stays stopped rather than using an early or empty resolver configuration.
+resolver snapshot. Late-created veths are excluded from the network-online wait
+with `RequiredForOnline=no`. Resolver changes after startup are not watched;
+restart the agent service (`systemctl restart hermes@NAME.service`) to rebuild
+its network and refresh the DNS upstreams. DHCP client lease/runtime/control
+state is private and ephemeral; its namespace-side veth uses a locally
+administered stable MAC so the single-address DHCP lease can be reacquired after
+namespace replacement. Assigned IPs remain runtime state, not a stable API. The
+client runs in a per-agent `RootDirectory`, with only its own DHCP runtime
+closure and ephemeral writable lease/control paths mounted, a closed device
+policy, a syscall allowlist, and the three capabilities needed for DHCP/network
+configuration. It has no host resolver or hostname hooks. If DHCP, SLAAC,
+networkd, resolver, or firewall setup does not
+complete within the bounded startup timeout, the agent remains stopped.
 Traffic to another Hermes agent subnet is blocked. Outbound IPv4/IPv6 routing
 and NAT use NixOS `networking.nat` with nftables;
 `networking.firewall.filterForward`
@@ -86,12 +102,15 @@ must be restricted to a particular host interface.
 
 This changes host-wide NixOS firewall/NAT behavior: the firewall backend becomes
 nftables, forwarding is enabled for IPv4 and IPv6, and unconfigured forwarded
-traffic is filtered. Existing routed networks must be represented by the
+traffic is filtered. It also starts systemd-networkd for only the generated
+Hermes host veths and excludes those interfaces from the host dhcpcd client;
+`networking.useNetworkd` and unrelated uplink ownership are not changed. NAT
+remains NixOS `networking.nat`, including the existing `externalInterface`
+restriction semantics. Existing routed networks must be represented by the
 NixOS firewall/NAT configuration (or explicit nftables forward rules). Existing
 `networking.firewall.extraCommands` or `networking.nat.extraCommands` are
 incompatible with the nftables backends and cause configuration evaluation to
-fail. The host must have no pre-existing routes/addresses overlapping the
-reserved Hermes ranges. IPv6 egress depends on host IPv6 connectivity.
+fail. IPv6 egress depends on host IPv6 connectivity.
 
 The main agent's dashboard stays bound to namespace loopback and defaults to a
 host mapping `127.0.0.1:9119 -> agent namespace loopback:9119`. The companion
@@ -163,15 +182,23 @@ garbage-collected. Inspect and migrate or remove stale files yourself only if
 you know they are unused. Switching back to the previous NixOS generation
 restores its provisioning rules; it does not restore or purge state.
 
-Each store path is a separate bind mount. The current VM fixture renders about
-1.1k gateway binds per agent, 116 network-helper binds, and 19 public-state
-fixer binds; package-set updates can change these counts and service start time.
+Each store path is a separate bind mount. The gateway, network setup, DHCP
+client, readiness coordinator, and public-state fixer each receive only their
+own evaluated runtime closure; package-set updates can change bind counts and
+service start time. The DHCP client has a private `RootDirectory`, private
+`/run` and lease state, and no host dhcpcd configuration or exit hooks.
 The longer start/restart bounds apply only to the VM smoke test, not production
 systemd timeouts.
 
-For diagnostics, inspect `systemctl status hermes-network@NAME.service`,
+For diagnostics, inspect `systemctl status hermes-network@NAME.service
+hermes-dhcp@NAME.service hermes-network-ready@NAME.service`,
+`networkctl status haN`,
 `readlink /proc/$(systemctl show -p MainPID --value hermes@NAME.service)/ns/net`,
 `ip link show haN`, `nft list table inet hermes-agent-guard`,
+`nft list set inet hermes-agent-guard haN_host4`,
+`nft list set inet hermes-agent-guard haN_peer4`,
+`nft list set inet hermes-agent-guard haN_host6`,
+`nft list set inet hermes-agent-guard haN_peer6`,
 `nft list chain inet hermes-agent-guard hermes_agent_input_guard`,
 `nft list chain inet hermes-agent-guard hermes_agent_forward_guard`,
 `nft list chain inet nixos-fw input-allow`, `nft list chain inet nixos-fw forward-allow`,
@@ -181,11 +208,13 @@ child is still propagated, and the unit's normal restart policy remains in force
 When enabled, Headroom uses stable-supported proxy flags; the module does not
 enable canary-only features. Template units are not directly wanted by
 `multi-user.target`; only configured per-agent instances are enabled.
-Stop/restart of an agent removes and recreates its veth, routes, DNS forwarder,
-namespace relays, and host-loopback proxies. Firewall rules are declarative in
-the NixOS ruleset; rules are not inserted per invocation. Removing a permission
-blocks subsequent packets to that private/host tuple but does not forcibly close
-the agent's userspace socket; existing connections can remain open and time out.
+Stop/restart of an agent removes and recreates its veth, networkd address/RA
+drop-in, DHCP lease, runtime firewall sets, DNS forwarder, namespace relays, and
+host-loopback proxies. Firewall guard rules are declarative in the NixOS
+ruleset; only validated address-set elements are published at runtime. Removing
+a permission blocks subsequent packets to that private/host tuple but does not
+forcibly close the agent's userspace socket; existing connections can remain
+open and time out.
 Public egress and already-established public flows remain host-uplink dependent.
 Rollback by reverting the module/configuration change, then rebuilding or
 switching to the previous NixOS generation; verify the effective guard rules and
