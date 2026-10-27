@@ -5,15 +5,15 @@ From the repository root, build a local x86_64-linux NixOS VM from the real
 and `vm-peer`) and their public-state services. QEMU networking is restricted;
 no host Hermes state or credentials are supplied, and the check does not make
 model requests. Default skill downloads are disabled only for this offline
-fixture. The optional Headroom proxy is disabled to stay within the 1024 MiB
-guest limit; real Hermes gateways, the dashboard, and ownership initialization
-remain enabled. Production Headroom defaults are unchanged. The
+fixture. The optional Headroom proxy remains disabled in this fixture; real
+Hermes gateways, the dashboard, and ownership initialization remain enabled.
+Production Headroom defaults are unchanged. The
 VM-only Nixpkgs configuration explicitly permits the
 known-insecure `olm-3.2.16` Matrix dependency without clearing its vulnerability
 metadata; this exception is not applied to other outputs. The real gateway
 `ExecStart` and ownership initialization are tested.
 
-The guest is configured with 1024 MiB RAM and a 1024 MiB root disk. The QEMU
+The guest is configured with 2048 MiB RAM and a 1024 MiB root disk. The QEMU
 command explicitly shares the host `/nix/store` read-only via 9p; the guest
 does not copy the store into its root disk. This bypasses NixOS's Linux-host
 virtiofs default because this fixture specifically tests the 9p guest mount.
@@ -226,7 +226,13 @@ Public egress and already-established public flows remain host-uplink dependent.
 Rollback by reverting the module/configuration change, then rebuilding or
 switching to the previous NixOS generation; verify the effective guard rules and
 listeners after rollback. Switching generations does not delete or overwrite
-profile state or user-modified skills.
+profile state or user-modified skills. A disposable-VM probe applied the previous
+generation (`2c074133`), candidate, then previous generation again; it verified
+the main and peer skill-state sentinels survived and candidate addresses, routes,
+RA drop-ins, DHCP/readiness units, and DNS listeners were removed on rollback.
+The probe used `switch-to-configuration test` to avoid touching the GRUB
+bootloader; it does not prove bootloader updates, reboot behavior, or a host
+generation switch/deployment.
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#hermes-module-vm-config-check
@@ -290,7 +296,7 @@ specialised-agent \
 
 At boot, the `hermes-module-vm-smoke` one-shot prints the guest store mounts,
 guest `MemTotal`, and root filesystem usage to the serial console. It fails if
-`/nix/.ro-store` is not a read-only 9p mount or guest RAM exceeds 1024 MiB.
+`/nix/.ro-store` is not a read-only 9p mount or guest RAM exceeds 2048 MiB.
 `/nix/store` is a bind of that read-only mount. The
 `hermes-module-vm-agent-smoke` one-shot then checks both agent and public-state
 units are active, restarts both public-state units and both agent instances,
@@ -321,12 +327,12 @@ replaces the peer process. `ExecMainStartTimestampMonotonic` is reported
 separately and is not used as the sole startup boundary.
 Gateway start/restart commands are bounded at 180 seconds and the smoke unit
 at 1200 seconds to allow per-store-path mount setup and the expanded live
-network-policy probes in the 1-GiB guest; the VM's
-RAM and disk limits are unchanged.
+network-policy probes in the 2-GiB guest. The RAM limit increased from 1 GiB
+to 2 GiB with operator approval; the 1-GiB disk limit is unchanged.
 For each real agent, the smoke check also runs `hermes profile list` from that
 agent's captured network namespace with its own `HOME` and verifies its default
 profile and the other agent's profile are visible. It stops the gateways while
-running the CLI to stay within the 1-GiB VM memory limit, then restarts them and
+running the CLI to limit concurrent service memory, then restarts them and
 repeats network checks. A separate peer-profile read runs as the service identity.
 Shared profile IDs must follow Hermes'
 profile-ID grammar (lowercase letters, numbers, `-`, `_`); the VM fixture uses

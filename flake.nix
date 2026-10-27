@@ -68,7 +68,7 @@
       networkManagerProbe = hermesModuleVm.extendModules {
         modules = [ ({ lib, ... }: { networking.networkmanager.enable = lib.mkForce true; }) ];
       };
-      internetEnabledVm = hermesModuleVm.extendModules {
+      internetEnabledVm = networkManagerProbe.extendModules {
         modules = [
           ({ lib, ... }: {
             virtualisation.restrictNetwork = lib.mkForce false;
@@ -80,6 +80,10 @@
               touch /run/hermes-vm-resolver-ready
             '';
             systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST = lib.mkForce "1";
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY =
+              lib.mkForce "1";
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_NM_UPLINK_TEST =
+              lib.mkForce "1";
           })
         ];
       };
@@ -89,7 +93,7 @@
       hermesModuleVmConfigCheck =
         nixpkgs-unstable.legacyPackages.x86_64-linux.runCommand "hermes-module-vm-config-check" { }
           ''
-            test ${toString hermesModuleVm.config.virtualisation.memorySize} -le 1024
+            test ${toString hermesModuleVm.config.virtualisation.memorySize} -le 2048
             test ${toString hermesModuleVm.config.virtualisation.diskSize} -le 1024
             test ${if hermesModuleVm.config.virtualisation.useNixStoreImage then "false" else "true"} = true
             test ${
@@ -484,8 +488,17 @@
                 ) defaultOnTmpfilesRules
                 && hermesModuleVm.config.virtualisation.restrictNetwork
                 && !internetEnabledVm.config.virtualisation.restrictNetwork
+                && internetEnabledVm.config.networking.networkmanager.enable
+                && internetEnabledVm.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ]
+                && !internetEnabledVm.config.networking.useNetworkd
                 &&
                   internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
+                  == "1"
+                &&
+                  internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
+                  == "1"
+                &&
+                  internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_NM_UPLINK_TEST
                   == "1"
                 && builtins.elem "1.1.1.1" internetEnabledVm.config.services.dnsmasq.settings.server
                 && nixpkgs-unstable.lib.hasInfix "nameserver 127.0.0.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
