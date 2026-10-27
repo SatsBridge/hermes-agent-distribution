@@ -37,7 +37,9 @@ granted `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE`; the DHCP client
 has only its private-network configuration capabilities, and the gateway gets
 none. DNS and TCP proxy children drop to `nobody` before serving requests.
 
-agent veths use `haN`/`hbN` interfaces. networkd allocates a host IPv4 `/30`
+agent veths use `haN`/`hbN` interfaces. The host-side `.network` match also
+requires `Kind=veth`, so an unrelated device with a reserved Hermes name is not
+configured by networkd. networkd allocates a host IPv4 `/30`
 from its system pool and serves one DHCPv4 address; it allocates a host IPv6
 `/64` and advertises that concrete prefix for peer SLAAC. No upstream prefix
 delegation is required. Allocations are dynamic and are not stable per-agent
@@ -45,6 +47,10 @@ addresses; consumers must discover them at runtime. Startup fails closed on
 overlapping host routes/addresses. A trusted lifecycle process atomically
 publishes exact host/peer addresses into typed nftables sets; declared protocol,
 port, anti-spoofing, and peer-denial rules remain in the earlier guard table.
+Guard hooks default to drop while explicitly passing unrelated host interfaces;
+readiness verifies the hook priorities and current Nix-generated policy as well
+as the address sets. A missing guard therefore prevents startup and fails closed
+for Hermes traffic instead of relying on the later NixOS interface passthrough.
 The host resolver is proxied on allocated host-side addresses; TCP/UDP port 53
 and required IPv6 neighbor/error/router-solicitation control, plus established
 conntrack replies to host-initiated connections, remain narrow exceptions. Only
@@ -103,7 +109,8 @@ must be restricted to a particular host interface.
 This changes host-wide NixOS firewall/NAT behavior: the firewall backend becomes
 nftables, forwarding is enabled for IPv4 and IPv6, and unconfigured forwarded
 traffic is filtered. It also starts systemd-networkd for only the generated
-Hermes host veths and excludes those interfaces from the host dhcpcd client;
+Hermes host veths and excludes those interfaces from host dhcpcd and
+NetworkManager;
 `networking.useNetworkd` and unrelated uplink ownership are not changed. NAT
 remains NixOS `networking.nat`, including the existing `externalInterface`
 restriction semantics. Existing routed networks must be represented by the

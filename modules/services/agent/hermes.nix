@@ -6,6 +6,37 @@
   ...
 }:
 let
+  addressFilter = pkgs.writeText "hermes-agent-address-filter.py" ''
+    import json
+    import sys
+
+    def usable(item, family, prefix):
+        if item.get("family") != family or item.get("prefixlen") != prefix or item.get("scope") != "global":
+            return False
+        if set(item.get("flags", [])) & {"tentative", "dadfailed", "deprecated"} or any(item.get(flag) for flag in ("tentative", "dadfailed", "deprecated")):
+            return False
+        return not any(value is not None and value != "forever" and int(value) <= 0 for value in (item.get("valid_life_time"), item.get("preferred_life_time")))
+
+    if sys.argv[1:] == ["--self-test"]:
+        fixture = [
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::1"},
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::2", "tentative": True},
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::3", "dadfailed": True},
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::4", "deprecated": True},
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::5", "flags": ["tentative"]},
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::6", "preferred_life_time": 0},
+            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::7", "valid_life_time": 0},
+        ]
+        assert [item["local"] for item in fixture if usable(item, "inet6", 64)] == ["2001:db8::1"]
+        sys.exit(0)
+
+    expected_family, expected_prefix = sys.argv[1], int(sys.argv[2])
+    data = json.load(sys.stdin)
+    for link in data:
+        for item in link.get("addr_info", []):
+            if usable(item, expected_family, expected_prefix):
+                print(item["local"])
+  '';
   agentFullNameDuplicatesMessage = lib.concatStringsSep ", " (
     mapAttrsToList (n: count: "\"${n}\" (${toString count} times)") duplicateAgentFullNamesCounts
   );
@@ -492,54 +523,81 @@ let
   agentFirewallInputRules = concatStringsSep "\n" (
     map (network: ''iifname "${network.hostIf}" accept'') (builtins.attrValues agentNetworks)
   );
-  agentInputGuardRules = concatStringsSep "\n" (
-    map (network: ''
-      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
-      iifname "${network.hostIf}" ip6 saddr { ::, fe80::/10 } meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
-      iifname "${network.hostIf}" udp sport 68 udp dport 67 accept
-      iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr @${network.host4Set} udp dport 53 accept
-      iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr @${network.host4Set} tcp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr @${network.host6Set} udp dport 53 accept
-      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr @${network.host6Set} tcp dport 53 accept
-      iifname "${network.hostIf}" ip saddr @${network.peer4Set} ct direction reply ct state established accept
-      iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ct direction reply ct state established accept
-      ${permissionRules network cfg.agents.${network.name}.networkAllow}
-      iifname "${network.hostIf}" drop
-    '') (builtins.attrValues agentNetworks)
-  );
-  agentForwardGuardRules = concatStringsSep "\n" (
-    map (
-      network:
-      let
-        otherNetworks = builtins.filter (other: other.index != network.index) (
-          builtins.attrValues agentNetworks
-        );
-        peerDrops = concatStringsSep "\n" (
-          map (other: ''
-            iifname "${network.hostIf}" oifname "${other.hostIf}" drop
-            oifname "${network.hostIf}" iifname "${other.hostIf}" drop
-          '') otherNetworks
-        );
-        permissions = cfg.agents.${network.name}.networkAllow;
-      in
-      ''
-        ${peerDrops}
-        iifname "${network.hostIf}" ip saddr != @${network.peer4Set} drop
-        iifname "${network.hostIf}" ip6 saddr != @${network.peer6Set} drop
-        ${permissionRules network permissions}
-        iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr { ${privateIPv4} } drop
-        iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr { ${privateIPv6} } drop
-        ${permissionReplyRules network permissions}
-        oifname "${network.hostIf}" meta l4proto ipv6-icmp ct state related accept
-        oifname "${network.hostIf}" ip daddr @${network.peer4Set} ip saddr { ${privateIPv4} } drop
-        oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} ip6 saddr { ${privateIPv6} } drop
-        oifname "${network.hostIf}" ip daddr @${network.peer4Set} ct state established,related accept
-        oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} ct state established,related accept
-        oifname "${network.hostIf}" ip daddr @${network.peer4Set} drop
-        oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} drop
-      ''
-    ) (builtins.attrValues agentNetworks)
-  );
+  tagPolicyRules =
+    label: policy:
+    concatStringsSep "\n" (
+      lib.imap0 (
+        index: rule:
+        let
+          marker = "hermes-policy-${label}-${toString index}-${
+            builtins.substring 0 16 (builtins.hashString "sha256" rule)
+          }";
+        in
+        "${rule} comment \"${marker}\""
+      ) (builtins.filter (rule: builtins.match "^[ ]*$" rule == null) (lib.splitString "\n" policy))
+    );
+  agentInputGuardRules = tagPolicyRules "input" ''
+    iifname != { ${
+      concatStringsSep ", " (map (network: "\"${network.hostIf}\"") (builtins.attrValues agentNetworks))
+    } } accept
+    ${concatStringsSep "\n" (
+      map (network: ''
+        iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        iifname "${network.hostIf}" ip6 saddr { ::, fe80::/10 } icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        iifname "${network.hostIf}" udp sport 68 udp dport 67 accept
+        iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr @${network.host4Set} udp dport 53 accept
+        iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr @${network.host4Set} tcp dport 53 accept
+        iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr @${network.host6Set} udp dport 53 accept
+        iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr @${network.host6Set} tcp dport 53 accept
+        iifname "${network.hostIf}" ip saddr @${network.peer4Set} ct direction reply ct state established accept
+        iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ct direction reply ct state established accept
+        ${permissionRules network cfg.agents.${network.name}.networkAllow}
+        iifname "${network.hostIf}" drop
+      '') (builtins.attrValues agentNetworks)
+    )}
+  '';
+  agentForwardGuardRules = tagPolicyRules "forward" ''
+    iifname != { ${
+      concatStringsSep ", " (map (network: "\"${network.hostIf}\"") (builtins.attrValues agentNetworks))
+    } } oifname != { ${
+      concatStringsSep ", " (map (network: "\"${network.hostIf}\"") (builtins.attrValues agentNetworks))
+    } } accept
+    ${concatStringsSep "\n" (
+      map (
+        network:
+        let
+          otherNetworks = builtins.filter (other: other.index != network.index) (
+            builtins.attrValues agentNetworks
+          );
+          peerDrops = concatStringsSep "\n" (
+            map (other: ''
+              iifname "${network.hostIf}" oifname "${other.hostIf}" drop
+              oifname "${network.hostIf}" iifname "${other.hostIf}" drop
+            '') otherNetworks
+          );
+          permissions = cfg.agents.${network.name}.networkAllow;
+        in
+        ''
+          ${peerDrops}
+          iifname "${network.hostIf}" ip saddr != @${network.peer4Set} drop
+          iifname "${network.hostIf}" ip6 saddr != @${network.peer6Set} drop
+          ${permissionRules network permissions}
+          iifname "${network.hostIf}" ip saddr @${network.peer4Set} ip daddr { ${privateIPv4} } drop
+          iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} ip6 daddr { ${privateIPv6} } drop
+          iifname "${network.hostIf}" ip saddr @${network.peer4Set} accept
+          iifname "${network.hostIf}" ip6 saddr @${network.peer6Set} accept
+          ${permissionReplyRules network permissions}
+          oifname "${network.hostIf}" meta l4proto ipv6-icmp ct state related accept
+          oifname "${network.hostIf}" ip daddr @${network.peer4Set} ip saddr { ${privateIPv4} } drop
+          oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} ip6 saddr { ${privateIPv6} } drop
+          oifname "${network.hostIf}" ip daddr @${network.peer4Set} ct state established,related accept
+          oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} ct state established,related accept
+          oifname "${network.hostIf}" ip daddr @${network.peer4Set} drop
+          oifname "${network.hostIf}" ip6 daddr @${network.peer6Set} drop
+        ''
+      ) (builtins.attrValues agentNetworks)
+    )}
+  '';
   # The earlier forward guard owns source, destination, peer, and port policy.
   agentFirewallForwardRules = concatStringsSep "\n" (
     map (network: ''iifname "${network.hostIf}" accept'') (builtins.attrValues agentNetworks)
@@ -578,8 +636,7 @@ let
               sleep 0.1
             done
             ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "$agent_ip:${toString mapping.agentPort}" || {
-              echo "${mapping.protocol} loopback relay failed to bind namespace port ${toString mapping.agentPort}" >&2
-              exit 1
+              fail_ready "${mapping.protocol} loopback relay failed to bind namespace port ${toString mapping.agentPort}"
             }
           ''
         ) loopbackMappings
@@ -597,8 +654,7 @@ let
           in
           ''
             if host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -q .; then
-              echo "Host loopback port ${toString mapping.hostPort} is already in use" >&2
-              exit 1
+              fail_ready "Host loopback port ${toString mapping.hostPort} is already in use"
             fi
             ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.util-linux "setpriv"} \
               --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
@@ -614,8 +670,7 @@ let
               sleep 0.1
             done
             host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}" || {
-              echo "Host loopback ${mapping.protocol} forwarding proxy failed to bind port ${toString mapping.hostPort}" >&2
-              exit 1
+              fail_ready "Host loopback ${mapping.protocol} forwarding proxy failed to bind port ${toString mapping.hostPort}"
             }
           ''
         ) (expandMappings portMappings)
@@ -649,6 +704,17 @@ let
         peer6_set=${lib.escapeShellArg network.peer6Set}
         ra_dropin=/run/systemd/network/40-hermes-agent-${toString network.index}.network.d/50-hermes-ipv6-prefix.conf
         runtime_dir=/run/hermes-agent-network-${toString network.index}
+        policy_hash=${
+          lib.escapeShellArg (
+            builtins.hashString "sha256" (
+              builtins.toJSON [
+                agentInputGuardRules
+                agentForwardGuardRules
+              ]
+            )
+          )
+        }
+        operation=''${1:-setup}
 
         dns_pid=
         proxy_pids=()
@@ -662,24 +728,26 @@ let
           else
             output=$(${lib.getExe' pkgs.iproute2 "ip"} -j "$family" address show dev "$device")
           fi
-          ${lib.getExe' pkgs.python3 "python3"} -c '
-        import json, sys
-        expected_family, expected_prefix = sys.argv[1:]
-        data = json.load(sys.stdin)
-        for link in data:
-            for item in link.get("addr_info", []):
-                if item.get("family") != expected_family or item.get("prefixlen") != int(expected_prefix) or item.get("scope") != "global":
-                    continue
-                if set(item.get("flags", [])) & {"tentative", "dadfailed", "deprecated"}:
-                    continue
-                print(item["local"])
-        ' "$([[ "$family" == -4 ]] && printf inet || printf inet6)" "$prefix" <<<"$output" | sort -u
+          ${lib.getExe' pkgs.python3 "python3"} ${addressFilter} \
+            "$([[ "$family" == -4 ]] && printf inet || printf inet6)" "$prefix" <<<"$output" | sort -u
         }
 
         flush_firewall() {
           {
             printf 'flush set inet hermes-agent-guard %s\n' "$host4_set" "$peer4_set" "$host6_set" "$peer6_set"
           } | host ${lib.getExe' pkgs.nftables "nft"} -f - 2>/dev/null || true
+        }
+
+        stop_gateway() {
+          ${lib.getExe' pkgs.systemd "systemctl"} --no-block stop "hermes@${name}.service" || true
+        }
+
+        fail_ready() {
+          echo "${name}: $*" >&2
+          flush_firewall
+          stop_gateway
+          ${lib.getExe' pkgs.systemd "systemctl"} --no-block stop "hermes-network@${name}.service" || true
+          exit 1
         }
 
         networkd_reload() {
@@ -696,9 +764,51 @@ let
             ' -- "$host_if"
         }
 
+        verify_guard_chain() {
+          local chain="$1" hook="$2" expected="$3" actual
+          actual=$(host ${lib.getExe' pkgs.nftables "nft"} list chain inet hermes-agent-guard "$chain")
+          ${lib.getExe' pkgs.python3 "python3"} -c '
+        import difflib, ipaddress, re, sys
+        hook, expected = sys.argv[1:]
+        actual = sys.stdin.read()
+        if not re.search(rf"type filter hook {hook} priority (?:-150|mangle); policy drop;", actual):
+            raise SystemExit(f"{hook} guard hook/priority/policy readback mismatch")
+        def rules(text, live=False):
+            lines = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or (live and line.startswith(("table ", "chain ", "type ", "}"))):
+                    continue
+                marker = line.find("hermes-policy-")
+                if marker >= 0:
+                    line = line[:line.rfind("comment", 0, marker)].rstrip()
+                line = line.replace("meta l4proto tcp", "meta l4proto 6")
+                line = line.replace("meta l4proto udp", "meta l4proto 17")
+                line = line.replace("meta l4proto ipv6-icmp", "meta l4proto 58")
+                def canonicalize_addresses(match):
+                    keyword, values = match.groups()
+                    networks = [ipaddress.ip_network(value.strip(), strict=False) for value in values.split(",")]
+                    return keyword + "{ " + ", ".join(map(str, ipaddress.collapse_addresses(networks))) + " }"
+                line = re.sub(r"(ip6? (?:saddr|daddr) )[{]([^}]*)[}]", canonicalize_addresses, line)
+                lines.append(" ".join(line.split()))
+            return lines
+        expected_rules = rules(expected)
+        actual_rules = rules(actual, live=True)
+        if expected_rules != actual_rules:
+            diff = chr(10).join(difflib.unified_diff(expected_rules, actual_rules, fromfile="configured", tofile="live", lineterm=""))
+            raise SystemExit(f"{hook} guard policy differs from the current configured rules{chr(10)}{diff}")
+        ' "$hook" "$expected" <<<"$actual"
+        }
+
+        verify_guard_policy() {
+          verify_guard_chain hermes_agent_input_guard input ${lib.escapeShellArg agentInputGuardRules}
+          verify_guard_chain hermes_agent_forward_guard forward ${lib.escapeShellArg agentForwardGuardRules}
+        }
+
         cleanup() {
           set +e
           flush_firewall
+
           if [[ -n "$dns_pid" ]]; then
             kill "$dns_pid" 2>/dev/null || true
             wait "$dns_pid" 2>/dev/null || true
@@ -711,13 +821,13 @@ let
             kill "$relay_pid" 2>/dev/null || true
             wait "$relay_pid" 2>/dev/null || true
           done
-          if [[ -e "$ra_dropin" ]]; then
+          if [[ "$operation" != ready && -e "$ra_dropin" ]]; then
             rm -f -- "$ra_dropin"
             networkd_reload >/dev/null 2>&1 || true
           fi
           if (( created_link )); then
             host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
-          elif [[ "''${1:-setup}" != ready ]] && host ${lib.getExe' pkgs.iproute2 "ip"} -details link show dev "$host_if" 2>/dev/null | grep -Fq "alias $alias"; then
+          elif [[ "$operation" != ready ]] && host ${lib.getExe' pkgs.iproute2 "ip"} -details link show dev "$host_if" 2>/dev/null | grep -Fq "alias $alias"; then
             host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
           fi
         }
@@ -725,6 +835,9 @@ let
           local status=$?
           trap - ERR EXIT
           cleanup
+          if [[ "$operation" == ready ]]; then
+            ${lib.getExe' pkgs.systemd "systemctl"} --no-block stop "hermes-network@${name}.service" || true
+          fi
           exit "$status"
         }
 
@@ -766,11 +879,11 @@ let
         PY
         }
 
-        if [[ "''${1:-setup}" == cleanup ]]; then
+        if [[ "$operation" == cleanup ]]; then
           cleanup
           exit 0
         fi
-        if [[ "''${1:-setup}" == ready ]]; then
+        if [[ "$operation" == ready ]]; then
           trap cleanup EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
@@ -791,7 +904,7 @@ let
                 break
               fi
             fi
-            if (( attempt == 300 )); then echo "${name}: DHCP/SLAAC readiness timed out on $peer_if" >&2; exit 1; fi
+            if (( attempt == 300 )); then fail_ready "DHCP/SLAAC readiness timed out on $peer_if"; fi
             sleep 0.1
           done
           subnet4=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/30").network)' "$host_ip")
@@ -812,15 +925,15 @@ let
           expected_peer6=$(printf '%s\n' "''${peer6[@]}" | sort -u | paste -sd,)
           if ! verify_set "$host4_set" "$host_ip" || ! verify_set "$peer4_set" "$agent_ip" \
             || ! verify_set "$host6_set" "$expected_host6" || ! verify_set "$peer6_set" "$expected_peer6"; then
-            echo "${name}: firewall set readback did not match allocation" >&2
-            exit 1
+            fail_ready "firewall set readback did not match allocation"
           fi
+          verify_guard_policy || fail_ready "current nftables guard policy readback failed"
           install -d -m 0750 "$runtime_dir"
           printf 'nameserver %s\nnameserver %s\noptions attempts:1 timeout:2\n' "$host_ip" "$host_ip6" >"$runtime_dir/resolv.conf.tmp"
           chmod 0644 "$runtime_dir/resolv.conf.tmp"
           mv -f -- "$runtime_dir/resolv.conf.tmp" "$runtime_dir/resolv.conf"
           mapfile -t dns_upstreams < <(awk '$1 == "nameserver" && NF >= 2 { print $2 }' /run/hermes-host-resolv.conf)
-          ((''${#dns_upstreams[@]} > 0)) || { echo "No host nameservers in /etc/resolv.conf" >&2; exit 1; }
+          ((''${#dns_upstreams[@]} > 0)) || fail_ready "No host nameservers in /etc/resolv.conf"
           dns_args=()
           for dns_upstream in "''${dns_upstreams[@]}"; do dns_args+=("--server=$dns_upstream"); done
           ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.dnsmasq "dnsmasq"} \
@@ -840,13 +953,15 @@ let
             || ! host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn 'sport = :53' | grep -Fq "$host_ip:53" \
             || ! host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -lun 'sport = :53' | grep -Fq "$host_ip6" \
             || ! host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -ltn 'sport = :53' | grep -Fq "$host_ip6"; then
-            echo "${name}: DNS listener readiness failed for $host_ip/$host_ip6" >&2
-            exit 1
+            fail_ready "DNS listener readiness failed for $host_ip/$host_ip6"
           fi
-          generation=$(printf '%s\n' "$host_ip" "$agent_ip" "''${host6[*]}" "''${peer6[*]}" | sha256sum | cut -d' ' -f1)
+          generation=$(printf '%s\n' "$host_ip" "$agent_ip" "''${host6[*]}" "''${peer6[*]}" "$policy_hash" | sha256sum | cut -d' ' -f1)
           ${lib.getExe' pkgs.systemd "systemd-notify"} --ready --status="${name} network generation $generation verified"
           echo "${name}: network generation $generation ready on $host_if/$peer_if; DHCPv4, SLAAC, DNS and nftables verified"
           while sleep 1; do
+            if ! verify_guard_policy; then
+              fail_ready "current nftables guard policy lost; ordinary traffic revoked"
+            fi
             mapfile -t current_host4 < <(read_addresses -4 "$host_if" 30)
             mapfile -t current_peer4 < <(read_addresses -4 "$peer_if" 30)
             mapfile -t current_host6 < <(read_addresses -6 "$host_if" 64)
@@ -857,15 +972,11 @@ let
               && ${lib.getExe' pkgs.iproute2 "ip"} -6 route show default | grep -Fq "dev $peer_if"; then
               :
             else
-              flush_firewall
-              echo "${name}: DHCP/SLAAC address or route changed; ordinary traffic revoked" >&2
-              exit 1
+              fail_ready "DHCP/SLAAC address or route changed; ordinary traffic revoked"
             fi
             if ! verify_set "$host4_set" "$host_ip" || ! verify_set "$peer4_set" "$agent_ip" \
               || ! verify_set "$host6_set" "$expected_host6" || ! verify_set "$peer6_set" "$expected_peer6"; then
-              flush_firewall
-              echo "${name}: firewall generation lost; ordinary traffic revoked" >&2
-              exit 1
+              fail_ready "firewall generation lost; ordinary traffic revoked"
             fi
           done
         fi
@@ -1362,9 +1473,16 @@ let
           };
         };
         "hermes-dhcp@" = {
-          after = [ "hermes-network@%i.service" ];
+          after = [
+            "hermes-network@%i.service"
+            "systemd-networkd.service"
+          ];
           bindsTo = [ "hermes-network@%i.service" ];
           description = "Acquire the isolated DHCP lease for Hermes agent %i";
+          partOf = [
+            "nftables.service"
+            "systemd-networkd.service"
+          ];
           unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
           serviceConfig = {
             AmbientCapabilities = [
@@ -1769,6 +1887,7 @@ in
         value.text = ''
           [Match]
           Name=${network.hostIf}
+          Kind=veth
 
           [Link]
           RequiredForOnline=no
@@ -1801,16 +1920,19 @@ in
           ]) (builtins.attrValues agentNetworks)
         )}
         chain hermes_agent_input_guard {
-          type filter hook input priority -150; policy accept;
+          type filter hook input priority -150; policy drop;
           ${agentInputGuardRules}
         }
         chain hermes_agent_forward_guard {
-          type filter hook forward priority -150; policy accept;
+          type filter hook forward priority -150; policy drop;
           ${agentForwardGuardRules}
         }
       '';
     };
     networking.dhcpcd.denyInterfaces = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [ "ha*" ];
+    networking.networkmanager.unmanaged = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [
+      "interface-name:ha*"
+    ];
     networking.nat = lib.mkIf (cfg.enable && activeAgentNames != [ ]) {
       enable = true;
       enableIPv6 = true;

@@ -65,6 +65,9 @@
           }
         ];
       };
+      networkManagerProbe = hermesModuleVm.extendModules {
+        modules = [ ({ lib, ... }: { networking.networkmanager.enable = lib.mkForce true; }) ];
+      };
       internetEnabledVm = hermesModuleVm.extendModules {
         modules = [
           ({ lib, ... }: {
@@ -132,6 +135,7 @@
                 };
                 hostNetworkConfig =
                   hermesModuleVm.config.environment.etc."systemd/network/40-hermes-agent-0.network".text;
+                guardConfig = hermesModuleVm.config.networking.nftables.tables."hermes-agent-guard".content;
                 hasMnemosyne = value: nixpkgs-unstable.lib.hasInfix "mnemosyne" value;
                 hasMnemosyneEnvironment =
                   environment:
@@ -525,6 +529,10 @@
                 && builtins.elem "network-online.target" units.hermes-vm-late-resolver.before
                 && !hermesModuleVm.config.networking.resolvconf.enable
                 && !hermesModuleVm.config.networking.useNetworkd
+                && networkManagerProbe.config.networking.networkmanager.enable
+                && networkManagerProbe.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ]
+                && !networkManagerProbe.config.networking.useNetworkd
+                && networkManagerProbe.config.networking.dhcpcd.enable
                 && units."hermes-dhcp@".serviceConfig.RootDirectory == "%t/hermes-dhcp-%i/root"
                 && units."hermes-dhcp@".serviceConfig.PrivateNetwork
                 && units."hermes-dhcp@".serviceConfig.NoNewPrivileges
@@ -557,9 +565,13 @@
                 ) units."hermes-dhcp@vm".serviceConfig.BindReadOnlyPaths
                 && builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".requires
                 && builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".bindsTo
+                && builtins.elem "nftables.service" units."hermes-dhcp@".partOf
+                && builtins.elem "systemd-networkd.service" units."hermes-dhcp@".after
+                && builtins.elem "systemd-networkd.service" units."hermes-dhcp@".partOf
                 && units."hermes-network-ready@".serviceConfig.Type == "notify"
                 && units."hermes-network-ready@".serviceConfig.Restart == "no"
                 && builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo
+                && nixpkgs-unstable.lib.hasInfix "Kind=veth" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "Address=0.0.0.0/30" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "Address=::/64" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "DHCPServer=yes" hostNetworkConfig
@@ -582,6 +594,8 @@
                 && hermesModuleVm.config.networking.firewall.filterForward
                 && hermesModuleVm.config.networking.nat.enable
                 && hermesModuleVm.config.networking.nat.enableIPv6
+                && nixpkgs-unstable.lib.hasInfix "policy drop" guardConfig
+                && nixpkgs-unstable.lib.hasInfix "iifname != { \"ha0\", \"ha1\" } accept" guardConfig
                 && builtins.elem "ha0" hermesModuleVm.config.networking.nat.internalInterfaces
                 && builtins.elem "ha1" hermesModuleVm.config.networking.nat.internalInterfaces
                 && builtins.hasAttr "hermes-agent-guard" hermesModuleVm.config.networking.nftables.tables
