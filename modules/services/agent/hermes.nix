@@ -801,7 +801,7 @@ let
         }
 
         verify_guard_policy() {
-          verify_guard_chain hermes_agent_input_guard input ${lib.escapeShellArg agentInputGuardRules}
+          verify_guard_chain hermes_agent_input_guard input ${lib.escapeShellArg agentInputGuardRules} || return
           verify_guard_chain hermes_agent_forward_guard forward ${lib.escapeShellArg agentForwardGuardRules}
         }
 

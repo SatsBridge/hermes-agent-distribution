@@ -251,9 +251,9 @@ QEMU_NET_OPTS='restrict=off' ./result/bin/run-nixos-vm
 ```
 
 This variant sets `restrictNetwork = false` only for the test guest, and the
-launcher explicitly uses `restrict=off`. Its late resolver retains the local
-deterministic test stub and adds `1.1.1.1`; dnsmasq forwards public queries there
-while preserving local `.test` records. The test guest and host
+launcher explicitly uses `restrict=off`. The late resolver points agents only at
+the local stub; host dnsmasq uses `1.1.1.1` upstream and retains local `.test`
+records. The test guest and host
 must have outbound DNS and HTTPS access to that resolver and `example.com`.
 It does not change the Hermes module's firewall or per-agent permissions. The
 runtime smoke requires guest host-namespace DNS and certificate-verified HTTPS

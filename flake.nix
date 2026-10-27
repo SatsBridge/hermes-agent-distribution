@@ -75,7 +75,8 @@
             services.dnsmasq.settings.server = lib.mkForce [ "1.1.1.1" ];
             systemd.services.hermes-vm-late-resolver.script = lib.mkForce ''
               sleep 5
-              printf 'nameserver 127.0.0.1\nnameserver 1.1.1.1\n' > /run/hermes-vm-resolv.conf
+              # Keep .test lookups local; the host dnsmasq forwards public queries upstream.
+              printf 'nameserver 127.0.0.1\n' > /run/hermes-vm-resolv.conf
               touch /run/hermes-vm-resolver-ready
             '';
             systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST = lib.mkForce "1";
@@ -488,7 +489,7 @@
                   == "1"
                 && builtins.elem "1.1.1.1" internetEnabledVm.config.services.dnsmasq.settings.server
                 && nixpkgs-unstable.lib.hasInfix "nameserver 127.0.0.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
-                && nixpkgs-unstable.lib.hasInfix "nameserver 1.1.1.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
+                && !nixpkgs-unstable.lib.hasInfix "nameserver 1.1.1.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
                 &&
                   units."hermes-network@".serviceConfig.TemporaryFileSystem
                   == hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig.TemporaryFileSystem
