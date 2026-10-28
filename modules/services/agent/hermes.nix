@@ -694,6 +694,8 @@ let
       };
       text = ''
         host() { ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- "$@"; }
+        # Explicitly opt into the bound host manager sockets from inside RootDirectory.
+        export SYSTEMD_OFFLINE=0
         host_if=${lib.escapeShellArg network.hostIf}
         peer_if=${lib.escapeShellArg network.peerIf}
         peer_mac=${lib.escapeShellArg network.peerMac}
@@ -1058,12 +1060,18 @@ let
       networkSetup = mkAgentNetworkSetup name agentNetwork portMappings;
       dhcpExecStart = pkgs.writeShellApplication {
         name = "hermes-dhcp-${toString agentNetwork.index}";
-        runtimeInputs = [ pkgs.dhcpcd ];
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.dhcpcd
+        ];
         text = ''
+          # The private tmpfs is per-command, so create its link in the client process.
+          ln -s /run/dhcpcd /var/run/dhcpcd
           exec ${lib.getExe pkgs.dhcpcd} --nobackground --waitip=4 --timeout=25 \
             --nohook=resolv.conf,hostname,ntp.conf --config=/dev/null ${agentNetwork.peerIf}
         '';
       };
+
       agentConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
         lib.recursiveUpdate agentCfg.settings {
           kanban = {
@@ -1190,10 +1198,27 @@ let
         ++ serviceExecRoots "hermes-network@${name}"
         ++ [ networkSetup ]
       );
-      dhcpClosure = closureStorePaths [
-        dhcpExecStart
-        pkgs.dhcpcd
-      ];
+      networkReadyClosure = closureStorePaths (
+        config.systemd.services."hermes-network-ready@".path
+        ++ config.systemd.services."hermes-network-ready@".jobScripts
+        ++ serviceExecRoots "hermes-network-ready@"
+        ++ config.systemd.services."hermes-network-ready@${name}".path
+        ++ config.systemd.services."hermes-network-ready@${name}".jobScripts
+        ++ serviceExecRoots "hermes-network-ready@${name}"
+        ++ [ networkSetup ]
+      );
+      dhcpClosure = closureStorePaths (
+        config.systemd.services."hermes-dhcp@".path
+        ++ config.systemd.services."hermes-dhcp@".jobScripts
+        ++ serviceExecRoots "hermes-dhcp@"
+        ++ config.systemd.services."hermes-dhcp@${name}".path
+        ++ config.systemd.services."hermes-dhcp@${name}".jobScripts
+        ++ serviceExecRoots "hermes-dhcp@${name}"
+        ++ [
+          dhcpExecStart
+          pkgs.dhcpcd
+        ]
+      );
       publicStateClosure = closureStorePaths (
         lib.subtractLists config.systemd.services."hermes-pf@".path
           config.systemd.services."hermes-pf@${name}".path
@@ -1206,7 +1231,7 @@ let
         "hermes-network@${name}" = {
           overrideStrategy = "asDropin";
           serviceConfig = {
-            BindReadOnlyPaths = [ "/etc/resolv.conf:/run/hermes-host-resolv.conf" ] ++ networkClosure;
+            BindReadOnlyPaths = networkClosure;
             ExecStart = "${lib.getExe networkSetup} setup";
             ExecStopPost = "${lib.getExe networkSetup} cleanup";
           };
@@ -1216,25 +1241,24 @@ let
           bindsTo = [ "hermes-network@${name}.service" ];
           overrideStrategy = "asDropin";
           serviceConfig = {
-            BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ] ++ dhcpClosure;
+            BindReadOnlyPaths = dhcpClosure;
             ExecStart = lib.getExe dhcpExecStart;
           };
         };
         "hermes-network-ready@${name}" = {
           overrideStrategy = "asDropin";
           serviceConfig = {
-            BindReadOnlyPaths = [ "/etc/resolv.conf:/run/hermes-host-resolv.conf" ] ++ networkClosure;
+            BindReadOnlyPaths = networkReadyClosure;
             ExecStart = "${lib.getExe networkSetup} ready";
             RuntimeDirectory = [ "hermes-agent-network-${toString agentNetwork.index}" ];
-            ReadWritePaths = [
-              "/run/systemd/network"
-              "/run/hermes-agent-network-${toString agentNetwork.index}"
-            ];
+            ReadWritePaths = [ "/run/hermes-agent-network-${toString agentNetwork.index}" ];
           };
         };
         "hermes-pf@${name}" = {
           overrideStrategy = "asDropin";
-          serviceConfig.BindReadOnlyPaths = publicStateClosure;
+          serviceConfig = {
+            BindReadOnlyPaths = publicStateClosure;
+          };
           wantedBy = [ "multi-user.target" ];
         };
         "hermes@${name}" = {
@@ -1271,7 +1295,6 @@ let
             ]
             ++ gatewayClosure;
             InaccessiblePaths = nixStoreAliasPaths;
-            TemporaryFileSystem = [ "/nix:ro" ];
             ExecStartPre = optional cfg.installDefaultSkills (lib.getExe installSkillsExecStartPre);
             ExecStart = lib.getExe execStart;
           };
@@ -1447,33 +1470,77 @@ let
           wants = [ "network-online.target" ];
           serviceConfig = {
             AmbientCapabilities = [ ];
+            BindPaths = [ "/run/systemd/network" ];
+            BindReadOnlyPaths = [
+              "/run/systemd/private"
+              "/run/systemd/netif/io.systemd.Network"
+              "/run/dbus/system_bus_socket"
+            ];
             CapabilityBoundingSet = [
               "CAP_NET_ADMIN"
-              "CAP_NET_BIND_SERVICE"
               "CAP_SETGID"
               "CAP_SETUID"
               "CAP_SYS_ADMIN"
               "CAP_SYS_PTRACE"
             ];
             InaccessiblePaths = nixStoreAliasPaths;
+            KeyringMode = "private";
+            LockPersonality = true;
+            MemoryDenyWriteExecute = true;
+            MountAPIVFS = true;
             NoNewPrivileges = true;
             PrivateDevices = true;
             PrivateIPC = true;
+            PrivateMounts = true;
             PrivateNetwork = true;
             PrivateTmp = true;
+            ProcSubset = "pid";
+            ProtectClock = true;
+            ProtectControlGroups = "strict";
             ProtectHome = true;
+            ProtectHostname = "private";
+            ProtectKernelLogs = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectProc = "invisible";
             ProtectSystem = "strict";
             ReadWritePaths = [ "/run/systemd/network" ];
+            DevicePolicy = "closed";
+            RemoveIPC = true;
             RestrictAddressFamilies = [
               "AF_INET"
               "AF_INET6"
               "AF_NETLINK"
               "AF_UNIX"
             ];
+            RestrictNamespaces = [ "net" ];
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            RootDirectory = "%t/hermes-network-%i/root";
+            RuntimeDirectory = [
+              "hermes-network-%i"
+              "hermes-network-%i/root"
+            ];
+            RuntimeDirectoryMode = "0700";
+            RuntimeDirectoryPreserve = false;
+            SystemCallArchitectures = "native";
+            SystemCallErrorNumber = "EPERM";
+            SystemCallFilter = [
+              "@system-service"
+              "~@resources"
+              "~@privileged"
+              "setgid"
+              "setgroups"
+              "setresgid"
+              "setresuid"
+              "setuid"
+              "setns"
+            ];
             TemporaryFileSystem = [ "/nix:ro" ];
             TimeoutStartSec = "30s";
             TimeoutStopSec = "15s";
             Type = "oneshot";
+            UMask = "0077";
             RemainAfterExit = true;
           };
         };
@@ -1495,20 +1562,23 @@ let
               "CAP_NET_BIND_SERVICE"
               "CAP_NET_RAW"
             ];
+
             CapabilityBoundingSet = [
               "CAP_NET_ADMIN"
               "CAP_NET_BIND_SERVICE"
               "CAP_NET_RAW"
             ];
             NoNewPrivileges = true;
+            DynamicUser = true;
             BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ];
             CoredumpFilter = "0x00";
             DevicePolicy = "closed";
             InaccessiblePaths = nixStoreAliasPaths;
             KeyringMode = "private";
             LockPersonality = true;
-            MemoryKSM = true;
+            MemoryDenyWriteExecute = true;
             PrivateDevices = true;
+            PrivateIPC = true;
             PrivateNetwork = true;
             PrivateMounts = true;
             PrivateTmp = true;
@@ -1521,23 +1591,13 @@ let
             ProtectKernelModules = true;
             ProtectKernelTunables = true;
             ProtectProc = "invisible";
+            ProcSubset = "pid";
             ProtectSystem = "strict";
-            ReadWritePaths = [
-              "/run"
-              "/var/run"
-              "/var/lib/dhcpcd"
-            ];
             RootDirectory = "%t/hermes-dhcp-%i/root";
+            StateDirectory = [ "hermes-dhcp-%i:dhcpcd" ];
             RuntimeDirectory = [
-              "hermes-dhcp-%i"
+              "hermes-dhcp-%i:dhcpcd"
               "hermes-dhcp-%i/root"
-              "hermes-dhcp-%i/root/etc"
-              "hermes-dhcp-%i/root/run"
-              "hermes-dhcp-%i/root/var"
-              "hermes-dhcp-%i/root/var/lib"
-              "hermes-dhcp-%i/root/var/lib/dhcpcd"
-              "hermes-dhcp-%i/root/var/run"
-              "hermes-dhcp-%i/root/var/run/dhcpcd"
             ];
             RuntimeDirectoryMode = "0700";
             RuntimeDirectoryPreserve = false;
@@ -1561,15 +1621,15 @@ let
             ];
             TemporaryFileSystem = [
               "/nix:ro"
-              "/run"
-              "/var/run"
-              "/var/lib/dhcpcd"
+              # A private writable parent lets DynamicUser create the fixed-path compatibility link.
+              "/var/run:mode=1777"
             ];
             TimeoutStartSec = "30s";
             TimeoutStopSec = "15s";
             Type = "exec";
             Restart = "no";
             UMask = "0077";
+            User = "hermes-dhcp-%i";
           };
         };
         "hermes-network-ready@" = {
@@ -1593,13 +1653,10 @@ let
           ];
           unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
           serviceConfig = {
-            AmbientCapabilities = [
-              "CAP_NET_ADMIN"
-              "CAP_NET_BIND_SERVICE"
-              "CAP_SETGID"
-              "CAP_SETUID"
-              "CAP_SYS_ADMIN"
-              "CAP_SYS_PTRACE"
+            AmbientCapabilities = [ ];
+            BindReadOnlyPaths = [
+              "/etc/resolv.conf:/run/hermes-host-resolv.conf"
+              "/run/systemd/private"
             ];
             CapabilityBoundingSet = [
               "CAP_NET_ADMIN"
@@ -1610,26 +1667,65 @@ let
               "CAP_SYS_PTRACE"
             ];
             InaccessiblePaths = nixStoreAliasPaths;
+            KeyringMode = "private";
+            LockPersonality = true;
+            MemoryDenyWriteExecute = true;
+            MountAPIVFS = true;
             NoNewPrivileges = true;
             NotifyAccess = "all";
+            DevicePolicy = "closed";
             PrivateDevices = true;
             PrivateIPC = true;
+            PrivateMounts = true;
             PrivateNetwork = true;
             PrivateTmp = true;
+            ProcSubset = "pid";
+            ProtectClock = true;
+            ProtectControlGroups = "strict";
             ProtectHome = true;
             ProtectSystem = "strict";
-            ReadWritePaths = [ "/run/systemd/network" ];
+            ProtectHostname = "private";
+            ProtectKernelLogs = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectProc = "invisible";
+            RemoveIPC = true;
             RestrictAddressFamilies = [
               "AF_INET"
               "AF_INET6"
               "AF_NETLINK"
               "AF_UNIX"
             ];
+            RestrictNamespaces = [ "net" ];
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            RootDirectory = "%t/hermes-network-ready-%i/root";
+            RuntimeDirectory = [
+              "hermes-network-ready-%i"
+              "hermes-network-ready-%i/root"
+              "hermes-agent-network-%i"
+            ];
+            RuntimeDirectoryMode = "0755";
+            RuntimeDirectoryPreserve = false;
+            SystemCallArchitectures = "native";
+            SystemCallErrorNumber = "EPERM";
+            SystemCallFilter = [
+              "@system-service"
+              "~@resources"
+              "~@privileged"
+              "setgid"
+              "setgroups"
+              "setresgid"
+              "setresuid"
+              "setuid"
+              "setns"
+            ];
             TemporaryFileSystem = [ "/nix:ro" ];
             TimeoutStartSec = "60s";
             TimeoutStopSec = "15s";
             Type = "notify";
             Restart = "no";
+            UMask = "0077";
           };
         };
         "hermes-pf@" = {
@@ -1662,18 +1758,14 @@ let
             KeyringMode = "private";
             LockPersonality = true;
             MemoryDenyWriteExecute = true;
-            MemoryKSM = true;
             MountAPIVFS = true;
             NoNewPrivileges = true;
             NotifyAccess = "none";
-            #PrivateBPF = true;
             PrivateDevices = true;
             PrivateIPC = true;
             PrivateMounts = true;
             PrivateNetwork = true;
-            #PrivatePIDs = true;
             PrivateTmp = true;
-            # TODO: PrivateUsers = "self" after https://github.com/systemd/systemd/issues/41994
             PrivateUsers = "identity";
             ProcSubset = "pid";
             ProtectClock = true;
@@ -1688,11 +1780,21 @@ let
             ReadWritePaths = [ agentStateSystemdPath ];
             RemoveIPC = true;
             Restart = "always";
-            BindReadOnlyPaths = publicStateTemplateClosure;
+            BindReadOnlyPaths = [ "/etc/group" ] ++ publicStateTemplateClosure;
+            # RootDirectory hides the host state tree; the fixer must change gateway ACLs there.
+            BindPaths = [ agentStateSystemdPath ];
             RestrictAddressFamilies = [ "AF_UNIX" ];
             RestrictNamespaces = true;
             RestrictRealtime = true;
             RestrictSUIDSGID = true;
+            RootDirectory = "%t/hermes-%i-pf/root";
+            RuntimeDirectory = [
+              "hermes-%i-pf"
+              "hermes-%i-pf/root"
+              "hermes-%i-pf/root/etc"
+            ];
+            RuntimeDirectoryMode = "0700";
+            RuntimeDirectoryPreserve = false;
             SetLoginEnvironment = false;
             SupplementaryGroups = [ sharedStateId ];
             SystemCallArchitectures = "native";
@@ -1765,21 +1867,15 @@ let
 
             KeyringMode = "private";
             LockPersonality = true;
-            #MemoryDenyWriteExecute = true;
-            MemoryKSM = true;
             MountAPIVFS = true;
             NoNewPrivileges = true;
             NotifyAccess = "none";
-            #PrivateBPF = true;
             PrivateDevices = true;
             PrivateIPC = true;
             PrivateMounts = true;
             PrivateNetwork = true;
-            #PrivatePIDs = true;
             PrivateTmp = true;
-            # TODO: PrivateUsers = "self" after https://github.com/systemd/systemd/issues/41994
             PrivateUsers = "identity";
-            #ProcSubset = "pid"; # ONNX bug
             ProtectClock = true;
             ProtectControlGroups = "strict";
             ProtectHome = true;
@@ -1790,7 +1886,6 @@ let
             ProtectProc = "invisible";
             ProtectSystem = "strict";
             ReadOnlyPaths = [ "/proc/cpuinfo" ];
-            #ReadWritePaths = [ sharedStatePath ];
             RemoveIPC = true;
             Restart = "always";
             RestrictAddressFamilies = [
@@ -1886,33 +1981,9 @@ in
     networking.firewall.extraForwardRules = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
       lib.mkBefore agentFirewallForwardRules
     );
-    environment.etc = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
-      lib.mapAttrs' (_: network: {
-        name = "systemd/network/40-hermes-agent-${toString network.index}.network";
-        value.text = ''
-          [Match]
-          Name=${network.hostIf}
-          Kind=veth
-
-          [Link]
-          RequiredForOnline=no
-
-          [Network]
-          Address=0.0.0.0/30
-          Address=::/64
-          DHCPServer=yes
-          IPv4Forwarding=yes
-          IPv6Forwarding=yes
-          IPv6SendRA=yes
-
-          [DHCPServer]
-          PersistLeases=runtime
-          PoolOffset=2
-          PoolSize=1
-          Router=_server_address
-        '';
-      }) agentNetworks
-    );
+    services.resolved.enable = lib.mkIf (
+      cfg.enable && activeAgentNames != [ ] && !config.networking.useNetworkd
+    ) (lib.mkOverride 999 false);
     networking.nftables.tables."hermes-agent-guard" = lib.mkIf (cfg.enable && activeAgentNames != [ ]) {
       family = "inet";
       content = ''
@@ -1948,21 +2019,41 @@ in
     systemd = mkMerge (
       [
         {
+          network.enable = lib.mkIf (cfg.enable && activeAgentNames != [ ]) true;
+          network.wait-online.enable = lib.mkIf (
+            cfg.enable && activeAgentNames != [ ] && !config.networking.useNetworkd
+          ) (lib.mkDefault false);
+          network.networks = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
+            lib.mapAttrs' (_: network: {
+              name = "40-hermes-agent-${toString network.index}";
+              value = {
+                matchConfig = {
+                  Name = network.hostIf;
+                  Kind = "veth";
+                };
+                linkConfig.RequiredForOnline = "no";
+                networkConfig = {
+                  Address = [
+                    "0.0.0.0/30"
+                    "::/64"
+                  ];
+                  DHCPServer = true;
+                  IPv4Forwarding = true;
+                  IPv6Forwarding = true;
+                  IPv6SendRA = true;
+                };
+                dhcpServerConfig = {
+                  PersistLeases = "runtime";
+                  PoolOffset = 2;
+                  PoolSize = 1;
+                  Router = "_server_address";
+                };
+              };
+            }) agentNetworks
+          );
           tmpfiles.rules = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [
             "d /run/systemd/network 0755 root root - -"
           ];
-          additionalUpstreamSystemUnits =
-            lib.mkIf (cfg.enable && activeAgentNames != [ ] && !config.systemd.network.enable)
-              [
-                "systemd-networkd.service"
-                "systemd-networkd.socket"
-              ];
-          sockets.systemd-networkd.wantedBy = lib.mkIf (
-            cfg.enable && activeAgentNames != [ ] && !config.systemd.network.enable
-          ) [ "sockets.target" ];
-          services.systemd-networkd.wantedBy = lib.mkIf (
-            cfg.enable && activeAgentNames != [ ] && !config.systemd.network.enable
-          ) [ "multi-user.target" ];
         }
       ]
       ++ (mapAttrsToList (mkAgent cfg.agents agentFullNames) cfg.agents)

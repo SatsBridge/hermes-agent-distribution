@@ -20,6 +20,9 @@ virtiofs default because this fixture specifically tests the 9p guest mount.
 The guest disk limit does not limit host-side Nix builds, the Nix store, or
 qcow2 metadata/physical allocation.
 
+The security, service-root, networkd activation, and DNS decisions are recorded
+in [ADR 0001](adr/0001-hermes-service-isolation-and-networkd.md).
+
 ## Per-agent network isolation
 
 Each enabled `hermes@NAME.service` keeps effective `PrivateNetwork=yes` and joins
@@ -88,14 +91,19 @@ The network helper waits for `network-online.target` before taking its upstream
 resolver snapshot. Late-created veths are excluded from the network-online wait
 with `RequiredForOnline=no`. Resolver changes after startup are not watched;
 restart the agent service (`systemctl restart hermes@NAME.service`) to rebuild
-its network and refresh the DNS upstreams. DHCP client lease/runtime/control
-state is private and ephemeral; its namespace-side veth uses a locally
+its network and refresh the DNS upstreams. DHCP uses a per-instance dynamic
+service identity. PID/control files are volatile under `RuntimeDirectory`;
+lease/DUID state persists under `StateDirectory=hermes-dhcp-NAME` (separate
+from the DHCP server's runtime leases). Its namespace-side veth uses a locally
 administered stable MAC so the single-address DHCP lease can be reacquired after
 namespace replacement. Assigned IPs remain runtime state, not a stable API. The
 client runs in a per-agent `RootDirectory`, with only its own DHCP runtime
-closure and ephemeral writable lease/control paths mounted, a closed device
-policy, a syscall allowlist, and the three capabilities needed for DHCP/network
-configuration. It has no host resolver or hostname hooks. If DHCP, SLAAC,
+closure. The existing start wrapper links its fixed `/var/run/dhcpcd` path
+to the managed runtime directory; a native state alias supplies `/var/lib/dhcpcd`.
+One private `/var/run` tmpfs allows that link without a privileged pre-start.
+It retains a closed device policy, a syscall allowlist, and the three
+capabilities needed for DHCP/network configuration. It has no host resolver or
+hostname hooks. If DHCP, SLAAC,
 networkd, resolver, or firewall setup does not
 complete within the bounded startup timeout, the agent remains stopped.
 Traffic to another Hermes agent subnet is blocked. Outbound IPv4/IPv6 routing
@@ -117,7 +125,16 @@ restriction semantics. Existing routed networks must be represented by the
 NixOS firewall/NAT configuration (or explicit nftables forward rules). Existing
 `networking.firewall.extraCommands` or `networking.nat.extraCommands` are
 incompatible with the nftables backends and cause configuration evaluation to
-fail. IPv6 egress depends on host IPv6 connectivity.
+fail. The module uses NixOS `systemd.network.networks` for generated
+`40-hermes-agent-N.network` files, so ordinary generation activation reloads
+networkd when those files change. Dynamic RA drop-ins still use the existing
+runtime reload path. If `networking.useNetworkd` is false, the module does not
+add a second host `network-online.target` wait gate; explicit networkd wait
+policy remains host-owned. The generic NixOS warning about networkd plus
+`networking.useDHCP` can remain because dhcpcd still owns the host uplink while
+Hermes veths are excluded. Enabling networkd alone does not take ownership of
+the host resolver: the module preserves the existing resolved default unless
+the host explicitly enables it. IPv6 egress depends on host IPv6 connectivity.
 
 The main agent's dashboard stays bound to namespace loopback and defaults to a
 host mapping `127.0.0.1:9119 -> agent namespace loopback:9119`. The companion
@@ -192,8 +209,10 @@ restores its provisioning rules; it does not restore or purge state.
 Each store path is a separate bind mount. The gateway, network setup, DHCP
 client, readiness coordinator, and public-state fixer each receive only their
 own evaluated runtime closure; package-set updates can change bind counts and
-service start time. The DHCP client has a private `RootDirectory`, private
-`/run` and lease state, and no host dhcpcd configuration or exit hooks.
+service start time. Every service family has an isolated `RootDirectory` and
+private runtime tree. Network setup alone gets a narrow writable host
+`/run/systemd/network` bind; readiness sees only its resolver publication path
+and manager socket. The DHCP root has no host dhcpcd configuration or hooks.
 The longer start/restart bounds apply only to the VM smoke test, not production
 systemd timeouts.
 
@@ -302,6 +321,9 @@ guest `MemTotal`, and root filesystem usage to the serial console. It fails if
 units are active, restarts both public-state units and both agent instances,
 checks that each service sees its store closure but not a known unrelated host
 store sentinel (including the guest's read-only 9p alias),
+checks the effective per-instance root directories and narrow helper mounts,
+and verifies exact nameserver membership plus a successful one-host-resolver
+DNS case and an unavailable-host-DNS negative control,
 and reads each peer's generated profile from the other agent's live mount
 namespace using that service's UID/GID and supplementary groups. Each wait is
 bounded at 120 seconds, and both agents must retain the same live PID and

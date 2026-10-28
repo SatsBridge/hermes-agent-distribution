@@ -68,6 +68,14 @@
       networkManagerProbe = hermesModuleVm.extendModules {
         modules = [ ({ lib, ... }: { networking.networkmanager.enable = lib.mkForce true; }) ];
       };
+      existingNetworkdProbe = hermesModuleVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            networking.useNetworkd = lib.mkForce true;
+            systemd.network.wait-online.enable = lib.mkForce true;
+          })
+        ];
+      };
       internetEnabledVm = networkManagerProbe.extendModules {
         modules = [
           ({ lib, ... }: {
@@ -138,8 +146,10 @@
                     })
                   ];
                 };
-                hostNetworkConfig =
-                  hermesModuleVm.config.environment.etc."systemd/network/40-hermes-agent-0.network".text;
+                hostNetworkSource =
+                  hermesModuleVm.config.environment.etc."systemd/network/40-hermes-agent-0.network".source;
+                hostNetworkConfig = builtins.readFile hostNetworkSource;
+                networkdReloadTriggers = hermesModuleVm.config.systemd.services.systemd-networkd.reloadTriggers;
                 guardConfig = hermesModuleVm.config.networking.nftables.tables."hermes-agent-guard".content;
                 hasMnemosyne = value: nixpkgs-unstable.lib.hasInfix "mnemosyne" value;
                 hasMnemosyneEnvironment =
@@ -187,6 +197,8 @@
                         systemd.services."hermes@vm".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-network@vm".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-pf@vm".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-dhcp@vm".preStart = "${pkgs.hello}/bin/hello";
+                        systemd.services."hermes-network-ready@vm".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes@".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-network@".preStart = "${pkgs.hello}/bin/hello";
                         systemd.services."hermes-network@".serviceConfig.ExecStartPost = "${pkgs.toilet}/bin/toilet";
@@ -197,6 +209,10 @@
                         systemd.services."hermes-network@vm".serviceConfig.ExecStop =
                           "${directExecProbe}/bin/hermes-direct-exec-probe";
                         systemd.services."hermes-pf@vm".serviceConfig.ExecStartPre =
+                          "${directExecProbe}/bin/hermes-direct-exec-probe";
+                        systemd.services."hermes-dhcp@vm".serviceConfig.ExecStopPost =
+                          "${directExecProbe}/bin/hermes-direct-exec-probe";
+                        systemd.services."hermes-network-ready@vm".serviceConfig.ExecStopPost =
                           "${directExecProbe}/bin/hermes-direct-exec-probe";
                         systemd.services."hermes-network@vm".serviceConfig.ExecReload = "${pkgs.figlet}/bin/figlet";
                         systemd.services."hermes@vm".serviceConfig.ExecReloadPost = [
@@ -441,6 +457,14 @@
                 && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm-peer"))
                 && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes-pf@vm"))
                 && !(hasStoreRoot networkResource (closureProbeBinds "hermes-pf@vm"))
+                && hasStoreRoot hello (closureProbeBinds "hermes-dhcp@vm")
+                && hasJobScripts "hermes-dhcp@vm"
+                && hasTemplateJobScripts "hermes-dhcp@vm" "hermes-dhcp@"
+                && hasStoreRoot directExec (closureProbeBinds "hermes-dhcp@vm")
+                && hasStoreRoot hello (closureProbeBinds "hermes-network-ready@vm")
+                && hasJobScripts "hermes-network-ready@vm"
+                && hasTemplateJobScripts "hermes-network-ready@vm" "hermes-network-ready@"
+                && hasStoreRoot directExec (closureProbeBinds "hermes-network-ready@vm")
                 && hasStoreRoot figlet (closureProbeBinds "hermes@vm")
                 && effectiveCondition == figlet
                 && builtins.elem cowsay effectiveReloadPost
@@ -460,6 +484,7 @@
                 &&
                   units."hermes@".serviceConfig.TemporaryFileSystem
                   == hermesModuleVm.config.systemd.services."hermes@".serviceConfig.TemporaryFileSystem
+                && units."hermes@".serviceConfig.TemporaryFileSystem == [ "/nix:ro" ]
                 && !hasMnemosyneEnvironment units."hermes@".environment
                 && !hasMnemosyneEnvironment units."hermes@vm".environment
                 && !hasMnemosyneRuntimePath units."hermes@"
@@ -547,7 +572,89 @@
                 && networkManagerProbe.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ]
                 && !networkManagerProbe.config.networking.useNetworkd
                 && networkManagerProbe.config.networking.dhcpcd.enable
+                && builtins.elem "ha*" networkManagerProbe.config.networking.dhcpcd.denyInterfaces
                 && units."hermes-dhcp@".serviceConfig.RootDirectory == "%t/hermes-dhcp-%i/root"
+                && units."hermes-network@".serviceConfig.RootDirectory == "%t/hermes-network-%i/root"
+                && units."hermes-network-ready@".serviceConfig.RootDirectory == "%t/hermes-network-ready-%i/root"
+                && units."hermes-pf@".serviceConfig.RootDirectory == "%t/hermes-%i-pf/root"
+                && units."hermes@".serviceConfig.RootDirectory == "%t/hermes-%i/root"
+                &&
+                  units."hermes-network@".serviceConfig.RuntimeDirectory == [
+                    "hermes-network-%i"
+                    "hermes-network-%i/root"
+                  ]
+                &&
+                  units."hermes-network-ready@".serviceConfig.RuntimeDirectory == [
+                    "hermes-network-ready-%i"
+                    "hermes-network-ready-%i/root"
+                    "hermes-agent-network-%i"
+                  ]
+                &&
+                  units."hermes-pf@".serviceConfig.RuntimeDirectory == [
+                    "hermes-%i-pf"
+                    "hermes-%i-pf/root"
+                    "hermes-%i-pf/root/etc"
+                  ]
+                &&
+                  units."hermes@".serviceConfig.RuntimeDirectory == [
+                    "hermes-%i"
+                    "hermes-%i/root"
+                    "hermes-%i/root/etc"
+                  ]
+                && builtins.all (unit: !(units.${unit}.serviceConfig ? MemoryKSM)) [
+                  "hermes-dhcp@"
+                  "hermes-network@"
+                  "hermes-network-ready@"
+                  "hermes-pf@"
+                  "hermes@"
+                ]
+                && builtins.all (unit: builtins.elem "~@privileged" units.${unit}.serviceConfig.SystemCallFilter) [
+                  "hermes-dhcp@"
+                  "hermes-network@"
+                  "hermes-network-ready@"
+                  "hermes-pf@"
+                  "hermes@"
+                ]
+                && units."hermes-dhcp@".serviceConfig.RestrictSUIDSGID
+                && units."hermes-pf@".serviceConfig.RestrictSUIDSGID
+                && units."hermes@".serviceConfig.RestrictSUIDSGID
+                && units."hermes-network@".serviceConfig.RestrictSUIDSGID
+                && units."hermes-network-ready@".serviceConfig.RestrictSUIDSGID
+                && units."hermes-dhcp@".serviceConfig.MemoryDenyWriteExecute
+                && units."hermes-network@".serviceConfig.MemoryDenyWriteExecute
+                && units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
+                && units."hermes-pf@".serviceConfig.MemoryDenyWriteExecute
+                && !(units."hermes@".serviceConfig ? MemoryDenyWriteExecute)
+                && units."hermes-network@".serviceConfig.BindPaths == [ "/run/systemd/network" ]
+                && builtins.elem "/run/systemd/network" units."hermes-network@".serviceConfig.ReadWritePaths
+                && builtins.elem "/run/systemd/private" units."hermes-network@".serviceConfig.BindReadOnlyPaths
+                &&
+                  builtins.elem "/run/systemd/netif/io.systemd.Network"
+                    units."hermes-network@".serviceConfig.BindReadOnlyPaths
+                &&
+                  builtins.elem "/run/dbus/system_bus_socket"
+                    units."hermes-network@".serviceConfig.BindReadOnlyPaths
+                && builtins.elem "/etc/group" units."hermes-pf@".serviceConfig.BindReadOnlyPaths
+                &&
+                  builtins.elem "/dev/null:/etc/dhcpcd.exit-hook"
+                    units."hermes-dhcp@".serviceConfig.BindReadOnlyPaths
+                && builtins.elem "%S/hermes-%i" units."hermes-pf@".serviceConfig.BindPaths
+                && !(units."hermes-pf@".serviceConfig ? StateDirectory)
+                &&
+                  units."hermes-dhcp@".serviceConfig.StateDirectory == [
+                    "hermes-dhcp-%i:dhcpcd"
+                  ]
+                &&
+                  units."hermes-dhcp@".serviceConfig.RuntimeDirectory == [
+                    "hermes-dhcp-%i:dhcpcd"
+                    "hermes-dhcp-%i/root"
+                  ]
+                &&
+                  units."hermes-dhcp@".serviceConfig.TemporaryFileSystem == [
+                    "/nix:ro"
+                    "/var/run:mode=1777"
+                  ]
+                && !(units."hermes-dhcp@".serviceConfig ? ReadWritePaths)
                 && units."hermes-dhcp@".serviceConfig.PrivateNetwork
                 && units."hermes-dhcp@".serviceConfig.NoNewPrivileges
                 && units."hermes-dhcp@".serviceConfig.ProtectSystem == "strict"
@@ -572,6 +679,8 @@
                     "CAP_NET_BIND_SERVICE"
                     "CAP_NET_RAW"
                   ]
+                && units."hermes-dhcp@".serviceConfig.DynamicUser
+                && units."hermes-dhcp@".serviceConfig.User == "hermes-dhcp-%i"
                 && units."hermes-dhcp@".unitConfig.JoinsNamespaceOf == [ "hermes-network@%i.service" ]
                 && units."hermes-dhcp@vm".serviceConfig ? ExecStart
                 && builtins.any (
@@ -586,12 +695,69 @@
                 && units."hermes-network-ready@".serviceConfig.Restart == "no"
                 && units."hermes-network-ready@".serviceConfig.TimeoutStartSec == "60s"
                 && builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo
+                && nixpkgs-unstable.lib.hasInfix "Name=ha0" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "Kind=veth" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "Address=0.0.0.0/30" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "Address=::/64" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "DHCPServer=yes" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "IPv6SendRA=yes" hostNetworkConfig
-                && !(disabledAgentProbe.config.environment.etc ? "systemd/network/40-hermes-agent-0.network")
+                && nixpkgs-unstable.lib.hasInfix "DHCPServer=true" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "IPv4Forwarding=true" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "IPv6Forwarding=true" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "IPv6SendRA=true" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "RequiredForOnline=no" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "PersistLeases=runtime" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "PoolOffset=2" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "PoolSize=1" hostNetworkConfig
+                && nixpkgs-unstable.lib.hasInfix "Router=_server_address" hostNetworkConfig
+                && !(disabledAgentProbe.config.systemd.network.networks ? "40-hermes-agent-0")
+                && !disabledAgentProbe.config.systemd.network.enable
+                && units."hermes-network@".serviceConfig.RestrictNamespaces == [ "net" ]
+                && units."hermes-network-ready@".serviceConfig.RestrictNamespaces == [ "net" ]
+                && units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
+                && !(units."hermes-network-ready@".serviceConfig ? ReadWritePaths)
+                && builtins.elem "~@privileged" units."hermes-network@".serviceConfig.SystemCallFilter
+                && builtins.elem "~@privileged" units."hermes-network-ready@".serviceConfig.SystemCallFilter
+                && builtins.elem "setns" units."hermes-network@".serviceConfig.SystemCallFilter
+                && builtins.elem "setns" units."hermes-network-ready@".serviceConfig.SystemCallFilter
+                &&
+                  builtins.all (syscall: builtins.elem syscall units."hermes-network@".serviceConfig.SystemCallFilter)
+                    [
+                      "setgid"
+                      "setgroups"
+                      "setresgid"
+                      "setresuid"
+                      "setuid"
+                    ]
+                &&
+                  builtins.all
+                    (syscall: builtins.elem syscall units."hermes-network-ready@".serviceConfig.SystemCallFilter)
+                    [
+                      "setgid"
+                      "setgroups"
+                      "setresgid"
+                      "setresuid"
+                      "setuid"
+                    ]
+                &&
+                  units."hermes-network@".serviceConfig.CapabilityBoundingSet == [
+                    "CAP_NET_ADMIN"
+                    "CAP_SETGID"
+                    "CAP_SETUID"
+                    "CAP_SYS_ADMIN"
+                    "CAP_SYS_PTRACE"
+                  ]
+                &&
+                  units."hermes-network-ready@".serviceConfig.CapabilityBoundingSet == [
+                    "CAP_NET_ADMIN"
+                    "CAP_NET_BIND_SERVICE"
+                    "CAP_SETGID"
+                    "CAP_SETUID"
+                    "CAP_SYS_ADMIN"
+                    "CAP_SYS_PTRACE"
+                  ]
+                && existingNetworkdProbe.config.networking.useNetworkd
+                && existingNetworkdProbe.config.systemd.network.wait-online.enable
+                && networkManagerProbe.config.systemd.network.wait-online.enable == false
+                && networkManagerProbe.config.networking.dhcpcd.enable
                 && units."hermes-network@".serviceConfig.PrivateNetwork
                 && units."hermes-network@".serviceConfig.Type == "oneshot"
                 && units."hermes-network@vm".serviceConfig ? ExecStart
@@ -609,6 +775,11 @@
                 && hermesModuleVm.config.networking.firewall.filterForward
                 && hermesModuleVm.config.networking.nat.enable
                 && hermesModuleVm.config.networking.nat.enableIPv6
+                && hermesModuleVm.config.systemd.network.enable
+                && !hermesModuleVm.config.systemd.network.wait-online.enable
+                && !hermesModuleVm.config.services.resolved.enable
+                && builtins.elem hostNetworkSource networkdReloadTriggers
+                && !hermesModuleVm.config.systemd.services.systemd-networkd.stopIfChanged
                 && nixpkgs-unstable.lib.hasInfix "policy drop" guardConfig
                 && nixpkgs-unstable.lib.hasInfix "iifname != { \"ha0\", \"ha1\" } accept" guardConfig
                 && builtins.elem "ha0" hermesModuleVm.config.networking.nat.internalInterfaces

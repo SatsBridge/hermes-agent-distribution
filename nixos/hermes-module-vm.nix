@@ -868,6 +868,75 @@ let
         printf '%s\n' "$pid"
       }
 
+      expected_root_directory() {
+        local unit="$1" instance="''${1#*@}"
+        instance="''${instance%.service}"
+        case "$unit" in
+          hermes@*) printf '/run/hermes-%s/root\n' "$instance" ;;
+          hermes-pf@*) printf '/run/hermes-%s-pf/root\n' "$instance" ;;
+          hermes-network@*) printf '/run/hermes-network-%s/root\n' "$instance" ;;
+          hermes-network-ready@*) printf '/run/hermes-network-ready-%s/root\n' "$instance" ;;
+          hermes-dhcp@*) printf '/run/hermes-dhcp-%s/root\n' "$instance" ;;
+          *) echo "$unit has no expected private-root mapping" >&2; return 1 ;;
+        esac
+      }
+
+      check_root_configuration() {
+        local unit actual expected
+        for unit in "''${units[@]}"; do
+          expected=$(expected_root_directory "$unit") || return 1
+          actual=$(timeout 10s systemctl show --property=RootDirectory --value "$unit")
+          [[ "$actual" == "$expected" ]] || {
+            echo "$unit effective RootDirectory is $actual; expected $expected" >&2
+            return 1
+          }
+        done
+        echo "All five Hermes service families use their per-instance effective RootDirectory"
+      }
+
+      check_helper_mounts() {
+        local setup="hermes-network@vm.service" ready="hermes-network-ready@vm.service" setup_binds setup_writes ready_binds ready_writes pid mountinfo
+        setup_binds=$(systemctl show --property=BindPaths --value "$setup")
+        setup_writes=$(systemctl show --property=ReadWritePaths --value "$setup")
+        ready_binds=$(systemctl show --property=BindPaths --value "$ready")
+        ready_writes=$(systemctl show --property=ReadWritePaths --value "$ready")
+        [[ "$setup_binds" == *"/run/systemd/network"* && "$setup_writes" == *"/run/systemd/network"* ]] || {
+          echo "$setup does not have the explicit, narrow networkd write mount: $setup_binds / $setup_writes" >&2
+          return 1
+        }
+        [[ "$setup_binds" != *"/run "* && "$ready_binds" != *"/run "* ]] || {
+          echo "A helper binds the complete host /run tree" >&2
+          return 1
+        }
+        [[ "$ready_binds" == *"/run/systemd/network"* ]] && {
+          echo "$ready unexpectedly binds networkd's writable runtime directory" >&2
+          return 1
+        }
+        [[ "$ready_writes" != *"/run/systemd/network"* ]] || {
+          echo "$ready unexpectedly has write access to networkd's runtime directory" >&2
+          return 1
+        }
+        [[ "$ready_writes" == *"/run/hermes-agent-network-0"* ]] || {
+          echo "$ready cannot publish its private resolver file: $ready_writes" >&2
+          return 1
+        }
+        pid=$(service_pid "$ready") || return 1
+        mountinfo=$(<"/proc/$pid/mountinfo")
+        [[ "$mountinfo" != *" /run/systemd/network "* ]] || {
+          echo "$ready has an unexpected host networkd directory mount" >&2
+          return 1
+        }
+        [[ -S "/proc/$pid/root/run/systemd/private" && -r "/proc/$pid/root/run/hermes-host-resolv.conf" ]] || {
+          echo "$ready is missing its narrow manager/resolver inputs inside RootDirectory" >&2
+          return 1
+        }
+        [[ ! -e "/proc/$pid/root/run/systemd/network" ]] || {
+          echo "$ready can see the networkd runtime directory without needing it" >&2
+          return 1
+        }
+        echo "Network setup has only the explicit networkd write bind; readiness sees manager/resolver inputs, not host networkd runtime state"
+      }
+
       discover_network_values() {
         local main_pid peer_pid
         main_pid=$(service_pid hermes@vm.service) || return 1
@@ -893,7 +962,7 @@ let
       }
 
       check_store_isolation() {
-        local unit="$1" pid="$2" bind_paths temporary_filesystem inaccessible_paths root_directory alias uid gid root_probe
+        local unit="$1" pid="$2" bind_paths temporary_filesystem inaccessible_paths root_directory alias uid gid root_probe expected_root mountinfo
         echo "Checking store closure and host-store denial in $unit (pid=$pid)"
         bind_paths=$(timeout 10s systemctl show --property=BindReadOnlyPaths --value "$unit")
         temporary_filesystem=$(timeout 10s systemctl show --property=TemporaryFileSystem --value "$unit")
@@ -911,7 +980,16 @@ let
           return 1
         }
         if [[ -n "$root_directory" ]]; then
-          [[ "$root_directory" == */root ]] || { echo "$unit has an unexpected private root: $root_directory" >&2; return 1; }
+          expected_root=$(expected_root_directory "$unit") || return 1
+          [[ "$root_directory" == "$expected_root" ]] || {
+            echo "$unit has private root $root_directory; expected $expected_root" >&2
+            return 1
+          }
+          mountinfo=$(<"/proc/$pid/mountinfo")
+          [[ "$mountinfo" == *" /nix "* && "$mountinfo" == *" /nix/store/"* ]] || {
+            echo "$unit mountinfo does not show the isolated store view" >&2
+            return 1
+          }
         else
           for alias in /run/current-system /run/booted-system /run/wrappers /etc/static /etc/profiles /etc/systemd; do
             [[ "$inaccessible_paths" == *"$alias"* ]] || {
@@ -974,6 +1052,8 @@ let
 
       check_all_store_isolation() {
         local unit pid
+        check_root_configuration || return 1
+        check_helper_mounts || return 1
         [[ -r "$store_sentinel" ]] || { echo "Positive-control store sentinel is missing: $store_sentinel" >&2; return 1; }
         [[ "$(<"$store_sentinel")" == "$store_sentinel_text" ]] || {
           echo "Positive-control store sentinel has unexpected contents" >&2
@@ -995,6 +1075,22 @@ let
         for unit in hermes-network-ready@vm.service hermes-network-ready@vm-peer.service hermes-dhcp@vm.service hermes-dhcp@vm-peer.service; do
           pid=$(service_pid "$unit") || return 1
           check_store_isolation "$unit" "$pid" || return 1
+          if [[ "$unit" == hermes-dhcp@* ]]; then
+            local instance="''${unit#hermes-dhcp@}" runtime state uid gid
+            instance="''${instance%.service}"
+            runtime="/run/hermes-dhcp-$instance"
+            state="/var/lib/hermes-dhcp-$instance"
+            [[ $(readlink "/proc/$pid/root/var/run/dhcpcd") == /run/dhcpcd \
+              && -L "/proc/$pid/root/var/lib/dhcpcd" ]] || return 1
+            uid=$(awk '/^Uid:/ {print $3}' "/proc/$pid/status")
+            gid=$(awk '/^Gid:/ {print $3}' "/proc/$pid/status")
+            # This tests filesystem access as the client identity, not its seccomp/cgroup controls.
+            # shellcheck disable=SC2016
+            nsenter --target "$pid" --mount --root --wd --setuid "$uid" --setgid "$gid" -- \
+              "$store_bash" -euc 'test /var/run/dhcpcd -ef "$1"; test /var/lib/dhcpcd -ef "$2"; test -w "$1"; test -w "$2"' \
+              -- "$runtime" "$state" || return 1
+            echo "$unit fixed runtime/state paths resolve to writable manager-owned directories as UID $uid"
+          fi
         done
       }
 
@@ -1099,6 +1195,87 @@ let
         return 1
       }
 
+      check_host_only_resolver() (
+        local unit="$1" pid="$2" host_if="$3" host_ip="$4" host_ip6="$5" agent_ip="$6" instance resolver_file original comment output actual expected
+        instance="''${unit#*@}"
+        instance="''${instance%.service}"
+        resolver_file="/run/hermes-agent-network-''${instance/vm/0}/resolv.conf"
+        [[ "$instance" == vm-peer ]] && resolver_file=/run/hermes-agent-network-1/resolv.conf
+        original=$(<"$resolver_file")
+        comment="hermes-vm-dns-negative-$instance"
+
+        remove_dns_block() {
+          local protocol handle
+          for protocol in udp tcp; do
+            handle=$(nft -a list chain inet hermes-agent-guard hermes_agent_input_guard \
+              | awk -v needle="comment \"$comment-$protocol\"" 'index($0, needle) { print $NF; exit }')
+            [[ -z "$handle" ]] || nft delete rule inet hermes-agent-guard hermes_agent_input_guard handle "$handle"
+          done
+        }
+        restore_resolver() {
+          printf '%s\n' "$original" >"$resolver_file"
+          remove_dns_block
+        }
+        trap restore_resolver EXIT
+
+        assert_nameservers() {
+          expected="$1"
+          actual=$(awk '$1 == "nameserver" { if (NF != 2) exit 2; print $2 }' "/proc/$pid/root/etc/resolv.conf")
+          [[ "$actual" == "$expected" ]] || {
+            echo "$unit resolver nameservers differ: expected [$expected], got [$actual]" >&2
+            return 1
+          }
+        }
+        resolve_controlled_record() {
+          run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c '
+        import socket, sys
+        cap = next(line.split()[1] for line in open("/proc/self/status") if line.startswith("CapEff:"))
+        assert int(cap, 16) == 0, cap
+        family, expected = sys.argv[1:]
+        af = socket.AF_INET if family == "A" else socket.AF_INET6
+        actual = sorted({row[4][0] for row in socket.getaddrinfo("hermes-vm.test", None, af)})
+        assert actual == [expected], actual
+        print(f"{family} {actual[0]} CapEff=0")
+          ' "$1" "$2"
+        }
+
+        output=$("${lib.getExe' pkgs.dnsutils "dig"}" +time=2 +tries=1 +short hermes-vm.test A)
+        [[ "$output" == 198.20.0.2 ]] || { echo "Host resolver positive control returned: $output" >&2; return 1; }
+        expected=$(printf '%s\n%s' "$host_ip" "$host_ip6")
+        assert_nameservers "$expected"
+        output=$("${lib.getExe' pkgs.dnsutils "dig"}" +time=2 +tries=1 +short hermes-vm.test AAAA)
+        [[ "$output" == fd42:198:20::2 ]] || { echo "Host resolver AAAA positive control returned: $output" >&2; return 1; }
+        printf 'nameserver %s\noptions attempts:1 timeout:2\n' "$host_ip" >"$resolver_file"
+        assert_nameservers "$host_ip"
+        resolve_controlled_record A 198.20.0.2
+        resolve_controlled_record AAAA fd42:198:20::2
+
+        nft insert rule inet hermes-agent-guard hermes_agent_input_guard \
+          iifname "$host_if" ip saddr "$agent_ip" udp dport 53 drop comment "$comment-udp"
+        nft insert rule inet hermes-agent-guard hermes_agent_input_guard \
+          iifname "$host_if" ip saddr "$agent_ip" tcp dport 53 drop comment "$comment-tcp"
+        output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c '
+        import socket, sys
+        cap = next(line.split()[1] for line in open("/proc/self/status") if line.startswith("CapEff:"))
+        assert int(cap, 16) == 0, cap
+        try:
+            socket.getaddrinfo("hermes-vm.test", None, socket.AF_INET)
+        except socket.gaierror:
+            print("gaierror")
+        else:
+            raise SystemExit("lookup unexpectedly succeeded")
+        ')
+        [[ "$output" == gaierror ]] || { echo "$unit DNS-unavailable negative control returned: $output" >&2; return 1; }
+
+        restore_resolver
+        trap - EXIT
+        expected=$(printf '%s\n%s' "$host_ip" "$host_ip6")
+        assert_nameservers "$expected"
+        resolve_controlled_record A 198.20.0.2
+        resolve_controlled_record AAAA fd42:198:20::2
+        echo "$unit used exactly one host DNS nameserver successfully and failed closed when that host resolver was blocked"
+      )
+
       check_agent_network() {
         local unit="$1" peer_if="$2" host_ip="$3" agent_ip="$4" blocked_peer="$5" host_ip6="$6" agent_ip6="$7" blocked_peer6="$8" host_if pid output
         pid=$(service_pid "$unit") || return 1
@@ -1129,6 +1306,7 @@ let
         output=$("${lib.getExe' pkgs.util-linux "nsenter"}" --target "$pid" --net -- "${lib.getExe' pkgs.dnsutils "dig"}" +tcp +time=2 +tries=1 +short @"$host_ip6" hermes-vm.test AAAA) || { echo "$unit IPv6 TCP DNS query failed" >&2; return 1; }
         [[ "$output" == fd42:198:20::2 ]] || { echo "$unit IPv6 TCP DNS answer was: $output" >&2; return 1; }
         echo "$unit: service-identity name-resolution probes"
+        check_host_only_resolver "$unit" "$pid" "$host_if" "$host_ip" "$host_ip6" "$agent_ip" || return 1
         output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket; print(*sorted({r[4][0] for r in socket.getaddrinfo("hermes-vm.test", None, socket.AF_INET)}), sep="\\n")') || { echo "$unit service-identity A lookup failed" >&2; return 1; }
         [[ "$output" == *198.20.0.2* ]] || { echo "$unit service-identity A lookup was: $output" >&2; return 1; }
         output=$(run_as_service root "$pid" "${lib.getExe' pkgs.python3 "python3"}" -c 'import socket; print(*sorted({r[4][0] for r in socket.getaddrinfo("hermes-vm.test", None, socket.AF_INET6)}), sep="\\n")') || { echo "$unit service-identity AAAA lookup failed" >&2; return 1; }
