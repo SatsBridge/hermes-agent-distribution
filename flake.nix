@@ -562,8 +562,8 @@
                 && builtins.elem "hermes-network@%i.service" units."hermes@".bindsTo
                 && builtins.elem "hermes-network@%i.service" units."hermes@".after
                 && builtins.elem "hermes-network@%i.service" units."hermes@".unitConfig.JoinsNamespaceOf
-                && builtins.elem "network-online.target" units."hermes-network@".after
-                && builtins.elem "network-online.target" units."hermes-network@".wants
+                && builtins.elem "network-online.target" units."hermes-host-control@".after
+                && builtins.elem "network-online.target" units."hermes-host-control@".wants
                 && builtins.hasAttr "hermes-vm-late-resolver" units
                 && builtins.elem "network-online.target" units.hermes-vm-late-resolver.before
                 && !hermesModuleVm.config.networking.resolvconf.enable
@@ -625,15 +625,15 @@
                 && units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
                 && units."hermes-pf@".serviceConfig.MemoryDenyWriteExecute
                 && !(units."hermes@".serviceConfig ? MemoryDenyWriteExecute)
-                && units."hermes-network@".serviceConfig.BindPaths == [ "/run/systemd/network" ]
-                && builtins.elem "/run/systemd/network" units."hermes-network@".serviceConfig.ReadWritePaths
-                && builtins.elem "/run/systemd/private" units."hermes-network@".serviceConfig.BindReadOnlyPaths
+                && units."hermes-host-control@".serviceConfig.BindPaths == [ "/run/systemd/network" ]
+                && builtins.elem "/run/systemd/network" units."hermes-host-control@".serviceConfig.ReadWritePaths
+                && builtins.elem "/run/systemd/private" units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
                 &&
                   builtins.elem "/run/systemd/netif/io.systemd.Network"
-                    units."hermes-network@".serviceConfig.BindReadOnlyPaths
-                &&
-                  builtins.elem "/run/dbus/system_bus_socket"
-                    units."hermes-network@".serviceConfig.BindReadOnlyPaths
+                    units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
+                && !(builtins.elem "/run/dbus/system_bus_socket"
+                  units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
+                )
                 && builtins.elem "/etc/group" units."hermes-pf@".serviceConfig.BindReadOnlyPaths
                 &&
                   builtins.elem "/dev/null:/etc/dhcpcd.exit-hook"
@@ -710,16 +710,27 @@
                 && nixpkgs-unstable.lib.hasInfix "Router=_server_address" hostNetworkConfig
                 && !(disabledAgentProbe.config.systemd.network.networks ? "40-hermes-agent-0")
                 && !disabledAgentProbe.config.systemd.network.enable
-                && units."hermes-network@".serviceConfig.RestrictNamespaces == [ "net" ]
+                && units."hermes-network@".serviceConfig.RestrictNamespaces
+                && units."hermes-host-control@".serviceConfig.RestrictNamespaces
+                && units."hermes-netns@".serviceConfig.RestrictNamespaces
+                && units."hermes-netns@".serviceConfig.CapabilityBoundingSet == ""
+                && units."hermes-host-control@".serviceConfig.CapabilityBoundingSet == [ "CAP_NET_ADMIN" ]
+                && units."hermes-host-control@".serviceConfig.NetworkNamespacePath == "/proc/1/ns/net"
+                && !(units."hermes-host-control@".unitConfig ? JoinsNamespaceOf)
+                && units."hermes-network@".unitConfig.JoinsNamespaceOf == [ "hermes-netns@%i.service" ]
+                && builtins.elem "hermes-host-control@%i.service" units."hermes-network@".bindsTo
+                && builtins.elem "hermes-netns@%i.service" units."hermes-host-control@".bindsTo
                 && units."hermes-network-ready@".serviceConfig.RestrictNamespaces == [ "net" ]
                 && units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
                 && !(units."hermes-network-ready@".serviceConfig ? ReadWritePaths)
                 && builtins.elem "~@privileged" units."hermes-network@".serviceConfig.SystemCallFilter
                 && builtins.elem "~@privileged" units."hermes-network-ready@".serviceConfig.SystemCallFilter
-                && builtins.elem "setns" units."hermes-network@".serviceConfig.SystemCallFilter
+                && !(builtins.elem "setns" units."hermes-network@".serviceConfig.SystemCallFilter)
+                && !(builtins.elem "setns" units."hermes-host-control@".serviceConfig.SystemCallFilter)
                 && builtins.elem "setns" units."hermes-network-ready@".serviceConfig.SystemCallFilter
                 &&
-                  builtins.all (syscall: builtins.elem syscall units."hermes-network@".serviceConfig.SystemCallFilter)
+                  builtins.all
+                    (syscall: !(builtins.elem syscall units."hermes-network@".serviceConfig.SystemCallFilter))
                     [
                       "setgid"
                       "setgroups"
@@ -740,10 +751,6 @@
                 &&
                   units."hermes-network@".serviceConfig.CapabilityBoundingSet == [
                     "CAP_NET_ADMIN"
-                    "CAP_SETGID"
-                    "CAP_SETUID"
-                    "CAP_SYS_ADMIN"
-                    "CAP_SYS_PTRACE"
                   ]
                 &&
                   units."hermes-network-ready@".serviceConfig.CapabilityBoundingSet == [
@@ -761,10 +768,10 @@
                 && units."hermes-network@".serviceConfig.PrivateNetwork
                 && units."hermes-network@".serviceConfig.Type == "oneshot"
                 && units."hermes-network@vm".serviceConfig ? ExecStart
-                && units."hermes-network@vm".serviceConfig ? ExecStopPost
+                && units."hermes-host-control@vm".serviceConfig ? ExecStopPost
                 && units."hermes-network@vm-peer".serviceConfig ? ExecStart
-                && units."hermes-network@vm-peer".serviceConfig ? ExecStopPost
-                && builtins.elem "CAP_SYS_PTRACE" units."hermes-network@".serviceConfig.CapabilityBoundingSet
+                && units."hermes-host-control@vm-peer".serviceConfig ? ExecStopPost
+                && !(builtins.elem "CAP_SYS_PTRACE" units."hermes-network@".serviceConfig.CapabilityBoundingSet)
                 && units."hermes-pf@".serviceConfig.PrivateNetwork
                 && units."hermes-pf@".serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ]
                 && builtins.elem "hermes@%i.service" units."hermes-pf@".partOf

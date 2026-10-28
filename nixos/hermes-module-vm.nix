@@ -5,8 +5,33 @@
   ...
 }:
 let
+  vmNetworkLocalBoundaryProbe = pkgs.writeText "hermes-vm-local-network-boundary.py" ''
+    import ctypes
+    import errno
+    import pathlib
+    import socket
+
+    status = dict(line.split(":", 1) for line in pathlib.Path("/proc/self/status").read_text().splitlines())
+    assert int(status["CapEff"], 16) == 0x1000, status["CapEff"]
+    assert int(status["CapBnd"], 16) == 0x1000, status["CapBnd"]
+    assert int(status["CapAmb"], 16) == 0
+    assert int(status["NoNewPrivs"]) == 1
+    assert int(status["Seccomp"]) == 2
+    for family in (socket.AF_INET, socket.AF_INET6, socket.AF_PACKET):
+        try:
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+        except OSError as error:
+            assert error.errno in (errno.EPERM, errno.EAFNOSUPPORT), error
+        else:
+            sock.close()
+            raise AssertionError(f"forbidden socket family {family} succeeded")
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.setns(-1, 0) == -1 and ctypes.get_errno() == errno.EPERM
+    assert libc.unshare(0x40000000) == -1 and ctypes.get_errno() == errno.EPERM
+    print("LOCAL_NETWORK_BOUNDARY_PASSED caps=NET_ADMIN ambient=0 seccomp=2 forbidden-families/setns/unshare=denied", flush=True)
+  '';
   networkSetupPath = builtins.head (
-    lib.splitString " " config.systemd.services."hermes-network@vm".serviceConfig.ExecStart
+    lib.splitString " " config.systemd.services."hermes-host-control@vm".serviceConfig.ExecStart
   );
   agentAddressFilter = builtins.head (
     builtins.match ".*(/nix/store/[^ ]+-hermes-agent-address-filter.py).*" (
@@ -402,6 +427,10 @@ let
         hermes-pf@vm-peer.service
         hermes-network@vm.service
         hermes-network@vm-peer.service
+        hermes-netns@vm.service
+        hermes-netns@vm-peer.service
+        hermes-host-control@vm.service
+        hermes-host-control@vm-peer.service
         hermes-dhcp@vm.service
         hermes-dhcp@vm-peer.service
         hermes-network-ready@vm.service
@@ -875,6 +904,8 @@ let
           hermes@*) printf '/run/hermes-%s/root\n' "$instance" ;;
           hermes-pf@*) printf '/run/hermes-%s-pf/root\n' "$instance" ;;
           hermes-network@*) printf '/run/hermes-network-%s/root\n' "$instance" ;;
+          hermes-netns@*) printf '/run/hermes-netns-%s/root\n' "$instance" ;;
+          hermes-host-control@*) printf '/run/hermes-host-control-%s/root\n' "$instance" ;;
           hermes-network-ready@*) printf '/run/hermes-network-ready-%s/root\n' "$instance" ;;
           hermes-dhcp@*) printf '/run/hermes-dhcp-%s/root\n' "$instance" ;;
           *) echo "$unit has no expected private-root mapping" >&2; return 1 ;;
@@ -895,7 +926,7 @@ let
       }
 
       check_helper_mounts() {
-        local setup="hermes-network@vm.service" ready="hermes-network-ready@vm.service" setup_binds setup_writes ready_binds ready_writes pid mountinfo
+        local setup="hermes-host-control@vm.service" ready="hermes-network-ready@vm.service" setup_binds setup_writes ready_binds ready_writes pid mountinfo
         setup_binds=$(systemctl show --property=BindPaths --value "$setup")
         setup_writes=$(systemctl show --property=ReadWritePaths --value "$setup")
         ready_binds=$(systemctl show --property=BindPaths --value "$ready")
@@ -2619,6 +2650,9 @@ in
     ExecStartPre = [ (lib.getExe vmNetworkReadinessBarrierProbe) ];
     BindReadOnlyPaths = lib.mkAfter vmNetworkReadinessBarrierClosure;
   };
+
+  systemd.services."hermes-network@".serviceConfig.ExecStartPost =
+    lib.mkDefault "${lib.getExe pkgs.python3} ${vmNetworkLocalBoundaryProbe}";
 
   systemd.services.hermes-vm-late-resolver = {
     before = [ "network-online.target" ];

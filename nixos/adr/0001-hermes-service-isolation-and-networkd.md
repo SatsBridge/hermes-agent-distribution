@@ -1,16 +1,17 @@
 # ADR 0001: Hermes service roots, networkd ownership, and resolver proof
 
 Status: proposed; the owner authorized internal privilege separation, but
-implementation and independent acceptance review remain pending. This is not a
-risk exception or release authorization.
+implementation is partial and independent acceptance review remains pending.
+This is not a risk exception or release authorization.
 Date: 2026-10-28
 
 The owner authorized splitting internal roles to avoid workload `CAP_SYS_ADMIN`
 (task thread, followed by design review t_b1ae7c4b). Preserve the public
 families and existing DNS/NAT owners; let the manager enter namespaces, separate
 host administration from unprivileged proxies, and validate generation-scoped
-agent observations before authorization. The table below still describes the
-partial pre-split candidate, not an accepted final topology. No further topology
+agent observations before authorization. The legacy-role table below describes
+the pre-split checkpoint; the first implemented split boundary is recorded
+separately below. Neither is an accepted final topology. No further topology
 permission is needed within those boundaries. PID1 still needs privileges to
 construct roots/namespaces; the service payload is not a nested container
 manager, so the systemd Container Interface's cgroup-delegation and
@@ -40,6 +41,9 @@ files; strengthen the existing DNS regression without changing resolver
 architecture.
 
 ## Service and data boundaries
+
+The following table is the historical pre-split checkpoint, not the effective
+settings of the new setup/anchor/controller units.
 
 `G` = gateway; `PF` = public-state fixer; `N` = network setup; `D` = DHCP; `R` =
 readiness.
@@ -121,6 +125,82 @@ containment boundary.
 
 ## Per-role execution hardening
 
+### First implemented split boundary (not whole-task acceptance)
+
+`hermes-netns@` is a root-identity, zero-capability `sleep` lifetime anchor.
+Its explicit `CapabilityBoundingSet=""` is important: the Nix unit renderer
+omits an empty list rather than emitting an empty directive. A root process
+with the omitted directive retains capabilities. The failed prerequisite guest
+exposed this, and the corrected guest demonstrated zero effective/permitted/
+bounding/ambient capabilities. No dumpability override, SYS_PTRACE or privileged
+initializer is necessary for the corrected zero-capability anchor.
+
+`hermes-host-control@` is now the only setup role that creates/deletes the host
+veth and RA files. PID1 selects `/proc/1/ns/net` using NetworkNamespacePath;
+this unit never joins the anchor and its payload has only NET_ADMIN. The public
+`hermes-network@` remains the private-namespace join point. It is ordered after
+and bound to both anchor and host controller, joins only the anchor, and brings
+up `lo`/the moved peer with NET_ADMIN. Both setup payloads deny setns, namespace
+creation and privileged/credential-change syscall groups. Neither starts proxy
+children or has SETUID/SETGID/SYS_ADMIN/SYS_PTRACE. Local setup has only
+AF_NETLINK/AF_UNIX and no manager socket or networkd runtime bind. The anchor has
+only AF_UNIX, no host socket and no persistent state. All three have their own
+root/runtime directories, closure/hook discovery, private devices/mounts/tmp/
+IPC, strict system/kernel/cgroup protection, closed device policy and MDWE.
+PrivateUsers remains off: controller/local NET_ADMIN must apply to the network
+namespace's owning user namespace; the anchor's root UID is the tested proc-FD
+access contract, not general privilege. PrivatePIDs remains off to preserve the
+host PID/namespace identity checks. No BPF/network policy is substituted.
+
+Host-controller setup notification has these exact postconditions: anchor
+InvocationID is 32 lowercase hexadecimal characters, PID is greater than one,
+process start time and namespace inode are captured, a namespace FD is held,
+the owned/aliased veth exists, peer MAC is configured, the peer was moved using
+that FD, the anchor identity was rechecked, and the host link is up. This does
+NOT mean the host has an address, RA prefix, DHCP, SLAAC or traffic authorization.
+Only after this acknowledgement does public local setup bring the peer up.
+The controller continues the existing bounded host allocation/overlap checks
+and RA publication/reconfigure, avoiding a carrier-before-ack deadlock. It keeps
+checking the anchor identity afterward. The existing privileged readiness code
+still performs the DHCP/SLAAC/routes/exact-policy barrier; replacing that code
+and splitting proxies/telemetry remains outstanding, not implicitly accepted.
+
+The namespace FD is opened only after manager PID/generation validation; process
+start time, PID, InvocationID and namespace inode are checked immediately before
+and after movement, then while the controller runs. PID reuse cannot retarget
+the held FD. Any mismatch fails the owner and runs cleanup. Host-control
+ExecStopPost also attempts cleanup after SIGKILL/failed start. Failed nft set
+flushing is now reported and attempts to block the owned host link before
+deletion; no silent flush success is claimed. This does not yet prove the final
+cross-role loss budget. A targeted production-controller SIGKILL test flushed a
+populated allocation set and deleted its link in 601.18274 ms while a synthetic
+dependent was still in its eight-second ExecStop. This covers that failure edge,
+not normal ordered stops, a slow gateway, observer/proxy loss or nft failure.
+Controller normal
+TERM exits successfully after cleanup; unexpected exits still invalidate
+BindsTo consumers. Anchor and controller are PartOf the public network lifetime.
+
+Manager-client contract: SYSTEMD_OFFLINE=0 handles verb-level chroot/offline
+detection, but does not override sd_booted(). A read-only store-backed empty
+directory at `/run/systemd/system` supplies that boot marker without importing
+the host directory. Controller binds only the system-manager private socket
+and networkd's varlink socket, plus writable `/run/systemd/network`. The
+prerequisite guest exercised real in-unit show/stop, reload/reconfigure and a
+failing start for a missing unit without a host D-Bus socket. `systemctl show`
+alone can return success/MainPID=0 for a nonexistent unit, hence the explicit
+PID/generation validation. A read-only socket mount does NOT constrain API
+authority: the root controller remains trusted host control. The legacy
+readiness role temporarily also receives the private boot marker; the final
+unprivileged readiness/proxy roles must lose manager access.
+
+The maintained VM ExecStartPost runs a Python assertion under the actual local
+setup cgroup/seccomp/mount controls, not a root nsenter approximation. It checks
+NET_ADMIN-only effective/bounding caps, zero ambient, NNP and seccomp, and denied
+INET/INET6/PACKET creation, setns and unshare. The detached prerequisite guest
+proved FD movement with denied setns; actual production-role/DHCP regression
+and broader lifecycle evidence are tracked separately. Image builds or this
+limited probe are not whole-system enforcement proof.
+
 ### Proposed split contract (not yet implemented)
 
 The following concrete graph implements the direction reviewed in t_b1ae7c4b.
@@ -193,16 +273,51 @@ Consumers bind producer directories read-only, without redeclaring their
 RuntimeDirectory. No gateway/proxy can forge either producer's record.
 Both producers use atomic replacement; no record is sourced as shell.
 
+Planned DAC/mount contract: the anchor publication directory is root-owned
+0755 with 0644 non-secret generation records, separate from its 0700 root/runtime
+tree. Host-control publication uses the existing per-index
+`/run/hermes-agent-network-N` directory, root-owned 0755 with 0644 allocation,
+resolver/config and authorization records. The unique per-instance observer UID
+owns `/run/hermes-network-observer-N`, mode 0755, with 0644 telemetry records.
+These contain network metadata, never credentials or resolver authentication
+material. Consumers get same-path read-only DIRECTORY binds to survive atomic
+replacement, not writable managed-directory declarations or file-bind snapshots.
+Only the gateway resolv.conf intentionally remains a per-start file snapshot.
+Public readiness reads controller publication; host control reads observer
+publication; proxies read only controller config; gateway reads only resolv.conf.
+No consumer can traverse producer private roots. Prove DAC reads with each real
+dynamic identity and deny producer writes, including from gateway/proxy UIDs.
+Producer runtime removal ends record lifetime; recovery must use a new anchor
+and invocation generation, never adopt a stale file left by a failed start.
+
 Telemetry DbC, version 1: a bounded JSON object containing the anchor
 generation, namespace inode, interface name/index/MAC, boottime timestamp,
 usable IPv4/IPv6 addresses with prefix lengths, and required default
 routes. Accept exactly the known fields/types, bounded arrays and input
-size, valid canonical addresses, matching interface/MAC/generation and
-non-future fresh timestamps; reject duplicates, invalid address states,
+size (64 KiB), valid canonical addresses, matching interface/MAC/generation and
+non-future fresh timestamps; reject duplicate JSON object keys as well as
+duplicate array entries, invalid address states,
 missing routes, stale/malformed records or dead producer. Keep the current
 address-set equality, overlap checks, exact policy hash and nft readback.
 The freshness/detection budget must fit existing runtime loss assertions;
 do not silently extend their timeouts to make this split pass.
+
+Planned authorization DbC, version 1: at most 4 KiB, exactly version,
+anchor InvocationID/PID/start-time/namespace-inode, controller InvocationID,
+observer InvocationID, allocation/config digest, policy digest, observed
+boottime-nanoseconds, and `authorized=true`. Digests are lowercase SHA256 and
+InvocationIDs are lowercase 32-hex strings; PIDs/start-times/inodes/timestamps
+are positive integers, not booleans or floats. Reject unknown/missing fields,
+duplicate keys, unsupported versions, malformed bounds/types, wrong generation,
+changed producer identity, stale/future timestamps and a dead/non-active producer.
+No permissive parser or shell evaluation is allowed. Observer publishes every
+0.5 seconds; host validation ticks at most once per second and accepts telemetry
+only within two seconds of CLOCK_BOOTTIME. Authorization is refreshed only after
+a complete successful validation tick; readiness revalidates at most every
+0.1 seconds and rejects authorization older than two seconds. These are proposed
+validation budgets, not a measured loss guarantee or permission to raise the
+existing ten-second runtime loss assertions. Parser negative cases and real
+end-to-end revocation timing must pass before this contract is accepted.
 
 Any required process/child loss invalidates authorization. Proxy group
 supervisors fail if any required child exits. Host control ExecStopPost

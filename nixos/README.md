@@ -27,7 +27,9 @@ in [ADR 0001](adr/0001-hermes-service-isolation-and-networkd.md).
 
 Each enabled `hermes@NAME.service` keeps effective `PrivateNetwork=yes` and joins
 the namespace of its `hermes-network@NAME.service` companion via
-`JoinsNamespaceOf=`. The companion creates the veth pair; host-side networkd
+`JoinsNamespaceOf=`. The companion joins a zero-capability `hermes-netns@NAME`
+anchor and brings the local peer up. `hermes-host-control@NAME` creates/moves
+the veth pair from the host namespace selected by systemd; host-side networkd
 configures only the generated `haN` links, while `hermes-dhcp@NAME.service`
 runs dhcpcd in the agent namespace. `hermes-network-ready@NAME.service` is the
 startup barrier: it requires the DHCPv4 lease, usable SLAAC address/default
@@ -35,10 +37,21 @@ route, verified per-agent nftables sets, resolver file, and DNS/proxy listeners
 before notifying systemd that the gateway may start. Address/route or firewall
 generation loss revokes the sets and stops the gateway. `hermes-pf@NAME` remains
 in its own `PrivateNetwork=yes` namespace with `RestrictAddressFamilies=AF_UNIX`.
-The short-lived companion setup process is trusted host-networking code and is
-granted `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE`; the DHCP client
-has only its private-network configuration capabilities, and the gateway gets
-none. DNS and TCP proxy children drop to `nobody` before serving requests.
+Both setup payloads have only `CAP_NET_ADMIN`, with setns and namespace creation
+denied. The host controller acknowledges peer movement before waiting for
+carrier-dependent allocation/RA work; its notification is not final readiness.
+It validates and holds the anchor namespace FD across movement. It remains
+trusted host-control code because its manager socket grants manager API access.
+The DHCP client has only its private-network configuration capabilities, and
+the gateway gets none.
+
+This worktree is an incomplete hardening candidate, not deployment-ready. The
+legacy readiness role still has SYS_ADMIN/SYS_PTRACE/credential-drop privileges
+and starts DNS/proxy children as `nobody`; the authorized unprivileged split
+remains outstanding. The full runtime currently fails on those legacy children
+inside the new root. The passing setup/DHCP boundary tests do not waive that
+failure or the remaining acceptance matrix. See the proposed
+[ADR](adr/0001-hermes-service-isolation-and-networkd.md).
 
 agent veths use `haN`/`hbN` interfaces. The host-side `.network` match also
 requires `Kind=veth`, so an unrelated device with a reserved Hermes name is not
@@ -235,8 +248,10 @@ When enabled, Headroom uses stable-supported proxy flags; the module does not
 enable canary-only features. Template units are not directly wanted by
 `multi-user.target`; only configured per-agent instances are enabled.
 Stop/restart of an agent removes and recreates its veth, networkd address/RA
-drop-in, DHCP lease, runtime firewall sets, DNS forwarder, namespace relays, and
-host-loopback proxies. Firewall guard rules are declarative in the NixOS
+drop-in, DHCP client runtime, runtime firewall sets, DNS forwarder, namespace
+relays, and host-loopback proxies. Per-instance DHCP lease/DUID state persists
+in `StateDirectory=hermes-dhcp-NAME`; stop and rollback do not delete it.
+Firewall guard rules are declarative in the NixOS
 ruleset; only validated address-set elements are published at runtime. Removing
 a permission blocks subsequent packets to that private/host tuple but does not
 forcibly close the agent's userspace socket; existing connections can remain
