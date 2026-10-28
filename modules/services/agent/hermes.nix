@@ -766,7 +766,7 @@ let
 
         verify_guard_chain() {
           local chain="$1" hook="$2" expected="$3" actual
-          actual=$(host ${lib.getExe' pkgs.nftables "nft"} list chain inet hermes-agent-guard "$chain")
+          actual=$(host ${lib.getExe' pkgs.nftables "nft"} list chain inet hermes-agent-guard "$chain") || return
           ${lib.getExe' pkgs.python3 "python3"} -c '
         import difflib, ipaddress, re, sys
         hook, expected = sys.argv[1:]
@@ -897,7 +897,12 @@ let
               agent_ip="''${peer4[0]}"
               host_ip6="''${host6[0]}"
               prefix6=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/64").network)' "$host_ip6")
-              mapfile -t peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); print("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
+              mapfile -t peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); sys.stdout.write("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
+              if (( attempt % 25 == 0 && ''${#peer6[@]} == 0 )) \
+                && ${lib.getExe' pkgs.python3 "python3"} -c 'import json,sys; sys.exit(not any(a.get("dadfailed", False) for l in json.load(sys.stdin) for a in l.get("addr_info", [])))' \
+                  <<<"$(${lib.getExe' pkgs.iproute2 "ip"} -j -6 address show dev "$peer_if")"; then
+                fail_ready "SLAAC DAD failed on $peer_if"
+              fi
               if (( ''${#peer6[@]} > 0 )) \
                 && ${lib.getExe' pkgs.iproute2 "ip"} -4 route show default | grep -Fq "via $host_ip dev $peer_if" \
                 && ${lib.getExe' pkgs.iproute2 "ip"} -6 route show default | grep -Fq "dev $peer_if"; then
@@ -918,7 +923,7 @@ let
           } | host ${lib.getExe' pkgs.nftables "nft"} -f -
           verify_set() {
             local set="$1" expected="$2" actual
-            actual=$(host ${lib.getExe' pkgs.nftables "nft"} -n list set inet hermes-agent-guard "$set" | ${lib.getExe' pkgs.python3 "python3"} -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"elements\s*=\s*\{([^}]*)\}",s); print(",".join(sorted(x.strip() for x in m.group(1).split(",") if x.strip())) if m else "")')
+            actual=$(host ${lib.getExe' pkgs.nftables "nft"} -n list set inet hermes-agent-guard "$set" | ${lib.getExe' pkgs.python3 "python3"} -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"elements\s*=\s*\{([^}]*)\}",s); print(",".join(sorted(x.strip() for x in m.group(1).split(",") if x.strip())) if m else "")') || return
             [[ "$actual" == "$expected" ]]
           }
           expected_host6=$(printf '%s\n' "''${host6[@]}" | sort -u | paste -sd,)
@@ -965,7 +970,7 @@ let
             mapfile -t current_host4 < <(read_addresses -4 "$host_if" 30)
             mapfile -t current_peer4 < <(read_addresses -4 "$peer_if" 30)
             mapfile -t current_host6 < <(read_addresses -6 "$host_if" 64)
-            mapfile -t current_peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); print("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
+            mapfile -t current_peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); sys.stdout.write("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
             if [[ "''${current_host4[*]}" == "''${host4[*]}" && "''${current_peer4[*]}" == "''${peer4[*]}" \
               && "''${current_host6[*]}" == "''${host6[*]}" && "''${current_peer6[*]}" == "''${peer6[*]}" ]] \
               && ${lib.getExe' pkgs.iproute2 "ip"} -4 route show default | grep -Fq "via $host_ip dev $peer_if" \
@@ -1621,7 +1626,7 @@ let
               "AF_UNIX"
             ];
             TemporaryFileSystem = [ "/nix:ro" ];
-            TimeoutStartSec = "40s";
+            TimeoutStartSec = "60s";
             TimeoutStopSec = "15s";
             Type = "notify";
             Restart = "no";

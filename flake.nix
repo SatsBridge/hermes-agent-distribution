@@ -584,6 +584,7 @@
                 && builtins.elem "systemd-networkd.service" units."hermes-dhcp@".partOf
                 && units."hermes-network-ready@".serviceConfig.Type == "notify"
                 && units."hermes-network-ready@".serviceConfig.Restart == "no"
+                && units."hermes-network-ready@".serviceConfig.TimeoutStartSec == "60s"
                 && builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo
                 && nixpkgs-unstable.lib.hasInfix "Kind=veth" hostNetworkConfig
                 && nixpkgs-unstable.lib.hasInfix "Address=0.0.0.0/30" hostNetworkConfig
@@ -628,6 +629,9 @@
               if
                 builtins.hasAttr "hermes-module-vm-smoke" hermesModuleVm.config.systemd.services
                 && builtins.hasAttr "hermes-module-vm-agent-smoke" hermesModuleVm.config.systemd.services
+                &&
+                  hermesModuleVm.config.systemd.services.hermes-module-vm-agent-smoke.serviceConfig.TimeoutStartSec
+                  == "3600s"
               then
                 "true"
               else

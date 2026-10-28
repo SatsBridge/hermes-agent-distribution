@@ -1776,6 +1776,147 @@ let
         echo "Tentative and live dadfailed IPv6 addresses were excluded; usable control passed and retirement cleared"
       }
 
+      check_dad_readiness_gate() {
+        local agent host_if peer_if gateway ready network dhcp client_pid host6 client_json failed start_before start_after ready_log recovery_units
+        echo "Testing main and peer readiness rejection for live dadfailed required IPv6 addresses"
+        inject_dadfailed_peer_address() {
+          local client_pid="$1" peer_if="$2" host6="$3" mode="''${4:-startup}" client_json failed filtered
+          local -a valid6=()
+          nsenter --target "$client_pid" --net -- nft add table inet hermes-dad-test || return 1
+          nsenter --target "$client_pid" --net -- nft add chain inet hermes-dad-test input \
+            '{ type filter hook input priority -150; policy accept; }' || return 1
+          nsenter --target "$client_pid" --net -- nft add rule inet hermes-dad-test input \
+            meta l4proto ipv6-icmp icmpv6 type nd-router-advert drop || return 1
+          if [[ "$mode" != active ]]; then
+            nsenter --target "$client_pid" --net -- ip -6 address flush dev "$peer_if" scope global || return 1
+          fi
+          nsenter --target "$client_pid" --net -- ip -6 address add "$host6/64" dev "$peer_if" || return 1
+          failed=
+          for _ in {1..100}; do
+            client_json=$(nsenter --target "$client_pid" --net -- ip -j -6 address show dev "$peer_if")
+            failed=$(python3 -c 'import json,sys; print(any(a.get("dadfailed", False) and a.get("local") == sys.argv[1] for l in json.load(sys.stdin) for a in l.get("addr_info", [])))' "$host6" <<<"$client_json")
+            [[ "$failed" == True ]] && break
+            sleep 0.1
+          done
+          [[ "$failed" == True ]] || {
+            echo "No live dadfailed duplicate of $host6 on $peer_if; address JSON follows:" >&2
+            printf '%s\n' "$client_json" >&2
+            return 1
+          }
+          filtered=$(python3 ${agentAddressFilter} inet6 64 <<<"$client_json")
+          if [[ "$mode" == active ]]; then
+            if grep -Fxq "$host6" <<<"$filtered"; then
+              echo "$peer_if address filter published its dadfailed IPv6 identity" >&2
+              return 1
+            fi
+            mapfile -t valid6 < <(python3 ${agentAddressFilter} inet6 64 <<<"$client_json")
+            for address in "''${valid6[@]}"; do
+              [[ "$address" == "$host6" ]] || nsenter --target "$client_pid" --net -- ip -6 address del "$address/64" dev "$peer_if" || return 1
+            done
+          elif [[ -n "$filtered" ]]; then
+            echo "$peer_if address filter published an IPv6 address during the DAD startup probe" >&2
+            return 1
+          fi
+        }
+        wait_gateway_ready() {
+          local gateway="$1" ready="$2"
+          for _ in {1..100}; do
+            if [[ $(systemctl show --property=ActiveState --value "$gateway") == active \
+              && $(systemctl show --property=ActiveState --value "$ready") == active ]]; then return 0; fi
+            sleep 0.1
+          done
+          echo "$gateway did not recover with its network readiness barrier" >&2
+          return 1
+        }
+        stop_peer_probes
+        timeout --kill-after=5s 60 systemctl stop hermes@vm.service hermes@vm-peer.service || { diagnose; return 1; }
+        for agent in vm vm-peer; do
+          if [[ "$agent" == vm ]]; then
+            host_if=ha0; peer_if=hb0
+          else
+            host_if=ha1; peer_if=hb1
+          fi
+          gateway="hermes@$agent.service"
+          ready="hermes-network-ready@$agent.service"
+          network="hermes-network@$agent.service"
+          dhcp="hermes-dhcp@$agent.service"
+          timeout --kill-after=5s 90 systemctl start "$network" "$dhcp" || { diagnose; return 1; }
+          client_pid=$(service_pid "$dhcp") || return 1
+          host6=$(ip -j -6 address show dev "$host_if" | python3 ${agentAddressFilter} inet6 64 | awk 'NR == 1 { print; exit }')
+          [[ -n "$host6" ]] || { echo "$host_if has no usable host-side IPv6 allocation" >&2; return 1; }
+          for _ in {1..100}; do
+            client_json=$(nsenter --target "$client_pid" --net -- ip -j -6 address show dev "$peer_if")
+            if nsenter --target "$client_pid" --net -- ip -o -4 address show dev "$peer_if" scope global | grep -q 'inet '; then break; fi
+            sleep 0.1
+          done
+          inject_dadfailed_peer_address "$client_pid" "$peer_if" "$host6" || return 1
+          start_before=$(systemctl show --property=ExecMainStartTimestampMonotonic --value "$gateway")
+          if timeout --kill-after=5s 60 systemctl start "$gateway"; then
+            echo "$gateway started while required IPv6 was dadfailed" >&2
+            return 1
+          fi
+          start_after=$(systemctl show --property=ExecMainStartTimestampMonotonic --value "$gateway")
+          [[ "$start_after" == "$start_before" ]] || { echo "$gateway ExecStart ran without usable IPv6" >&2; return 1; }
+          for _ in {1..50}; do
+            [[ $(systemctl show --property=ActiveState --value "$ready") == failed ]] && break
+            sleep 0.1
+          done
+          [[ $(systemctl show --property=Result --value "$ready") == exit-code ]] || {
+            echo "$ready did not report a bounded DAD readiness failure (Result=$(systemctl show --property=Result --value "$ready"))" >&2
+            return 1
+          }
+          ready_log=$(journalctl -u "$ready" -b --no-pager -o cat)
+          grep -Fq "SLAAC DAD failed on $peer_if" <<< "$ready_log" || {
+            echo "$ready failed for a reason other than missing usable DAD address" >&2
+            return 1
+          }
+          echo "$agent kept ExecStart blocked for dadfailed $host6"
+          timeout 30s systemctl reset-failed "$gateway" "$network" "$dhcp" "$ready"
+          timeout --kill-after=5s 180 systemctl start "$gateway" || { diagnose; return 1; }
+          wait_gateway_ready "$gateway" "$ready" || { diagnose; return 1; }
+          if [[ "$agent" == vm-peer ]]; then discover_network_values || return 1; fi
+        done
+        for agent in vm vm-peer; do
+          if [[ "$agent" == vm ]]; then
+            host_if=ha0; peer_if=hb0
+          else
+            host_if=ha1; peer_if=hb1
+          fi
+          gateway="hermes@$agent.service"
+          ready="hermes-network-ready@$agent.service"
+          dhcp="hermes-dhcp@$agent.service"
+          client_pid=$(service_pid "$dhcp") || return 1
+          host6=$(ip -j -6 address show dev "$host_if" | python3 ${agentAddressFilter} inet6 64 | awk 'NR == 1 { print; exit }')
+          [[ -n "$host6" ]] || { echo "$host_if has no usable IPv6 allocation for address-loss test" >&2; return 1; }
+          inject_dadfailed_peer_address "$client_pid" "$peer_if" "$host6" active || return 1
+          for _ in {1..100}; do
+            if [[ $(systemctl show --property=ActiveState --value "$ready") != active \
+              && $(systemctl show --property=ActiveState --value "$gateway") != active ]]; then break; fi
+            sleep 0.1
+          done
+          [[ $(systemctl show --property=ActiveState --value "$ready") != active \
+            && $(systemctl show --property=ActiveState --value "$gateway") != active ]] || {
+            echo "$agent retained readiness/application after its IPv6 identity entered dadfailed" >&2
+            return 1
+          }
+          ready_log=$(journalctl -u "$ready" -b --no-pager -o cat)
+          grep -Fq 'DHCP/SLAAC address or route changed; ordinary traffic revoked' <<< "$ready_log" || {
+            echo "$agent address retirement did not trigger fail-closed readiness teardown" >&2
+            return 1
+          }
+          echo "$agent revoked its active firewall generation and stopped after IPv6 DAD failure"
+          timeout 30s systemctl reset-failed "$gateway" "hermes-network@$agent.service" "$dhcp" "$ready"
+          recovery_units=("$gateway")
+          if [[ "$agent" == vm ]]; then recovery_units+=(hermes@vm-peer.service); fi
+          timeout --kill-after=5s 180 systemctl start "''${recovery_units[@]}" || { diagnose; return 1; }
+          wait_gateway_ready "$gateway" "$ready" || { diagnose; return 1; }
+          discover_network_values || return 1
+        done
+        timeout --kill-after=5s 180 systemctl start hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        wait_for_active || { diagnose; return 1; }
+        echo "Main and peer gateways recovered only after DHCP/SLAAC and verified firewall readiness were restored"
+      }
+
       check_nft_startup_failure_gate() {
         local main_start peer_start
         echo "Testing bounded startup failure when nftables allocation/policy publication is unavailable"
@@ -1813,6 +1954,68 @@ let
         start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
         start_peer_probes hermes@vm-peer.service "$peer_agent_ip" "$peer_agent_ip6" || return 1
         echo "Both gateways remained blocked during nftables publication failure and recovered after declarative reload"
+      }
+
+      check_nft_readback_exit_status() {
+        local helper functions mock_nft_output mock_nft_status status
+        helper=$(systemctl show --property=ExecStart --value hermes-network@vm.service \
+          | python3 -c 'import re,sys; m=re.search(r"path=([^ ;]+)", sys.stdin.read()); print(m.group(1) if m else "")')
+        [[ -x "$helper" ]] || { echo "Could not locate the generated network checker: $helper" >&2; return 1; }
+        functions=$(python3 - "$helper" <<'PY'
+      import pathlib, sys
+
+      source = pathlib.Path(sys.argv[1]).read_text()
+      lines = source.splitlines()
+      for start, end in (("verify_guard_chain() {", "verify_guard_policy() {"), ("verify_set() {", "expected_host6=")):
+          first = next(i for i, line in enumerate(lines) if line.strip() == start)
+          last = next(i for i, line in enumerate(lines[first + 1:], first + 1) if line.strip().startswith(end))
+          print("\n".join(lines[first:last]))
+      PY
+        ) || return 1
+        (
+        eval "$functions"
+        # shellcheck disable=SC2329
+        host() { printf '%s' "$mock_nft_output"; return "$mock_nft_status"; }
+
+        mock_nft_output=$'table inet hermes-agent-guard {\n chain hermes_agent_input_guard {\n  type filter hook input priority -150; policy drop;\n }\n}\n'
+        mock_nft_status=0
+        verify_guard_chain hermes_agent_input_guard input "" || { echo "Matching guard readback was rejected" >&2; return 1; }
+        mock_nft_output+=$' ip saddr 203.0.113.0/24 drop\n'
+        if verify_guard_chain hermes_agent_input_guard input ""; then
+          echo "Stale guard readback was accepted" >&2
+          return 1
+        fi
+        mock_nft_output=
+        if ! verify_guard_chain hermes_agent_input_guard input ""; then :; else
+          echo "Empty guard readback was accepted" >&2
+          return 1
+        fi
+        mock_nft_output=$'table inet hermes-agent-guard {\n chain hermes_agent_input_guard {\n  type filter hook input priority -150; policy drop;\n }\n}\n'
+        mock_nft_status=1
+        if verify_guard_chain hermes_agent_input_guard input ""; then
+          echo "Matching guard output with a failed nft read was accepted" >&2
+          return 1
+        fi
+
+        mock_nft_output='set ha0_peer4 { type ipv4_addr; elements = { 192.0.2.1 } }'
+        mock_nft_status=0
+        verify_set ha0_peer4 192.0.2.1 || { echo "Matching set readback was rejected" >&2; return 1; }
+        status=0
+        verify_set ha0_peer4 192.0.2.2 || status=$?
+        (( status != 0 )) || { echo "Mismatching set readback was accepted" >&2; return 1; }
+        mock_nft_output=
+        if verify_set ha0_peer4 192.0.2.1; then
+          echo "Empty set readback was accepted" >&2
+          return 1
+        fi
+        mock_nft_output='set ha0_peer4 { type ipv4_addr; elements = { 192.0.2.1 } }'
+        mock_nft_status=1
+        if ! verify_set ha0_peer4 192.0.2.1; then :; else
+          echo "Matching set output with a failed nft read was accepted" >&2
+          return 1
+        fi
+        echo "Generated chain/set verifiers reject mismatching, empty, and matching-output/nonzero nft readbacks in conditional callers"
+        ) || return 1
       }
 
       check_nft_policy_startup_gate() {
@@ -2062,6 +2265,7 @@ let
         echo "Hermes live DAD probe passed"
         exit 0
       fi
+      check_nft_readback_exit_status || { diagnose; exit 1; }
       host_other_ip=$(ip -o -4 address show scope global | awk '$2 != "ha0" && $2 != "ha1" { split($4, a, "/"); print a[1]; exit }')
       [[ -n "$host_other_ip" ]] || { echo "No non-veth host interface address is available for the isolation probe" >&2; diagnose; exit 1; }
       if [[ "$HERMES_VM_INTERNET_TEST" == 1 ]]; then
@@ -2105,6 +2309,7 @@ let
       check_host_initiated_replies || { diagnose; exit 1; }
       assert_distinct_namespaces || { diagnose; exit 1; }
       check_address_dad_states || { diagnose; exit 1; }
+      check_dad_readiness_gate || { diagnose; exit 1; }
       check_agent_network hermes@vm.service hb0 "''${host_vm_ip}" "''${agent_vm_ip}" "''${peer_agent_ip}" "''${host_vm_ip6}" "''${agent_vm_ip6}" "''${peer_agent_ip6}" || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 "''${host_peer_ip}" "''${peer_agent_ip}" "''${agent_vm_ip}" "''${host_peer_ip6}" "''${peer_agent_ip6}" "''${agent_vm_ip6}" || { diagnose; exit 1; }
       if [[ "$HERMES_VM_INTERNET_RECOVERY_ONLY" == 1 ]]; then
@@ -2174,7 +2379,7 @@ let
       timeout --kill-after=5s 180 systemctl restart hermes@vm.service || { diagnose; exit 1; }
       check_dashboard_startup restart "$restart_request_usec" || { diagnose; exit 1; }
       echo "Requiring peer restart after main restart"
-      timeout --kill-after=5s 60 systemctl start hermes@vm-peer.service || { diagnose; exit 1; }
+      timeout --kill-after=5s 180 systemctl start hermes@vm-peer.service || { diagnose; exit 1; }
       peer_pid_after=$(service_pid hermes@vm-peer.service)
       [[ "$peer_pid_after" != "$peer_pid_before" ]] || { echo "Peer did not restart after the main agent restart" >&2; diagnose; exit 1; }
       timeout --kill-after=5s 60 systemctl restart hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; exit 1; }
@@ -2455,8 +2660,8 @@ in
       ExecStart = lib.getExe vmAgentRuntimeSmoke;
       StandardError = "journal+console";
       StandardOutput = "journal+console";
-      # Gateway restarts recreate one mount per closure path in the 2-GiB guest.
-      TimeoutStartSec = "2400s";
+      # The complete 2-GiB guest matrix including both-agent DAD gates can exceed 40 minutes.
+      TimeoutStartSec = "3600s";
       Type = "oneshot";
     };
   };
