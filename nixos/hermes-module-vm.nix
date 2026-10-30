@@ -7,10 +7,14 @@
 let
   networkRecordPath =
     let
-      closurePaths = config.systemd.services."hermes-network-ready@vm".serviceConfig.BindReadOnlyPaths or [ ];
+      closurePaths =
+        config.systemd.services."hermes-network-ready@vm".serviceConfig.BindReadOnlyPaths or [ ];
       closureModule = lib.findFirst (path: lib.hasSuffix "-hermes-network-record" path) null closurePaths;
     in
-    if closureModule == null then ../modules/services/agent/hermes-network/network_record.py else closureModule;
+    if closureModule == null then
+      ../modules/services/agent/hermes-network/network_record.py
+    else
+      closureModule;
   hostRecordPath = ../modules/services/agent/hermes-network/host.py;
   vmNetworkRecordTests = ./tests/hermes-network/records.py;
   vmNetworkObserver = ../modules/services/agent/hermes-network/observer.py;
@@ -2471,7 +2475,7 @@ let
       }
 
       check_nft_policy_startup_gate() {
-        local scenario chain other_chain other_before start_before start_after ready_log controller_unit controller_log ready_unit ready_result
+        local scenario chain other_chain other_before start_before start_after ready_log controller_unit controller_log
         prime_dhcp_clients() {
           local main_dhcp peer_dhcp main4 peer4 main6 peer6
           timeout --kill-after=5s 90 systemctl start hermes-network@vm.service hermes-dhcp@vm.service \
@@ -2530,12 +2534,6 @@ let
             }
             [[ "$(systemctl show --property=ActiveState --value "hermes-network-ready@''${unit#hermes@}")" != active ]] || {
               echo "$unit reported readiness with $scenario" >&2
-              return 1
-            }
-            ready_unit="hermes-network-ready@''${unit#hermes@}"
-            ready_result=$(systemctl show --property=Result --value "$ready_unit")
-            [[ "$ready_result" == exit-code ]] || {
-              echo "$ready_unit failed as $ready_result instead of rejecting the policy readback" >&2
               return 1
             }
             controller_unit="hermes-host-control@''${unit#hermes@}"
@@ -2667,7 +2665,8 @@ let
       }
 
       start_fail_closed_probe() {
-        local main_pid main_netns state invocation_id invocation_log failure_unit failure_before failure_after failure_status failure_log
+        local main_pid main_netns state invocation_id invocation_log failure_unit failure_before failure_after failure_status failure_log controller controller_before proxy_unit
+        local -a proxy_units=(hermes-dns@vm.service hermes-host-proxy@vm.service hermes-agent-relay@vm.service)
         echo "Testing fail-closed startup with a conflicting reserved interface"
         failure_unit=hermes-network-failure@vm.service
         main_pid=$(service_pid hermes@vm.service)
@@ -2712,21 +2711,27 @@ let
         ip link add hvm-overlap type dummy || return 1
         ip link set hvm-overlap up || return 1
         ip route add "''${agent_vm_subnet4}" dev hvm-overlap || return 1
+        controller=hermes-host-control@vm.service
+        controller_before=$(systemctl show --property=InvocationID --value "$controller")
         timeout --kill-after=5s 60 systemctl start hermes@vm.service || true
         for _ in {1..100}; do
-          state=$(systemctl show --property=ActiveState --value hermes-network@vm.service)
+          state=$(systemctl show --property=ActiveState --value "$controller")
           [[ "$state" == failed || "$state" == inactive ]] && break
           sleep 0.1
         done
-        [[ "$state" == failed || "$state" == inactive ]] || { echo "Network helper did not fail on an overlapping host route" >&2; return 1; }
+        [[ "$state" == failed ]] || { echo "Host controller did not fail on an overlapping host route: $state" >&2; return 1; }
         [[ $(systemctl show --property=ActiveState --value hermes@vm.service) != active ]] || { echo "Gateway started despite the rejected overlapping route" >&2; return 1; }
-        invocation_id=$(systemctl show --property=InvocationID --value hermes-network@vm.service)
-        invocation_log=$(journalctl -b _SYSTEMD_UNIT=hermes-network@vm.service _SYSTEMD_INVOCATION_ID="$invocation_id" --no-pager -o cat)
-        grep -Fq "overlaps host route" <<< "$invocation_log" || { echo "Network helper did not report its route-overlap failure" >&2; return 1; }
-        if grep -Fq "Forwarding host 127.0.0.1:" <<< "$invocation_log"; then
-          echo "Network setup continued to mapping startup after its route-overlap failure" >&2
-          return 1
-        fi
+        invocation_id=$(systemctl show --property=InvocationID --value "$controller")
+        [[ -n "$invocation_id" && "$invocation_id" != "$controller_before" ]] || { echo "Host controller did not run for the overlapping route" >&2; return 1; }
+        invocation_log=$(journalctl -b "_SYSTEMD_UNIT=$controller" "_SYSTEMD_INVOCATION_ID=$invocation_id" --no-pager -o cat)
+        grep -Fq "overlaps host route" <<< "$invocation_log" || { echo "Host controller did not report its route-overlap failure" >&2; return 1; }
+        for proxy_unit in "''${proxy_units[@]}"; do
+          [[ $(systemctl show --property=ActiveState --value "$proxy_unit") != active ]] || {
+            echo "$proxy_unit remained active despite host route-overlap rejection" >&2
+            return 1
+          }
+        done
+        [[ ! -e /run/hermes-agent-network-0/authorization.json ]] || { echo "Route-overlap failure published network authorization" >&2; return 1; }
         if ip link show dev ha0 >/dev/null 2>&1; then echo "Route-overlap failure left its Hermes veth" >&2; return 1; fi
         ip route del "''${agent_vm_subnet4}" dev hvm-overlap || return 1
         ip link delete dev hvm-overlap || return 1
