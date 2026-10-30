@@ -85,7 +85,14 @@
         modules = [
           ({ lib, ... }: {
             networking.useNetworkd = lib.mkForce true;
-            systemd.network.wait-online.enable = lib.mkForce true;
+          })
+        ];
+      };
+      networkdRemovedVm = internetEnabledVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            services.hermes-specialised-agent.agents.vm.enable = lib.mkForce false;
+            services.hermes-specialised-agent.agents.vm-peer.enable = lib.mkForce false;
           })
         ];
       };
@@ -108,67 +115,21 @@
           })
         ];
       };
-      networkdIdleNetworks = removeAttrs internetEnabledVm.config.systemd.network.networks [
-        "40-hermes-agent-0"
-        "40-hermes-agent-1"
-      ];
-      networkdIdleVm = internetEnabledVm.extendModules {
+      networkdIdleVm = networkdRemovedVm.extendModules {
         modules = [
           ({ lib, ... }: {
-            systemd.services =
-              builtins.listToAttrs (
-                map
-                  (name: {
-                    inherit name;
-                    value = {
-                      enable = lib.mkForce false;
-                      wantedBy = lib.mkForce [ ];
-                      requiredBy = lib.mkForce [ ];
-                      upheldBy = lib.mkForce [ ];
-                    };
-                  })
-                  (
-                    builtins.filter (name: builtins.hasAttr name hermesModuleVm.config.systemd.services) (
-                      nixpkgs-unstable.lib.concatMap
-                        (
-                          role:
-                          map (instance: "${role}@${instance}") [
-                            "vm"
-                            "vm-peer"
-                          ]
-                        )
-                        [
-                          "hermes"
-                          "hermes-pf"
-                          "hermes-network"
-                          "hermes-dhcp"
-                          "hermes-network-ready"
-                          "hermes-netns"
-                          "hermes-host-control"
-                          "hermes-network-failure"
-                          "hermes-network-observer"
-                          "hermes-dns"
-                          "hermes-host-proxy"
-                          "hermes-agent-relay"
-                        ]
-                    )
-                  )
-              )
-              // {
-                hermes-module-vm-agent-smoke = {
-                  enable = lib.mkForce false;
-                  wantedBy = lib.mkForce [ ];
-                  requiredBy = lib.mkForce [ ];
-                  upheldBy = lib.mkForce [ ];
-                };
-                hermes-vm-generation-rollback-launcher = {
-                  enable = lib.mkForce false;
-                  wantedBy = lib.mkForce [ ];
-                  requiredBy = lib.mkForce [ ];
-                  upheldBy = lib.mkForce [ ];
-                };
-              };
-            systemd.network.networks = lib.mkForce networkdIdleNetworks;
+            systemd.services.hermes-module-vm-agent-smoke = {
+              enable = lib.mkForce false;
+              wantedBy = lib.mkForce [ ];
+              requiredBy = lib.mkForce [ ];
+              upheldBy = lib.mkForce [ ];
+            };
+            systemd.services.hermes-vm-generation-rollback-launcher = {
+              enable = lib.mkForce false;
+              wantedBy = lib.mkForce [ ];
+              requiredBy = lib.mkForce [ ];
+              upheldBy = lib.mkForce [ ];
+            };
           })
         ];
       };
@@ -1035,8 +996,8 @@
                   || builtins.trace "Hermes config assertion 121: internetEnabledVm.config.networking.networkmanager.unmanaged == [ \"interface-name:ha*\" ]" false
                 )
                 && (
-                  (!internetEnabledVm.config.networking.useNetworkd)
-                  || builtins.trace "Hermes config assertion 122: !internetEnabledVm.config.networking.useNetworkd" false
+                  internetEnabledVm.config.networking.useNetworkd
+                  || builtins.trace "Hermes config assertion 122: internetEnabledVm.config.networking.useNetworkd" false
                 )
                 && (
                   (
@@ -1186,8 +1147,8 @@
                   || builtins.trace "Hermes config assertion 149: !hermesModuleVm.config.networking.resolvconf.enable" false
                 )
                 && (
-                  (!hermesModuleVm.config.networking.useNetworkd)
-                  || builtins.trace "Hermes config assertion 150: !hermesModuleVm.config.networking.useNetworkd" false
+                  hermesModuleVm.config.networking.useNetworkd
+                  || builtins.trace "Hermes config assertion 150: hermesModuleVm.config.networking.useNetworkd" false
                 )
                 && (
                   networkManagerProbe.config.networking.networkmanager.enable
@@ -1198,12 +1159,12 @@
                   || builtins.trace "Hermes config assertion 152: networkManagerProbe.config.networking.networkmanager.unmanaged == [ \"interface-name:ha*\" ]" false
                 )
                 && (
-                  (!networkManagerProbe.config.networking.useNetworkd)
-                  || builtins.trace "Hermes config assertion 153: !networkManagerProbe.config.networking.useNetworkd" false
+                  networkManagerProbe.config.networking.useNetworkd
+                  || builtins.trace "Hermes config assertion 153: networkManagerProbe.config.networking.useNetworkd" false
                 )
                 && (
-                  networkManagerProbe.config.networking.dhcpcd.enable
-                  || builtins.trace "Hermes config assertion 154: networkManagerProbe.config.networking.dhcpcd.enable" false
+                  (networkManagerProbe.config.networking.dhcpcd.enable == hermesModuleVm.config.networking.dhcpcd.enable)
+                  || builtins.trace "Hermes config assertion 154: Hermes leaves the host dhcpcd enablement unchanged" false
                 )
                 && (
                   (builtins.elem "ha*" networkManagerProbe.config.networking.dhcpcd.denyInterfaces)
@@ -1574,8 +1535,8 @@
                   || builtins.trace "Hermes config assertion 227: !(disabledAgentProbe.config.systemd.network.networks ? \"40-hermes-agent-0\")" false
                 )
                 && (
-                  (!disabledAgentProbe.config.systemd.network.enable)
-                  || builtins.trace "Hermes config assertion 228: !disabledAgentProbe.config.systemd.network.enable" false
+                  disabledAgentProbe.config.systemd.network.enable
+                  || builtins.trace "Hermes config assertion 228: host-owned networkd stays enabled when Hermes is disabled" false
                 )
                 && (
                   units."hermes-network@".serviceConfig.RestrictNamespaces
@@ -1779,12 +1740,12 @@
                   || builtins.trace "Hermes config assertion 260: existingNetworkdProbe.config.systemd.network.wait-online.enable" false
                 )
                 && (
-                  (networkManagerProbe.config.systemd.network.wait-online.enable == false)
-                  || builtins.trace "Hermes config assertion 261: networkManagerProbe.config.systemd.network.wait-online.enable == false" false
+                  networkManagerProbe.config.systemd.network.wait-online.enable
+                  || builtins.trace "Hermes config assertion 261: networkManagerProbe preserves networkd wait-online default" false
                 )
                 && (
-                  networkManagerProbe.config.networking.dhcpcd.enable
-                  || builtins.trace "Hermes config assertion 262: networkManagerProbe.config.networking.dhcpcd.enable" false
+                  (networkManagerProbe.config.networking.dhcpcd.enable == hermesModuleVm.config.networking.dhcpcd.enable)
+                  || builtins.trace "Hermes config assertion 262: Hermes preserves host dhcpcd enablement" false
                 )
                 && (
                   units."hermes-network@".serviceConfig.PrivateNetwork
@@ -1863,12 +1824,12 @@
                   || builtins.trace "Hermes config assertion 281: hermesModuleVm.config.systemd.network.enable" false
                 )
                 && (
-                  (!hermesModuleVm.config.systemd.network.wait-online.enable)
-                  || builtins.trace "Hermes config assertion 282: !hermesModuleVm.config.systemd.network.wait-online.enable" false
+                  hermesModuleVm.config.systemd.network.wait-online.enable
+                  || builtins.trace "Hermes config assertion 282: hermesModuleVm.config.systemd.network.wait-online.enable" false
                 )
                 && (
-                  (!hermesModuleVm.config.services.resolved.enable)
-                  || builtins.trace "Hermes config assertion 283: !hermesModuleVm.config.services.resolved.enable" false
+                  hermesModuleVm.config.services.resolved.enable
+                  || builtins.trace "Hermes config assertion 283: Hermes preserves the resolved default on the supported networkd host" false
                 )
                 && (
                   (builtins.elem hostNetworkSource networkdReloadTriggers)
@@ -1976,16 +1937,16 @@
                 )
                 && (
                   (
-                    networkdIdleVm.config.systemd.services."hermes@vm".wantedBy == [ ]
-                    && networkdIdleVm.config.systemd.services."hermes-pf@vm".wantedBy == [ ]
+                    !(builtins.hasAttr "hermes@vm" networkdIdleVm.config.systemd.services)
+                    && !(builtins.hasAttr "hermes-pf@vm" networkdIdleVm.config.systemd.services)
                   )
-                  || builtins.trace "Hermes config assertion 306: previous generation does not want Hermes service instances" false
+                  || builtins.trace "Hermes config assertion 306: previous generation has both agents disabled" false
                 )
                 && (
                   builtins.length (networkdConfigSetTriggers networkdReloadTriggers) == 1
                   && builtins.length (networkdConfigSetTriggers idleNetworkdReloadTriggers) == 1
                   && builtins.length (networkdConfigSetTriggers changedNetworkdReloadTriggers) == 1
-                  || builtins.trace "Hermes config assertion 307: all active generations retain one membership reload trigger" false
+                  || builtins.trace "Hermes config assertion 307: active and zero-agent networkd generations retain one membership reload trigger" false
                 )
                 && (
                   (builtins.head (networkdConfigSetTriggers networkdReloadTriggers))
@@ -1998,10 +1959,8 @@
                   || builtins.trace "Hermes config assertion 309: source update changes membership reload trigger" false
                 )
                 && (
-                  nixpkgs-unstable.lib.hasInfix "removed:systemd/network/40-hermes-agent-0.network" (
-                    builtins.readFile (builtins.head (networkdConfigSetTriggers idleNetworkdReloadTriggers))
-                  )
-                  || builtins.trace "Hermes config assertion 310: removed network is represented in the always-present trigger" false
+                  builtins.readFile (builtins.head (networkdConfigSetTriggers idleNetworkdReloadTriggers)) == "[]"
+                  || builtins.trace "Hermes config assertion 310: last-agent removal leaves an empty membership trigger" false
                 )
                 && (
                   (
@@ -2012,6 +1971,22 @@
                     ) == 0
                   )
                   || builtins.trace "Hermes config assertion 311: zero-agent configuration adds no membership reload trigger" false
+                )
+                && (
+                  networkdRemovedVm.config.systemd.network.enable
+                  && networkdRemovedVm.config.systemd.network.wait-online.enable
+                  && !builtins.hasAttr "40-hermes-agent-0" networkdRemovedVm.config.systemd.network.networks
+                  && !builtins.hasAttr "40-hermes-agent-1" networkdRemovedVm.config.systemd.network.networks
+                  && builtins.length (networkdConfigSetTriggers networkdRemovedVm.config.systemd.services.systemd-networkd.reloadTriggers) == 1
+                  && builtins.head (networkdConfigSetTriggers networkdReloadTriggers)
+                    != builtins.head (networkdConfigSetTriggers networkdRemovedVm.config.systemd.services.systemd-networkd.reloadTriggers)
+                  && builtins.readFile (builtins.head (networkdConfigSetTriggers networkdRemovedVm.config.systemd.services.systemd-networkd.reloadTriggers)) == "[]"
+                  || builtins.trace ("Hermes config assertion 313: last-agent removal " + builtins.toJSON {
+                    networkEnabled = networkdRemovedVm.config.systemd.network.enable;
+                    waitOnline = networkdRemovedVm.config.systemd.network.wait-online.enable;
+                    networks = builtins.attrNames networkdRemovedVm.config.systemd.network.networks;
+                    triggers = networkdRemovedVm.config.systemd.services.systemd-networkd.reloadTriggers or [ ];
+                  }) false
                 )
                 && (
                   defaultOnRuntimeVm.config.services.hermes-specialised-agent.installDefaultSkills

@@ -2,6 +2,7 @@ import ast
 import importlib.util
 import json
 import ipaddress
+import os
 import re
 import pathlib
 import subprocess
@@ -12,11 +13,14 @@ from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-sys.path.insert(0, sys.argv.pop(1))
+network_record_directory = pathlib.Path(sys.argv.pop(1))
+sys.path.insert(0, str(network_record_directory))
 from network_record import allocation, atomic, authorization, config, dad_pending, dad_waiting, now, observation, verify_sets
 setup_spec = importlib.util.spec_from_file_location("hermes_network_setup", sys.argv.pop(1))
 network_setup = importlib.util.module_from_spec(setup_spec)
 setup_spec.loader.exec_module(network_setup)
+host_record_path = pathlib.Path(sys.argv.pop(1))
+observer_path = pathlib.Path(sys.argv.pop(1))
 
 with tempfile.TemporaryDirectory() as directory:
     path = pathlib.Path(directory) / 'record.json'
@@ -29,6 +33,58 @@ with tempfile.TemporaryDirectory() as directory:
     assert dad_waiting([{'tentative': True}], [], False)
     assert not dad_waiting([{'tentative': True}], ['2001:db8::1'], False)
     assert not dad_waiting([{'dadfailed': True}], [], True)
+    observer_root = pathlib.Path(directory) / 'observer'
+    publication = observer_root / 'publication'
+    observation_path = observer_root / 'observation' / 'record.json'
+    publication.mkdir(parents=True)
+    observation_path.parent.mkdir()
+    observer_expected = {**expected, 'namespace': os.stat('/proc/self/ns/net').st_ino}
+    atomic(publication / 'config.json', observer_expected)
+    ip_tool = observer_root / 'ip'
+    ip_tool.write_text(f'''#!{sys.executable}
+import json,sys
+args=sys.argv[1:]
+if args == ['-j','address','show','dev','hb0']:
+ print(json.dumps([{{'ifindex':2,'address':'02:00:00:00:00:01','addr_info':[{{'family':'inet','local':'192.0.2.2','prefixlen':30,'scope':'global'}},{{'family':'inet6','local':'2001:db8::2','prefixlen':64,'scope':'global'}}]}}]))
+elif args == ['-j','route','show']:
+ print(json.dumps([{{'dst':'default','dev':'hb0','gateway':'192.0.2.1'}}]))
+elif args == ['-j','-6','route','show']:
+ print('[]')
+else:
+ raise SystemExit('unexpected ip arguments: '+repr(args))
+''')
+    ip_tool.chmod(0o755)
+    ss_tool = observer_root / 'ss'
+    ss_tool.write_text(f'#!{sys.executable}\n')
+    ss_tool.chmod(0o755)
+    settings_path = observer_root / 'settings.json'
+    settings_path.write_text(json.dumps({
+        'publication': str(publication), 'observation_path': str(observation_path),
+        'interface': 'hb0', 'mac': '02:00:00:00:00:01',
+        'tools': {'ip': str(ip_tool), 'ss': str(ss_tool)},
+    }))
+    observer_env = {**os.environ, 'INVOCATION_ID': 'e' * 32}
+    observer_process = subprocess.Popen([sys.executable, '-I', '-B', str(observer_path), str(network_record_directory), str(settings_path)], env=observer_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not observation_path.exists():
+            if observer_process.poll() is not None:
+                raise AssertionError('observer exited before publishing: ' + observer_process.communicate()[1])
+            time.sleep(0.01)
+        assert observation_path.exists(), 'observer did not publish a record'
+        emitted = json.loads(observation_path.read_text())
+        assert emitted['route4'] is True and emitted['route6'] is False
+        try:
+            observation(observation_path, observer_expected, 'hb0', '02:00:00:00:00:01')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('observer record without an IPv6 default route passed readiness validation')
+    finally:
+        if observer_process.poll() is None:
+            observer_process.terminate()
+        observer_process.wait(timeout=3)
+    print('NETWORK_OBSERVER_ROUTE_FAMILIES_PASSED emitted_ipv6_route_loss_rejected', flush=True)
     authorized = dict(version=1, generation=expected['generation'], controller=expected['controller'], observer=observed['invocation'], pid=123, start=1, namespace=456, allocation=allocation(expected, observed), policy=expected['policy'], timestamp=now(), authorized=True)
     rejected = 0
 
@@ -58,7 +114,7 @@ with tempfile.TemporaryDirectory() as directory:
     reject(lambda p: authorization(p, expected, observed), {**authorized, 'observer': 'f' * 32})
     reject(lambda p: authorization(p, expected, observed), {**authorized, 'allocation': 'f' * 64})
     print(f'NETWORK_RECORD_CONTRACT_PASSED valid=3 rejected={rejected}', flush=True)
-tree = ast.parse(pathlib.Path(sys.argv[1]).read_text())
+tree = ast.parse(host_record_path.read_text())
 actual_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in ("run", "rules", "verify_policy")]
 assert len(actual_functions) == 3
 exec(compile(ast.Module(body=actual_functions, type_ignores=[]), "actual-host-verifiers", "exec"))

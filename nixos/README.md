@@ -140,11 +140,12 @@ must be restricted to a particular host interface.
 
 This changes host-wide NixOS firewall/NAT behavior: the firewall backend becomes
 nftables, forwarding is enabled for IPv4 and IPv6, and unconfigured forwarded
-traffic is filtered. It also starts systemd-networkd for only the generated
-Hermes host veths and excludes those interfaces from host dhcpcd and
-NetworkManager;
-`networking.useNetworkd` and unrelated uplink ownership are not changed. NAT
-remains NixOS `networking.nat`, including the existing `externalInterface`
+traffic is filtered. Active Hermes agents require
+`networking.useNetworkd = true`; the module does not change that setting. It
+adds the generated Hermes veth networks to systemd-networkd and excludes those
+interfaces from host dhcpcd and NetworkManager. NetworkManager may also be
+enabled. The module does not otherwise take over unrelated uplink ownership.
+NAT remains NixOS `networking.nat`, including the existing `externalInterface`
 restriction semantics. Existing routed networks must be represented by the
 NixOS firewall/NAT configuration (or explicit nftables forward rules). Existing
 `networking.firewall.extraCommands` or `networking.nat.extraCommands` are
@@ -153,14 +154,10 @@ fail. The module uses NixOS `systemd.network.networks` for generated
 `40-hermes-agent-N.network` files, so ordinary generation activation reloads
 networkd when those files are added, changed, or removed. A content-addressed
 membership trigger covers removals in the pinned NixOS switch implementation.
-Dynamic RA drop-ins still use the existing runtime reload path. If
-`networking.useNetworkd` is false, the module does not
-add a second host `network-online.target` wait gate; explicit networkd wait
-policy remains host-owned. The generic NixOS warning about networkd plus
-`networking.useDHCP` can remain because dhcpcd still owns the host uplink while
-Hermes veths are excluded. Enabling networkd alone does not take ownership of
-the host resolver: the module preserves the existing resolved default unless
-the host explicitly enables it. IPv6 egress depends on host IPv6 connectivity.
+Dynamic RA drop-ins still use the existing runtime reload path. The standard
+networkd wait-online policy remains enabled and host-owned. The module does not
+change the host's systemd-resolved setting; the NixOS default applies. IPv6 egress
+depends on host IPv6 connectivity.
 
 The main agent's dashboard stays bound to namespace loopback and defaults to a
 host mapping `127.0.0.1:9119 -> agent namespace loopback:9119`. The companion

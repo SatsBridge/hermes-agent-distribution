@@ -6,11 +6,14 @@
 }:
 let
   networkRecordPath =
-    lib.findFirst (path: lib.hasSuffix "-hermes-network-record" path)
-      (throw "network record module missing from readiness closure")
-      config.systemd.services."hermes-network-ready@vm".serviceConfig.BindReadOnlyPaths;
+    let
+      closurePaths = config.systemd.services."hermes-network-ready@vm".serviceConfig.BindReadOnlyPaths or [ ];
+      closureModule = lib.findFirst (path: lib.hasSuffix "-hermes-network-record" path) null closurePaths;
+    in
+    if closureModule == null then ../modules/services/agent/hermes-network/network_record.py else closureModule;
   hostRecordPath = ../modules/services/agent/hermes-network/host.py;
   vmNetworkRecordTests = ./tests/hermes-network/records.py;
+  vmNetworkObserver = ../modules/services/agent/hermes-network/observer.py;
   vmPayloadBoundaryProbe = ./tests/hermes-network/payload_boundary.py;
   vmPayloadHook = role: {
     serviceConfig.ExecStartPost = [ "${pkgs.python3}/bin/python3 ${vmPayloadBoundaryProbe} ${role}" ];
@@ -449,10 +452,14 @@ let
       dad_sender_log=
       dad_event_observed=0
       dad_namespace_revoked=0
+      ipv6_route_pid=
+      ipv6_route_gateway=
       startup_phases_reported=0
       root_boundary_marker=/run/hermes-vm-root-boundary-complete
       split_frozen_pid=
       split_override=/run/systemd/system/hermes@vm.service.d/90-vm-slow-stop.conf
+      ipv6_readiness_override=/run/systemd/system/hermes-network-ready@vm.service.d/90-ipv6-route-test.conf
+      ipv6_route_ra_dropin=/run/systemd/network/40-hermes-agent-0.network.d/99-hermes-vm-disable-ra.conf
       host_vm_ip="" agent_vm_ip="" host_peer_ip="" peer_agent_ip=""
       host_vm_ip6="" agent_vm_ip6="" host_peer_ip6="" peer_agent_ip6=""
       agent_vm_subnet4="" peer_agent_subnet4="" agent_vm_subnet6="" peer_agent_subnet6=""
@@ -469,12 +476,37 @@ let
         dad_event_observed=0 dad_namespace_revoked=0
       }
 
+      disable_test_ipv6_ra() {
+        local interface="$1"
+        install -d -m 0755 "''${ipv6_route_ra_dropin%/*}"
+        # The positional parameters belong to the lock-held inner shell.
+        # shellcheck disable=SC2016
+        flock -x /run/systemd/network/.hermes-networkd.lock ${pkgs.bash}/bin/bash -c 'set -e; printf "[Network]\nIPv6SendRA=no\n" > "$1"; networkctl reload; networkctl reconfigure "$2"' _ "$ipv6_route_ra_dropin" "$interface"
+      }
+
+      restore_test_ipv6_ra() {
+        [[ -e "$ipv6_route_ra_dropin" ]] || return 0
+        # The positional parameter belongs to the lock-held inner shell.
+        # shellcheck disable=SC2016
+        flock -x /run/systemd/network/.hermes-networkd.lock ${pkgs.bash}/bin/bash -c 'set -e; rm -f "$1"; networkctl reload' _ "$ipv6_route_ra_dropin"
+      }
+
       cleanup_test_network() {
+        if [[ -n "$ipv6_route_pid" && -n "$ipv6_route_gateway" ]]; then
+          nsenter --target "$ipv6_route_pid" --net -- ${pkgs.bash}/bin/bash -c 'set -e; printf 1 > /proc/sys/net/ipv6/conf/hb0/accept_ra' 2>/dev/null || true
+          nsenter --target "$ipv6_route_pid" --net -- ip -6 route replace default via "$ipv6_route_gateway" dev hb0 2>/dev/null || true
+        fi
+        unset ipv6_route_pid ipv6_route_gateway
         [[ -z "$split_frozen_pid" ]] || kill -CONT "$split_frozen_pid" 2>/dev/null || true
         if [[ -e "$split_override" ]]; then
           rm -f -- "$split_override"
           systemctl daemon-reload || true
         fi
+        if [[ -e "$ipv6_readiness_override" ]]; then
+          rm -f -- "$ipv6_readiness_override"
+          systemctl daemon-reload || true
+        fi
+        restore_test_ipv6_ra || true
         remove_host_revocation_rules
         remove_dhcp_block
         cleanup_dad_fault
@@ -1842,10 +1874,13 @@ let
           return 1
         fi
         remove_dhcp_block
-        timeout --kill-after=5s 60 systemctl stop hermes-network-ready@vm.service hermes-dhcp@vm.service hermes-network@vm.service || true
-        timeout 30s systemctl reset-failed hermes@vm.service hermes@vm-peer.service hermes-network@vm.service \
-          hermes-network@vm-peer.service hermes-dhcp@vm.service hermes-dhcp@vm-peer.service \
-          hermes-network-ready@vm.service hermes-network-ready@vm-peer.service
+        timeout --kill-after=5s 180 systemctl stop hermes@vm.service hermes@vm-peer.service \
+          hermes-network@vm.service hermes-network@vm-peer.service \
+          hermes-dhcp@vm.service hermes-dhcp@vm-peer.service \
+          hermes-network-ready@vm.service hermes-network-ready@vm-peer.service || return 1
+        assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
+        assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
+        timeout 30s systemctl reset-failed "''${units[@]}"
         timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
           hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
         wait_for_active || { diagnose; return 1; }
@@ -1920,6 +1955,156 @@ let
           wait_for_active || return 1
           assert_distinct_namespaces || return 1
         done
+        start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
+        start_peer_probes hermes@vm-peer.service "$peer_agent_ip" "$peer_agent_ip6" || return 1
+      }
+
+      check_ipv6_default_route_loss() {
+        local anchor_pid route6 route6_after gateway route4_before route4_after started deadline ready gateway_state set_output revoked elapsed observed_route6 observer_state controller_state
+        echo "Testing that live IPv6 default-route loss closes readiness while IPv4 remains routed"
+        anchor_pid=$(service_pid hermes-netns@vm.service) || return 1
+        route6=$(nsenter --target "$anchor_pid" --net -- ip -6 route show default dev hb0)
+        gateway=$(awk '{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }' <<< "$route6")
+        [[ -n "$gateway" ]] || { echo "No IPv6 default-route gateway was available for the loss probe: $route6" >&2; return 1; }
+        route4_before=$(nsenter --target "$anchor_pid" --net -- ip -4 route show default dev hb0)
+        [[ -n "$route4_before" ]] || { echo "IPv4 default route was absent before the IPv6 loss probe" >&2; return 1; }
+        ipv6_route_pid="$anchor_pid"
+        ipv6_route_gateway="$gateway"
+        nsenter --target "$anchor_pid" --net -- ${pkgs.bash}/bin/bash -c 'set -e; printf 0 > /proc/sys/net/ipv6/conf/hb0/accept_ra'
+        started=$(python3 -c 'import time; print(time.monotonic_ns())')
+        disable_test_ipv6_ra ha0
+        route6_after=$(nsenter --target "$anchor_pid" --net -- ip -6 route show default dev hb0 2>/dev/null || true)
+        if [[ -n "$route6_after" ]]; then
+          nsenter --target "$anchor_pid" --net -- ip -6 route del default dev hb0 || true
+          route6_after=$(nsenter --target "$anchor_pid" --net -- ip -6 route show default dev hb0 2>/dev/null || true)
+        fi
+        [[ -z "$route6_after" ]] || { echo "IPv6 default route remains after deletion: $route6_after" >&2; return 1; }
+        route4_after=$(nsenter --target "$anchor_pid" --net -- ip -4 route show default dev hb0 2>/dev/null || true)
+        [[ -n "$route4_after" && "$route4_after" == "$route4_before" ]] || {
+          echo "Removing the IPv6 route changed the independent IPv4 default route: before=$route4_before after=$route4_after" >&2
+          return 1
+        }
+        deadline=$((SECONDS + 10))
+        revoked=0
+        while (( SECONDS < deadline )); do
+          ready=$(systemctl show --property=ActiveState --value hermes-network-ready@vm.service)
+          gateway_state=$(systemctl show --property=ActiveState --value hermes@vm.service)
+          if [[ "$ready" != active && "$gateway_state" != active ]]; then
+            set_output=$(nft -j list table inet hermes-agent-guard)
+            if python3 -c 'import json,sys; names={"ha0_host4","ha0_peer4","ha0_host6","ha0_peer6"}; sets=[row["set"] for row in json.load(sys.stdin)["nftables"] if "set" in row and row["set"].get("name") in names]; sys.exit(0 if len(sets)==4 and all(not value.get("elem") for value in sets) else 1)' <<<"$set_output"; then
+              revoked=1
+              break
+            fi
+          fi
+          sleep 0.1
+        done
+        elapsed=$(python3 -c 'import sys,time; print((time.monotonic_ns()-int(sys.argv[1]))//1000000)' "$started")
+        if [[ "$revoked" != 1 ]]; then
+          observed_route6=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["route6"])' /run/hermes-observation-vm/observation.json 2>/dev/null || printf 'unavailable')
+          observer_state=$(systemctl show --property=ActiveState --value hermes-network-observer@vm.service)
+          controller_state=$(systemctl show --property=ActiveState --value hermes-host-control@vm.service)
+          echo "IPv6 route loss diagnostic: kernel_routes=[$route6_after] observer_record_route6=$observed_route6 observer=$observer_state controller=$controller_state readiness=$ready gateway=$gateway_state"
+        fi
+        [[ "$revoked" == 1 && "$elapsed" -lt 10000 ]] || {
+          echo "IPv6 default-route loss did not revoke gateway authorization within the unchanged 10-second bound: ''${elapsed}ms" >&2
+          return 1
+        }
+        echo "HERMES_VM_IPV6_DEFAULT_ROUTE_LOSS_REVOKED elapsed_ms=$elapsed ipv4_route_preserved=1"
+        nsenter --target "$anchor_pid" --net -- ${pkgs.bash}/bin/bash -c 'set -e; printf 1 > /proc/sys/net/ipv6/conf/hb0/accept_ra' 2>/dev/null || true
+        nsenter --target "$anchor_pid" --net -- ip -6 route replace default via "$gateway" dev hb0 2>/dev/null || true
+        unset ipv6_route_pid ipv6_route_gateway
+        timeout --kill-after=5s 180 systemctl stop hermes@vm.service hermes@vm-peer.service hermes-network@vm.service hermes-network@vm-peer.service || return 1
+        assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
+        assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
+        restore_test_ipv6_ra || return 1
+        systemctl reset-failed
+        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
+        wait_for_active || return 1
+        assert_distinct_namespaces || return 1
+        discover_network_values || return 1
+        start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
+        start_peer_probes hermes@vm-peer.service "$peer_agent_ip" "$peer_agent_ip6" || return 1
+      }
+
+      check_ipv6_default_route_startup_gate() {
+        local anchor_pid route4 route6 route6_after gateway substate ready gateway_state started deadline set_output revoked gateway_start gateway_start_before elapsed
+        echo "Testing initial startup remains blocked when the IPv6 default route disappears before readiness"
+        stop_peer_probes
+        timeout --kill-after=5s 180 systemctl stop hermes@vm.service hermes@vm-peer.service hermes-network@vm.service hermes-network@vm-peer.service || return 1
+        assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
+        assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
+        install -d -m 0755 "''${ipv6_readiness_override%/*}"
+        printf '[Service]\nBindReadOnlyPaths+=%s\nExecStartPre=%s/bin/sleep 20\n' "${pkgs.coreutils}" "${pkgs.coreutils}" >"$ipv6_readiness_override"
+        systemctl daemon-reload
+        systemctl reset-failed
+        gateway_start_before=$(systemctl show --property=ExecMainStartTimestampMonotonic --value hermes@vm.service)
+        systemctl --no-block start hermes@vm.service || return 1
+        deadline=$((SECONDS + 180))
+        while (( SECONDS < deadline )); do
+          substate=$(systemctl show --property=SubState --value hermes-network-ready@vm.service)
+          [[ "$substate" == start-pre ]] && break
+          gateway_state=$(systemctl show --property=ActiveState --value hermes@vm.service)
+          [[ "$gateway_state" != active ]] || { echo "Gateway started before the IPv6 route gate test could remove its route" >&2; return 1; }
+          sleep 0.1
+        done
+        [[ "$substate" == start-pre ]] || { echo "Readiness did not reach the test-only start-pre barrier: $substate" >&2; return 1; }
+        anchor_pid=$(service_pid hermes-netns@vm.service) || return 1
+        for _ in {1..100}; do
+          route4=$(nsenter --target "$anchor_pid" --net -- ip -4 route show default dev hb0)
+          route6=$(nsenter --target "$anchor_pid" --net -- ip -6 route show default dev hb0)
+          gateway=$(awk '{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }' <<< "$route6")
+          [[ -n "$route4" && -n "$gateway" ]] && break
+          sleep 0.1
+        done
+        [[ -n "$route4" && -n "$gateway" ]] || { echo "Dual-stack routes were not available before the startup loss: IPv4=[$route4] IPv6=[$route6]" >&2; return 1; }
+        ipv6_route_pid="$anchor_pid"
+        ipv6_route_gateway="$gateway"
+        nsenter --target "$anchor_pid" --net -- ${pkgs.bash}/bin/bash -c 'set -e; printf 0 > /proc/sys/net/ipv6/conf/hb0/accept_ra'
+        started=$(python3 -c 'import time; print(time.monotonic_ns())')
+        disable_test_ipv6_ra ha0
+        route6_after=$(nsenter --target "$anchor_pid" --net -- ip -6 route show default dev hb0 2>/dev/null || true)
+        if [[ -n "$route6_after" ]]; then
+          nsenter --target "$anchor_pid" --net -- ip -6 route del default dev hb0 || true
+          route6_after=$(nsenter --target "$anchor_pid" --net -- ip -6 route show default dev hb0 2>/dev/null || true)
+        fi
+        [[ -z "$route6_after" ]] || { echo "IPv6 default route remains after the targeted loss: $route6_after" >&2; return 1; }
+        [[ -n "$(nsenter --target "$anchor_pid" --net -- ip -4 route show default dev hb0)" ]] || {
+          echo "IPv4 default route disappeared with the IPv6-only startup fault" >&2
+          return 1
+        }
+        deadline=$((SECONDS + 10))
+        revoked=0
+        while (( SECONDS < deadline )); do
+          ready=$(systemctl show --property=ActiveState --value hermes-network-ready@vm.service)
+          gateway_state=$(systemctl show --property=ActiveState --value hermes@vm.service)
+          gateway_start=$(systemctl show --property=ExecMainStartTimestampMonotonic --value hermes@vm.service)
+          if [[ "$ready" != active && "$gateway_state" != active && "$gateway_start" == "$gateway_start_before" ]]; then
+            set_output=$(nft -j list table inet hermes-agent-guard)
+            if python3 -c 'import json,sys; names={"ha0_host4","ha0_peer4","ha0_host6","ha0_peer6"}; sets=[row["set"] for row in json.load(sys.stdin)["nftables"] if "set" in row and row["set"].get("name") in names]; sys.exit(0 if len(sets)==4 and all(not value.get("elem") for value in sets) else 1)' <<<"$set_output"; then
+              revoked=1
+              break
+            fi
+          fi
+          sleep 0.1
+        done
+        elapsed=$(python3 -c 'import sys,time; print((time.monotonic_ns()-int(sys.argv[1]))//1000000)' "$started")
+        [[ "$revoked" == 1 && "$elapsed" -lt 10000 ]] || {
+          echo "Startup without an IPv6 default route was not kept closed within the unchanged 10-second bound: ''${elapsed}ms" >&2
+          return 1
+        }
+        echo "HERMES_VM_IPV6_DEFAULT_ROUTE_STARTUP_BLOCKED elapsed_ms=$elapsed ipv4_route_preserved=1 gateway_start_unchanged=$gateway_start_before"
+        timeout --kill-after=5s 180 systemctl stop hermes@vm.service hermes@vm-peer.service hermes-network@vm.service hermes-network@vm-peer.service || return 1
+        assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
+        assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
+        restore_test_ipv6_ra || return 1
+        rm -f -- "$ipv6_readiness_override"
+        systemctl daemon-reload
+        systemctl reset-failed
+        unset ipv6_route_pid ipv6_route_gateway
+        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
+        wait_for_active || return 1
+        assert_distinct_namespaces || return 1
+        discover_network_values || return 1
         start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
         start_peer_probes hermes@vm-peer.service "$peer_agent_ip" "$peer_agent_ip6" || return 1
       }
@@ -2282,7 +2467,7 @@ let
 
       check_nft_readback_exit_status() {
         "${pkgs.python3}/bin/python3" -I -B ${vmNetworkRecordTests} ${networkRecordPath} \
-          ${../modules/services/agent/hermes-network/setup.py} ${hostRecordPath}
+          ${../modules/services/agent/hermes-network/setup.py} ${hostRecordPath} ${vmNetworkObserver}
       }
 
       check_nft_policy_startup_gate() {
@@ -2363,15 +2548,19 @@ let
               echo "$unit failed allocation publication/readback instead of policy readback for $scenario" >&2
               return 1
             fi
+            assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
+            assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
+            timeout 30s systemctl reset-failed "''${units[@]}" hermes-network-failure@vm.service hermes-network-failure@vm-peer.service
           done
           [[ "$(nft -n list chain inet hermes-agent-guard "$other_chain")" == "$other_before" ]] || {
             echo "$scenario unexpectedly changed the other nftables guard chain" >&2
             return 1
           }
+          timeout --kill-after=5s 60 systemctl stop hermes@vm.service hermes@vm-peer.service || return 1
+          assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
+          assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
           timeout --kill-after=5s 30 systemctl restart nftables.service || { diagnose; return 1; }
-          timeout 30s systemctl reset-failed hermes@vm.service hermes@vm-peer.service hermes-network@vm.service \
-            hermes-network@vm-peer.service hermes-dhcp@vm.service hermes-dhcp@vm-peer.service \
-            hermes-network-ready@vm.service hermes-network-ready@vm-peer.service
+          timeout 30s systemctl reset-failed "''${units[@]}"
           timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
             hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
           wait_for_active || { diagnose; return 1; }
@@ -2604,6 +2793,8 @@ let
       check_dad_readiness_gate || { diagnose; exit 1; }
       check_agent_network hermes@vm.service hb0 "''${host_vm_ip}" "''${agent_vm_ip}" "''${peer_agent_ip}" "''${host_vm_ip6}" "''${agent_vm_ip6}" "''${peer_agent_ip6}" || { diagnose; exit 1; }
       check_agent_network hermes@vm-peer.service hb1 "''${host_peer_ip}" "''${peer_agent_ip}" "''${agent_vm_ip}" "''${host_peer_ip6}" "''${peer_agent_ip6}" "''${agent_vm_ip6}" || { diagnose; exit 1; }
+      check_ipv6_default_route_startup_gate || { diagnose; exit 1; }
+      check_ipv6_default_route_loss || { diagnose; exit 1; }
       if [[ "$HERMES_VM_INTERNET_RECOVERY_ONLY" == 1 ]]; then
         echo "Focused Internet recovery run: public DNS and verified HTTPS after nftables/networkd recovery"
         check_public_internet || { diagnose; exit 1; }
@@ -2712,9 +2903,10 @@ in
   # This isolated, network-restricted test VM needs Hermes' current Matrix dependency.
   nixpkgs.config.permittedInsecurePackages = [ "olm-3.2.16" ];
 
+  networking.useNetworkd = true;
   networking.resolvconf.enable = false;
   networking.nameservers = [ ];
-  environment.etc."resolv.conf".source = "/run/hermes-vm-resolv.conf";
+  environment.etc."resolv.conf".source = lib.mkForce "/run/hermes-vm-resolv.conf";
   services.dnsmasq = {
     enable = true;
     settings = {
@@ -2738,7 +2930,7 @@ in
     before = [ "hermes-network@vm.service" ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
-      ExecStart = "${pkgs.python3}/bin/python3 -I -B ${vmNetworkRecordTests} ${networkRecordPath} ${../modules/services/agent/hermes-network/setup.py} ${hostRecordPath}";
+      ExecStart = "${pkgs.python3}/bin/python3 -I -B ${vmNetworkRecordTests} ${networkRecordPath} ${../modules/services/agent/hermes-network/setup.py} ${hostRecordPath} ${vmNetworkObserver}";
       ExecStartPost = "${pkgs.python3}/bin/python3 -I -B ${./tests/hermes-runtime/contracts.py} ${../modules/services/agent/hermes-runtime} ${pkgs.coreutils}/bin/chown";
       Type = "oneshot";
       DynamicUser = true;

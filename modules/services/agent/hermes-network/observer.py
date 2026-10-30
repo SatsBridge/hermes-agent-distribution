@@ -7,7 +7,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv.pop(1))
-from network_record import atomic, config, dad_pending, dad_waiting, now, observation, usable
+from network_record import atomic, config, dad_pending, dad_waiting, default_routes, now, observation, usable
 
 settings = json.loads(pathlib.Path(sys.argv.pop(1)).read_text())
 publication = pathlib.Path(settings['publication'])
@@ -44,8 +44,8 @@ while True:
         if dad_waiting(link['addr_info'], peer6, dadfailed):
             time.sleep(0.1)
             continue
-        routes = ip('route', 'show')
-        record = dict(version=1, generation=expected['generation'], invocation=os.environ['INVOCATION_ID'], namespace=os.stat('/proc/self/ns/net').st_ino, timestamp=now(), interface=interface, index=link['ifindex'], mac=link['address'], peer4=peer4, peer6=peer6, route4=any((route.get('dst') == 'default' and route.get('dev') == interface and (route.get('gateway') == expected['host4'][0]) for route in routes)), route6=any((route.get('dst') == 'default' and route.get('dev') == interface for route in routes)), dadfailed=dadfailed, listeners=sorted(set(listeners)))
+        route4, route6 = default_routes(ip, interface, expected['host4'][0])
+        record = dict(version=1, generation=expected['generation'], invocation=os.environ['INVOCATION_ID'], namespace=os.stat('/proc/self/ns/net').st_ino, timestamp=now(), interface=interface, index=link['ifindex'], mac=link['address'], peer4=peer4, peer6=peer6, route4=route4, route6=route6, dadfailed=dadfailed, listeners=sorted(set(listeners)))
         atomic(observation_path, record)
         observation(observation_path, expected, interface, mac)
         if not notified:

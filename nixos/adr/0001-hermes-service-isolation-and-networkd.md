@@ -285,20 +285,27 @@ IPv4Forwarding, IPv6Forwarding, IPv6SendRA, runtime server leases, PoolOffset=2,
 PoolSize=1. `Router=` is omitted: systemd 261 rejects the legacy
 `_server_address` token and uses the DHCP server interface address by default.
 Pinned NixOS emits .network sources into
-reloadTriggers and sets stopIfChanged=false. Enable systemd.network only for
-active agents. In the pinned switch-to-configuration-ng implementation, removing
-the last `X-Reload-Triggers` key is ignored by its unit comparator; a stable,
-content-addressed membership trigger over Hermes' generated network sources is
-therefore appended while agents are active. Addition, content change, and removal
-all change that still-present trigger. Runtime RA drop-ins remain outside NixOS
-and still require the helper's explicit reload/reconfigure.
+reloadTriggers and sets stopIfChanged=false. Enable systemd.network for active
+agents, but do not disable it when the host independently owns networkd. In the
+pinned switch-to-configuration-ng implementation, removing the last
+`X-Reload-Triggers` key is ignored by its unit comparator. Keep one
+content-addressed membership trigger while Hermes is enabled and systemd.network
+is enabled, including the zero-agent case on a host-owned networkd. The trigger
+content is the exact generated Hermes source list (empty after last-agent
+removal); addition, content change, and last-agent removal change the retained
+trigger without enabling networkd on a host with no active agent. Runtime RA
+drop-ins remain outside NixOS and still require the helper's explicit
+reload/reconfigure.
 
-Do not change networking.useNetworkd, host dhcpcd/NM uplink ownership or explicit
-wait-online policy. Weak defaults avoid introducing a second uplink wait gate
-or new resolved owner when Hermes alone enables networkd. Narrow ha* exclusions
-preserve coexistence; the generic Nixpkgs warning is not suppressed by taking
-over uplinks. First/change/removal/rollback with networkd already running must
-be exercised using ordinary activation, not manual reload or trigger eval alone.
+The supported host contract for active Hermes agents is
+`networking.useNetworkd=true`; the module asserts this prerequisite and does not
+set it. NetworkManager may be enabled at the same time; Hermes veths remain
+excluded from NetworkManager and dhcpcd, without changing unrelated uplink
+ownership. Hosts with `networking.useNetworkd=false` are outside this task's
+supported configuration. Keep NixOS's standard networkd wait-online default;
+do not add a Hermes-specific override. First/change/last-agent-removal/rollback
+with networkd already running must be exercised using ordinary activation, not
+manual reload or trigger evaluation alone.
 
 Agents still get only allocated host-veth proxy resolvers, never public/LAN
 fallbacks. Test the COMPLETE nameserver list in the actual gateway root/mount/
@@ -319,22 +326,36 @@ load-fragment/verbs/bus-util/sd_booted sources; pinned Nixpkgs networkd module;
 iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 
 Current evidence is partial. Config checks compile generated scripts and run
-record positives/negative cases. A full offline guest confirmed the direct
-systemd D-Bus manager polling now proceeds past startup, then exposed two
-networkd runtime defects: the old `Router=_server_address` was rejected by
-systemd 261, and `UMask=0077` reduced the dynamically created RA drop-in
-directory to 0700 so networkd could not traverse it. The candidate omits the
-invalid Router key (the documented default is the server address) and explicitly
-sets the drop-in directory mode to 0755; these fixes still need a fresh guest
-run. Earlier independent targeted guests proved
-zero-cap anchors, NET_ADMIN controllers/local setup and actual local-unit
-seccomp/family/namespace enforcement, DHCP lifecycle and one controller-SIGKILL
-edge. They did NOT prove full final acceptance. Recent full split guests reached
-DNS and readiness, then failed closed on authorization freshness; no successful
-final runtime or clean shutdown is claimed yet. Historical missing NSS/manager/
-DHCP failures are not descriptions of current role requirements. Bounded
-verbatim final-candidate execution, commands/statuses/closure identities must be
-attached durably; inaccessible scratch paths are not review evidence.
+Historical pre-split guests found that systemd 261 rejects the old
+`Router=_server_address` token and that `UMask=0077` made the dynamic RA drop-in
+directory inaccessible to networkd. The current source omits the invalid Router
+key (using networkd's server-address default) and explicitly sets the drop-in
+directory to 0755. Earlier DHCP-layout and split-role guests are historical
+evidence only; they are not substitutes for a current full-candidate run.
+
+Current candidate evidence is partial. `hermes-module-vm-config-check` and the
+offline VM image build pass. The observer-level route-family test emits
+`route6=false` when only the IPv4 default is present, and the actual observation
+parser rejects it. A fresh offline guest records
+`HERMES_VM_IPV6_DEFAULT_ROUTE_STARTUP_BLOCKED` (417 ms; IPv4 preserved) and
+`HERMES_VM_IPV6_DEFAULT_ROUTE_LOSS_REVOKED` (2,041 ms; IPv4 preserved); it also
+passes both agents' exact host-only resolver and unavailable-host-DNS probes as
+their service identities with `CapEff=0`. The full offline smoke has NOT reached
+its final success marker: it stops in the late nftables policy-startup/recovery
+matrix. Its failure log and earlier positive markers are attached separately.
+The measured first real dashboard log is about 67 seconds after the network
+startup boundary, above the unchanged 15-second target; this NFR is unwaived.
+There is no clean-shutdown claim: the disposable guest reports failure to
+unmount `/nix/store` before the QEMU runner exits. Internet DNS/verified HTTPS,
+default-on Headroom/skills, ordinary live networkd activation/rollback, and the
+complete unit enforcement/lifecycle matrix remain unverified. No security
+exception, risk acceptance, software acceptance, or release authorization is
+inferred from scores or partial guest evidence.
+
+Historical missing NSS/manager/DHCP failures are not descriptions of current
+role requirements. Attach bounded verbatim final-candidate output with commands,
+exit statuses and candidate/prior closure identities; inaccessible scratch
+paths are not review evidence.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,

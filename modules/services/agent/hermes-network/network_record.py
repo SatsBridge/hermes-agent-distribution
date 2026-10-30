@@ -42,6 +42,14 @@ def dad_pending(items):
 def dad_waiting(items, peer6, dadfailed):
     return dad_pending(items) and not peer6 and not dadfailed
 
+def default_routes(ip, interface, gateway4):
+    routes4 = ip("route", "show")
+    routes6 = ip("-6", "route", "show")
+    return (
+        any(route.get("dst") == "default" and route.get("dev") == interface and route.get("gateway") == gateway4 for route in routes4),
+        any(route.get("dst") == "default" and route.get("dev") == interface for route in routes6),
+    )
+
 def unique(pairs):
     result = {}
     for key, value in pairs:
