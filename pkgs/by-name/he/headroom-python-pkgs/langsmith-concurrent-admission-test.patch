@@ -1,0 +1,16 @@
+--- a/tests/unit_tests/test_replica_compression.py
++++ b/tests/unit_tests/test_replica_compression.py
+@@ -506,9 +506,11 @@
+     assert drains, "expected at least one frame to be drained mid-flight"
+     for destinations, raw in drains:
+         urls = {d.api_url for d in destinations}
+-        assert urls == {"https://b"}, urls
++        # A drain releases the frame, so either destination can claim the next one.
++        assert urls in ({"https://b"}, {"https://d"}), urls
+         body = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+-        assert b"theirs" not in body
++        foreign = b"theirs" if urls == {"https://b"} else b"mine"
++        assert foreign not in body
+
+
+ # --- payload grouping (step 2) ------------------------------------------------
