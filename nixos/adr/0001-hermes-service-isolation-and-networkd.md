@@ -1,529 +1,346 @@
-# ADR 0001: Hermes service roots, networkd ownership, and resolver proof
+# ADR 0001: Hermes service roots, privilege separation and networkd
 
-Status: proposed; the owner authorized internal privilege separation, but
-implementation is partial and independent acceptance review remains pending.
-This is not a risk exception or release authorization.
+Status: proposed implementation; independent acceptance and owner release decisions
+remain pending. This is not an approved exception or release authorization.
 Date: 2026-10-28
 
-The owner authorized splitting internal roles to avoid workload `CAP_SYS_ADMIN`
-(task thread, followed by design review t_b1ae7c4b). Preserve the public
-families and existing DNS/NAT owners; let the manager enter namespaces, separate
-host administration from unprivileged proxies, and validate generation-scoped
-agent observations before authorization. The legacy-role table below describes
-the pre-split checkpoint; the first implemented split boundary is recorded
-separately below. Neither is an accepted final topology. No further topology
-permission is needed within those boundaries. PID1 still needs privileges to
-construct roots/namespaces; the service payload is not a nested container
-manager, so the systemd Container Interface's cgroup-delegation and
-manager-capability advice does not justify granting those privileges to
-payloads.
+## Context and decision
 
-## Context and boundaries
+Task t_6010650d implements parent investigation t_86a163bd/comment 234. The owner
+subsequently authorized internal service separation to remove workload
+CAP_SYS_ADMIN, and persistent per-instance DHCP client state. Design review
+ t_b1ae7c4b and implementation reviews require executable lifecycle/data contracts
+and real guest evidence. No formal SDD exists; this ADR does not invent one.
 
-The NixOS module operates five production service families: `hermes@` (gateway),
-`hermes-pf@` (public-state fixer), `hermes-network@` (host/veth setup),
-`hermes-dhcp@` (DHCP client), and `hermes-network-ready@` (readiness
-coordinator). This ADR records design decisions for the existing service and
-network contracts. No formal SDD was present in the repository; this record does
-not claim an upstream or owner-approved SDD.
+Keep the five public families: gateway `hermes@`, fixer `hermes-pf@`, local setup
+`hermes-network@`, client `hermes-dhcp@`, readiness `hermes-network-ready@`.
+Add internal roles only at actual namespace, privilege or producer boundaries.
+PID1 constructs/joins namespaces and roots. Payloads do not call setns or change
+identity. This is not a claim that the host manager is CAP_SYS_ADMIN-free, nor a
+nested container manager requiring the systemd Container Interface's privileges.
 
-Preserved contracts: dynamic host IPv4 `/30` + IPv6 `/64`/SLAAC,
-protocol/port-specific nftables policy and fail-closed readiness, host-loopback
-mappings, host DNS proxy ownership, peer profiles/ACLs, existing user/shared
-state, KVM, hook closure overrides, default-on Headroom/skills, NixOS NAT
-`externalInterface`, and unrelated uplink ownership. No package/pin update, new
-DNS/NAT owner, user-state migration, quota, or unrelated host-daemon re-rooting
-is authorized here.
+Preserve dynamic DHCPv4 /30 and SLAAC /64, exact protocol/port nft policy,
+fail-closed startup/loss, host-loopback mappings, host DNS ownership and snapshot
+semantics, peer ACL/profiles, existing user/shared state, KVM, hook closures,
+default-on Headroom/skills, NAT externalInterface and unrelated uplink ownership.
+No pins, packages, public options, NAT/DNS owners, quotas or state migrations are
+added. Per-role RootDirectory trees expose only their evaluated runtime closures
+and explicit data/device/socket mounts, not /nix or host profiles wholesale.
 
-Decision: use per-instance `RootDirectory=` trees and individually-bound Nix
-closures; use NixOS `systemd.network.networks` for the generated `.network`
-files; strengthen the existing DNS regression without changing resolver
-architecture.
+## Execution and ownership boundaries
 
-## Service and data boundaries
+| Role | Identity / effective privilege | Namespace and responsibility |
+|---|---|---|
+| anchor `hermes-netns@` | root UID, empty bounding/ambient caps | Own private netns lifetime; no manager API or network configuration. Root UID is the tested namespace-FD DAC/proc access contract, not general privilege. |
+| controller `hermes-host-control@` | root UID, NET_ADMIN only; no ambient caps | PID1 joins host netns via NetworkNamespacePath. Creates/moves/deletes owned veth, networkd RA files, host allocation/resolver/config/authorization, exact nft readback and revocation. Never JoinsNamespaceOf the anchor. |
+| failure reaper `hermes-network-failure@` | root UID, empty caps | OnFailure-only D-Bus client stops the private anchor after host-control ExecStopPost has completed; this prevents a failed host setup from stranding its waiting observer. No networking or host filesystem access beyond its own root and D-Bus socket. |
+| local setup `hermes-network@` | distinct DynamicUser, NET_ADMIN bounded+ambient | Joins ordered anchor; brings up lo and moved peer. No manager API, DNS/proxy children or host runtime import. Ambient NET_ADMIN carries the one required privilege through exec as non-root. |
+| DHCP `hermes-dhcp@` | distinct per-instance DynamicUser; NET_ADMIN, NET_BIND_SERVICE, NET_RAW bounded+ambient | Joins local namespace; packaged dhcpcd configures client addresses/routes, raw DHCP/ARP and client sockets. |
+| observer `hermes-network-observer@` | distinct DynamicUser; zero caps | Joins ordered anchor, observes addresses/routes/listeners and publishes telemetry. No manager API or host mutation. |
+| DNS `hermes-dns@` | distinct DynamicUser; NET_BIND_SERVICE bounded+ambient | Manager-selected host netns. Existing dnsmasq listens only on allocated host-veth addresses, reads one startup host-resolver snapshot. No setuid/setgid or manager access. |
+| host proxy `hermes-host-proxy@` | distinct DynamicUser; NET_BIND_SERVICE only for configured ports below 1024, otherwise zero caps | Host netns; existing socat processes bind only 127.0.0.1. Group supervisor fails on any required child exit. |
+| agent relay `hermes-agent-relay@` | distinct DynamicUser; NET_BIND_SERVICE only for configured low relay ports, otherwise zero caps | Anchor netns; existing socat relays veth listeners to namespace loopback, including supported low ports. Required child exit fails supervisor. |
+| readiness `hermes-network-ready@` | distinct DynamicUser; zero caps | Anchor netns; checks controller authorization. No manager, host resolver, networkd, nft, writable producer bind or host capabilities. Sends its own READY=1 with NotifyAccess=main. |
+| fixer `hermes-pf@` | DynamicUser, primary group hermes-shared; DAC_READ_SEARCH/FOWNER bounded+ambient | Private netns; changes only existing gateway-state ACLs. Numeric `id -g` supplies ACL GID; no host /etc/group bind or NSS group-name query. RestrictAddressFamilies=[] per owner direction; socket() denied explicitly by seccomp, under runtime test. |
+| gateway `hermes@` | DynamicUser, zero caps | Joins local namespace only after final readiness. Existing state, peer-profile/shared-state and KVM behavior retained. |
 
-The following table is the historical pre-split checkpoint, not the effective
-settings of the new setup/anchor/controller units.
+Every added role has its own root and template+instance lifecycle-command closure
+discovery. Shell interpreter/env and command dependencies are store references;
+Python roles include their interpreter/stdlib and only the binaries their
+selected role actually executes. No host shell/profile tree is imported.
+Journald output uses inherited descriptors. DNS logs to stderr, avoiding an
+otherwise required AF_UNIX syslog socket. Only gateway needs the existing CA
+bundle. DHCP suppresses external exit hooks with /dev/null.
 
-`G` = gateway; `PF` = public-state fixer; `N` = network setup; `D` = DHCP; `R` =
-readiness.
+The controller alone receives a writable /run/systemd/network bind (RA lock and
+drop-ins), the system D-Bus socket for documented system-manager API calls, and
+the networkd Varlink socket. It does not bind /run/systemd/private. A store-backed
+empty /run/systemd/system boot marker separately satisfies sd_booted();
+SYSTEMD_OFFLINE=0 overrides verb-level chroot detection. A read-only mount of the
+D-Bus socket does NOT limit API authority: this root controller remains trusted
+host control, not a contained NET_ADMIN-only adversary. No whole /run, /etc or
+/proc/1/root bind. All payload roles lack manager access.
 
-| Boundary | G | PF | N | D | R |
-|---|---|---|---|---|---|
-| Identity | `DynamicUser`; no capabilities | `DynamicUser`; `DAC_READ_SEARCH`, `FOWNER` | root; host network and manager operations | `DynamicUser`; `NET_ADMIN`, `NET_BIND_SERVICE`, `NET_RAW` ambient + bounded | root; host firewall, DNS and manager operations |
-| Root | `%t/hermes-%i/root` | `%t/hermes-%i-pf/root` | `%t/hermes-network-%i/root` | `%t/hermes-dhcp-%i/root` | `%t/hermes-network-ready-%i/root` |
-| Runtime root creation | base runtime dir + `root` + `root/etc` | base + `root` | base + `root` | base + `root`; native aliases plus one ExecStart link | base + `root`, plus separate resolver-publication dir |
-| Persistent state | existing gateway `StateDirectory`; preserve ownership | none; bind the existing gateway state tree read/write to perform ACL maintenance | none | per-instance `StateDirectory`; owner-authorized lease/DUID persistence | none; resolver output is separate volatile runtime state |
-| Store | own evaluated closure only; existing profile/plugins/CA/shell/env/KVM bindings | own template + instance closure and effective hooks | own template + instance closure and effective hooks | dhcpcd/wrapper and all template + instance hooks | own template + instance closure and effective hooks |
+The fixer binds the gateway state tree read/write deliberately. ReadWritePaths
+is not an import into RootDirectory. It does not declare a competing
+StateDirectory that would recursively transfer gateway ownership. Its primary
+shared group allows numeric ACL operations without leaking all host groups.
+The gateway's privileged `+` ownership pre-start remains a separate exception
+requiring independent verification; its bypass is not attributed to the main
+zero-capability process. Cgroup device controls still apply to that path.
 
-The fixer needs `BindPaths=%S/hermes-%i`: `ReadWritePaths=` alone does not
-expose the host gateway state tree inside `RootDirectory=`. It deliberately does
-not declare that tree as a fixer-owned `StateDirectory`, which could recursively
-change ownership. The gateway's nested `root` is intentional: `%t/hermes-%i`
-also contains its SSH runtime socket. The filesystem root must not alias that
-runtime directory. The other service roots likewise use a distinct `root` child
-to avoid mixing the chroot filesystem with the service's host runtime directory.
+DynamicUser exceptions are per-role, not a shared helper default:
 
-The packaged dhcpcd 10.3.2 uses `/var/run/dhcpcd` for PID/control files and
-`/var/lib/dhcpcd` for lease/DUID state, with no runtime/state override flag. The
-owner subsequently authorized persistent per-instance client state, superseding
-the original ephemeral-client-state constraint; server `PersistLeases=runtime`
-is unchanged. Use the owner's two-entry
-`RuntimeDirectory=[hermes-dhcp-%i:dhcpcd, hermes-dhcp-%i/root]`; the alias
-creates `/run/dhcpcd`. `StateDirectory=hermes-dhcp-%i:dhcpcd` natively creates
-the private-root state alias. A single static link in the existing ExecStart
-wrapper points `/var/run/dhcpcd` to `/run/dhcpcd`. No directory creation or
-environment-path parsing is needed. Its parent is one private `/var/run` tmpfs
-with sticky mode 1777, allowing the dynamic identity to create the link without
-root, chown, extra capabilities, or unmanaged directory trees. Only this
-service's mount namespace sees that tmpfs; it contains a link, while actual
-PID/control files live in the manager-owned 0700 runtime directory. Creating
-that link in ExecStartPre would populate a different per-command tmpfs.
-`User=hermes-dhcp-%i` avoids the default template-wide DynamicUser identity.
-Runtime parents/root disappear on stop; lease state persists and is isolated per
-instance. The root is writable through its runtime alias, not an immutable-root
-boundary.
+- Anchor retains root UID but zero capabilities. Controller has no SYS_PTRACE;
+  access to the anchor's namespace FD relies on matching root UID under proc/
+  ptrace checks. A different dynamic anchor UID breaks this proven FD contract.
+  Sharing a dynamic identity or adding SYS_PTRACE is not a least-privilege fix.
+- Host controller retains root UID and NET_ADMIN. Its private system-manager
+  connection is authorized by root peer credentials, RA directory access is
+  root-owned, and it must open the root anchor namespace FD. NET_ADMIN alone on
+  a dynamic UID grants none of those filesystem/API rights. A new broker/polkit
+  authorization interface is not part of this implementation.
+- Failure reaper retains root UID only for the same system-manager D-Bus peer
+  authorization; it has zero capabilities and can request only the single
+  instance anchor stop in its executable operation.
+- Local setup has no such requirement after the split. It now uses a distinct
+  DynamicUser with NET_ADMIN bounded+ambient, remains in the initial owning
+  user namespace and joins the manager-selected anchor netns. Its current
+  operation/enforcement proof must be rerun after this identity change.
 
-The previous absolute native-alias proposal was invalid: systemd v261
-`load-fragment.c` `config_parse_exec_directories()` requires both source and
-destination to be relative and ignores the whole assignment on failure. A
-relative runtime alias under `hermes-dhcp-%i/root/var/run/dhcpcd` is also wrong:
-the manager emits `../../..`, which resolves to `/` after chroot rather than the
-runtime parent. Live guest readlink/mountinfo proved this; do not relax
-protection of `/` to accommodate it. The state alias does not cross that root
-boundary and works. An earlier `$root` mkdir wrapper failed on root-owned parent
-permissions and was removed, not given a privilege bypass. The final proposed
-layout adds no host `/run` or `/var` import. `ReadWritePaths` does not import
-host paths or override DAC ownership, but the tested `/var/lib` and `/var/run`
-exceptions were redundant: managed directories and the explicit tmpfs are
-already writable. They were removed after the operator-requested removal matrix
-passed without them. Store paths stay read-only.
+CapabilityBoundingSet is an upper bound, not a non-root privilege grant.
+DynamicUser payloads need AmbientCapabilities for the same required bits to
+survive ordinary interpreter/tool exec without setuid or file capabilities.
+This applies to local ip (NET_ADMIN), dhcpcd (network configuration/raw DHCP/
+privileged client sockets), DNS or configured low-port socat (NET_BIND_SERVICE),
+and fixer setfacl (DAC_READ_SEARCH/FOWNER). The root controller uses only the
+bounding NET_ADMIN set and an empty ambient set. Gateway, observer and readiness
+have no capabilities in either set. Maintained actual-unit probes check
+permitted, effective, bounding and ambient sets; listing unit directives alone
+is not proof that a child actually received or lacked a bit.
 
-Host-write exposure is narrow and role-specific:
+### Directory and record DbC
 
-- `N`: bind only host `/run/systemd/network` read/write, with `ReadWritePaths=`
-  for that path; bind `/run/systemd/private` and the D-Bus system socket
-  read-only for `systemctl`/`networkctl` control. No whole-host `/run` or `/etc`
-  bind.
-- `R`: read-only bind of the host resolver snapshot to
-  `/run/hermes-host-resolv.conf`, read-only `/run/systemd/private` for
-  fail-closed `systemctl stop`, and write access only to its instance
-  resolver-publication directory. It does not bind the host networkd directory
-  or D-Bus socket.
-- `D`: no `ReadWritePaths` declarations. Actual host write exposure is only the
-  automatic per-instance runtime/state binds; `/var/run` is private tmpfs. No
-  explicit `BindPaths` or host parent-tree bind.
-- `PF`: only the existing gateway state tree is writable; store closure mounts
-  remain read-only.
-- `G`: existing state/shared-state/KVM bindings only; no broad host filesystem
-  access.
+Root/runtime directories default to 0700. The anchor creates the separate,
+root-owned `/run/hermes-agent-network-N` publication directory for its lifetime;
+only the controller writes it and sets mode 0755. The observer separately
+manages `/run/hermes-observation-NAME`, setting mode 0755 and writing telemetry
+with mode 0644. Its root remains 0700. These records contain network metadata,
+not secrets. Producers
+atomically replace 0644 files; consumers get read-only DIRECTORY binds so
+replacement is visible. Consumers never redeclare/chown producer directories.
+Gateway resolv.conf deliberately remains a per-start FILE snapshot.
 
-`RootDirectory=` does not constrain host namespace operations performed by a
-`CAP_SYS_ADMIN` process or actions authorized through the system-manager socket.
-Setup/readiness remain trusted host-mutating code, not an adversarial-helper
-containment boundary.
+Anchor lifetime owns the host-publication directory so it exists before the
+observer's mount namespace is constructed. Observer starts Type=exec after the
+anchor but before controller; its active state alone is NOT usable telemetry.
+This breaks the mount/bootstrap dependency cycle: observer waits for config and
+DHCP/SLAAC; controller validates the actual record, rather than treating exec
+success as readiness. Missing/invalid telemetry cannot authorize traffic.
+Controller starts after observer exec, hence its read-only telemetry mount
+exists. Proxies start after DHCP/local setup and wait for valid config/data.
+Neither producer private root is shared. Stop/recovery removes records with
+their namespace generation. Recovery is explicit, not an automatic restart.
 
-## Per-role execution hardening
+Internal dynamic user names use distinct `hn-XX-%i` prefixes, no longer than
+the existing public gateway identity prefix. Long role names must not introduce
+an earlier systemd username-length limit or fall back to a template-wide UID.
+Service/runtime/state names remain unchanged; persistent StateDirectory data
+is managed/idmapped by systemd, not migrated or deleted by these programs.
 
-### First implemented split boundary (not whole-task acceptance)
+Version-1 config (4 KiB) has exact fields: version, anchor generation/PID/start/
+namespace inode, controller InvocationID, canonical host4/host6 arrays, policy
+digest. Observation (64 KiB) has version, matching generation/netns, observer
+InvocationID, CLOCK_BOOTTIME timestamp, interface/index/MAC, usable peer4/peer6,
+required default-route booleans, DAD failure and bounded protocol:port listeners.
+Reject duplicate object keys/array members, unsupported versions, unknown or
+missing fields, bool-as-int, malformed types/addresses/IDs, oversized, stale,
+future and wrong-generation records. Observer filters tentative, DAD-failed,
+deprecated and expired addresses and constrains IPv6 to the advertised prefix.
+It does not refresh telemetry while either usable peer family is absent, so the
+controller's two-second freshness limit revokes an authorized generation instead
+of accepting an empty allocation. DAD failure is reported immediately.
+Controller checks exact current address sets, host overlap and nft policy.
 
-`hermes-netns@` is a root-identity, zero-capability `sleep` lifetime anchor.
-Its explicit `CapabilityBoundingSet=""` is important: the Nix unit renderer
-omits an empty list rather than emitting an empty directive. A root process
-with the omitted directive retains capabilities. The failed prerequisite guest
-exposed this, and the corrected guest demonstrated zero effective/permitted/
-bounding/ambient capabilities. No dumpability override, SYS_PTRACE or privileged
-initializer is necessary for the corrected zero-capability anchor.
+Authorization (4 KiB) has exact fields: version, anchor generation/PID/start/
+namespace inode, controller and observer InvocationIDs, allocation and policy
+SHA256, boottime timestamp and authorized=true. The unprivileged readiness
+parser requires matching immutable config and bounded freshness; no shell
+source/eval. Controller checks producer manager state and observer InvocationID
+before refreshing authorization. Required proxies are supervised and readiness
+has BindsTo/After on every required producer. Empty mapping groups have no
+instance. No gateway/proxy can write controller or observer records.
 
-`hermes-host-control@` is now the only setup role that creates/deletes the host
-veth and RA files. PID1 selects `/proc/1/ns/net` using NetworkNamespacePath;
-this unit never joins the anchor and its payload has only NET_ADMIN. The public
-`hermes-network@` remains the private-namespace join point. It is ordered after
-and bound to both anchor and host controller, joins only the anchor, and brings
-up `lo`/the moved peer with NET_ADMIN. Both setup payloads deny setns, namespace
-creation and privileged/credential-change syscall groups. Neither starts proxy
-children or has SETUID/SETGID/SYS_ADMIN/SYS_PTRACE. Local setup has only
-AF_NETLINK/AF_UNIX and no manager socket or networkd runtime bind. The anchor has
-only AF_UNIX, no host socket and no persistent state. All three have their own
-root/runtime directories, closure/hook discovery, private devices/mounts/tmp/
-IPC, strict system/kernel/cgroup protection, closed device policy and MDWE.
-PrivateUsers remains off: controller/local NET_ADMIN must apply to the network
-namespace's owning user namespace; the anchor's root UID is the tested proc-FD
-access contract, not general privilege. PrivatePIDs remains off to preserve the
-host PID/namespace identity checks. No BPF/network policy is substituted.
+Observer attempts publication every 0.5 seconds; observation and authorization
+records are accepted only when at most 2 seconds old. Readiness polls every
+0.1 seconds. The first implementation's repeated manager queries missed the
+2-second authorization bound; the current validator batches producer queries
+and removes redundant per-address calls without increasing that freshness
+limit. Final-candidate VM results, including loss and stop timing, are recorded
+in the attached evidence. No freshness or end-to-end loss-bound waiver is
+inferred.
 
-Host-controller setup notification has these exact postconditions: anchor
-InvocationID is 32 lowercase hexadecimal characters, PID is greater than one,
-process start time and namespace inode are captured, a namespace FD is held,
-the owned/aliased veth exists, peer MAC is configured, the peer was moved using
-that FD, the anchor identity was rechecked, and the host link is up. This does
-NOT mean the host has an address, RA prefix, DHCP, SLAAC or traffic authorization.
-Only after this acknowledgement does public local setup bring the peer up.
-The controller continues the existing bounded host allocation/overlap checks
-and RA publication/reconfigure, avoiding a carrier-before-ack deadlock. It keeps
-checking the anchor identity afterward. The existing privileged readiness code
-still performs the DHCP/SLAAC/routes/exact-policy barrier; replacing that code
-and splitting proxies/telemetry remains outstanding, not implicitly accepted.
+### Startup, stop and recovery
 
-The namespace FD is opened only after manager PID/generation validation; process
-start time, PID, InvocationID and namespace inode are checked immediately before
-and after movement, then while the controller runs. PID reuse cannot retarget
-the held FD. Any mismatch fails the owner and runs cleanup. Host-control
-ExecStopPost also attempts cleanup after SIGKILL/failed start. Failed nft set
-flushing is now reported and attempts to block the owned host link before
-deletion; no silent flush success is claimed. This does not yet prove the final
-cross-role loss budget. A targeted production-controller SIGKILL test flushed a
-populated allocation set and deleted its link in 601.18274 ms while a synthetic
-dependent was still in its eight-second ExecStop. This covers that failure edge,
-not normal ordered stops, a slow gateway, observer/proxy loss or nft failure.
-Controller normal
-TERM exits successfully after cleanup; unexpected exits still invalidate
-BindsTo consumers. Anchor and controller are PartOf the public network lifetime.
+1. Anchor creates private namespace and publication lifetime.
+2. Observer exec establishes its private root/telemetry directory/mounts.
+3. Host controller validates live anchor PID, InvocationID, process start time
+   and namespace inode, holds a namespace FD, moves peer via rtnetlink and
+   rechecks identity. NET_ADMIN is checked in the owning user namespace; no
+   payload setns/SYS_PTRACE. It notifies HOST SETUP after peer move/host-link up,
+   before carrier-dependent allocation/RA.
+4. Public local setup brings peer/lo up; DHCP starts. Controller continues
+   networkd allocation, host overlap checks and RA publication. It publishes
+   config; observer supplies validated usable address/route telemetry.
+5. Proxy groups start as final dynamic identities. Controller waits for required
+   producer states and actual DNS/mapping listeners before publishing address
+   sets, verifies complete sets and exact guard rules, then authorizes.
+6. Readiness validates authorization, sends READY and continuously revalidates;
+   only then can gateway hooks/ExecStart execute.
 
-Manager-client contract: SYSTEMD_OFFLINE=0 handles verb-level chroot/offline
-detection, but does not override sd_booted(). A read-only store-backed empty
-directory at `/run/systemd/system` supplies that boot marker without importing
-the host directory. Controller binds only the system-manager private socket
-and networkd's varlink socket, plus writable `/run/systemd/network`. The
-prerequisite guest exercised real in-unit show/stop, reload/reconfigure and a
-failing start for a missing unit without a host D-Bus socket. `systemctl show`
-alone can return success/MainPID=0 for a nonexistent unit, hence the explicit
-PID/generation validation. A read-only socket mount does NOT constrain API
-authority: the root controller remains trusted host control. The legacy
-readiness role temporarily also receives the private boot marker; the final
-unprivileged readiness/proxy roles must lose manager access.
+Controller is ordered before consumers; therefore its normal ExecStopPost is
+NOT an early-revocation guarantee. The running monitor checks pending stop/
+restart jobs for its public gateway/network/readiness and its own controller,
+then invalidates authorization and revokes without waiting for reversed stop
+ordering or a slow gateway ExecStop. Manager stop requests are --no-block to
+avoid waiting on the controller's own transaction. Unexpected observer/proxy/
+namespace/policy/data loss also exits/invalidate readiness and stops consumers.
+The running controller monitors pending stop jobs and performs fail-close
+cleanup in its main process before exiting, ahead of reversed dependency stop
+ordering. ExecStopPost repeats the idempotent cleanup as the SIGKILL/failed-start
+fallback. OnFailure starts the separate zero-capability D-Bus helper after that
+cleanup; it asynchronously asks PID1 to stop the namespace anchor so a failed
+controller start cannot strand the otherwise-waiting observer. Anchor BindsTo
+edges stop consumers. The helper does not wait on that job. Remove
+authorization first;
+failed nft flush is reported and attempts link-down. Delete the owned/aliased
+link before potentially blocking RA lock/reload. Flush/down/delete/reload failure
+injection and measurement are required; logging a failed action is not a
+successful fail-closed claim. A held FD prevents PID reuse retargeting the move;
+controller rechecks live anchor identity during monitoring.
 
-The maintained VM ExecStartPost runs a Python assertion under the actual local
-setup cgroup/seccomp/mount controls, not a root nsenter approximation. It checks
-NET_ADMIN-only effective/bounding caps, zero ambient, NNP and seccomp, and denied
-INET/INET6/PACKET creation, setns and unshare. The detached prerequisite guest
-proved FD movement with denied setns; actual production-role/DHCP regression
-and broader lifecycle evidence are tracked separately. Image builds or this
-limited probe are not whole-system enforcement proof.
+The existing peer gateway BindsTo/After main gateway remains. Thus stopping main
+can also stop peer's dependent network stack. Preserve the intended baseline
+transaction, rather than claiming independent peer lifetime from a detached
+DHCP-only fixture. Maintained real-gateway comparison remains required.
 
-### Proposed split contract (not yet implemented)
+### DHCP paths and lifetime
 
-The following concrete graph implements the direction reviewed in t_b1ae7c4b.
-Review its lifetime/data contracts before replacing the pre-split helper.
-This is not a second request for owner permission to split internal roles.
+Packaged dhcpcd 10.3.2 fixes PID/control files at /var/run/dhcpcd and lease/DUID
+files at /var/lib/dhcpcd; no CLI runtime/state override exists. Owner authorized
+persistent per-instance client StateDirectory, superseding the initial
+volatile-client-state requirement. Server PersistLeases=runtime is unchanged.
 
-- `hermes-netns@`: a root-identity, zero-capability lifetime anchor. PID1
-  creates its private network namespace. A per-instance runtime record binds
-  its InvocationID, MainPID, process start time and namespace inode. No
-  proxies, manager socket, host network operations or persistent state.
-  Root identity is proposed only to let host control open the namespace FD
-  without SYS_PTRACE; prove ptrace/DAC checks under final controls.
-- `hermes-host-control@`: host namespace selected by PID1 through
-  `NetworkNamespacePath=/proc/1/ns/net`; never joins the anchor. Root with
-  NET_ADMIN only. Owns veth creation/removal, RA lock/drop-in, host resolver
-  snapshot, allocation/config/resolver publication, nftables verification
-  and revocation. Opens and validates the anchor reference before moving
-  the peer with rtnetlink, without workload setns. Holds the namespace FD
-  through movement and rechecks the manager's anchor generation afterward.
-  Its Type=notify acknowledgement means HOST SETUP ONLY, not authorization.
-  The same process then monitors host policy, observer data and listeners.
-- Public `hermes-network@` remains the agent namespace join point and
-  local-link setup oneshot. Joins the anchor after host setup; NET_ADMIN
-  only, no workload setns, child credential changes or packet proxies.
-- `hermes-dhcp@` joins that namespace after local-link setup. Keep the
-  tested dynamic identity and bounded NET_ADMIN/NET_BIND_SERVICE/NET_RAW.
-- `hermes-network-observer@` joins the agent namespace after DHCP starts.
-  Unique DynamicUser, zero capabilities. Reads addresses/routes and
-  atomically publishes non-executable telemetry from its own runtime dir.
-  It notifies only after producing a usable current-generation observation.
-- `hermes-dns@` runs the existing per-agent host-veth DNS proxy directly as
-  a unique DynamicUser, with NET_BIND_SERVICE only. No credential-drop
-  wrapper, NET_ADMIN, manager socket or host resolver watcher. Reads the
-  immutable host-resolver snapshot/config for this generation.
-- `hermes-host-proxy@` groups only the configured host-loopback mappings:
-  host namespace, unique DynamicUser, zero capabilities, bind 127.0.0.1.
-- `hermes-agent-relay@` groups only agent loopback relays: joins the anchor,
-  unique DynamicUser. Grant NET_BIND_SERVICE only when a configured relay
-  port requires it under the actual namespace threshold; do not reject
-  existing low-port mappings or change that threshold globally.
-- Public readiness becomes an unprivileged observer of the host control's
-  generation-scoped authorization, with mandatory loss dependencies on
-  all required roles. The gateway and fixer retain their existing roles.
-  Empty proxy/relay groups need no unit. Every internal service still gets
-  its own root, necessary closure, restrictions and directory ownership.
+Keep the independently exercised two-entry RuntimeDirectory:
+`hermes-dhcp-%i:dhcpcd`, `hermes-dhcp-%i/root`, and native StateDirectory alias
+`hermes-dhcp-%i:dhcpcd`. One static link in the existing ExecStart wrapper maps
+/var/run/dhcpcd to /run/dhcpcd inside a private /var/run:mode=1777 tmpfs. No
+extra RuntimeDirectory children, mkdir/chown/root initializer, explicit DHCP
+BindPaths or ReadWritePaths. A pre-start-created tmpfs link would disappear in
+the next command's mount namespace. Host /var/run layout is not inherited.
 
-Startup order, with arrows meaning Requires/BindsTo plus After:
+Prior real guest removal matrix: no ReadWritePaths passed both-instance renew/
+stop/start/runtime cleanup/state-sentinel checks; no tmpfs failed ENOENT; mode
+0755 tmpfs failed EACCES. Native absolute alias assignments are invalid (both
+source/destination must be relative); nested runtime relative aliases crossing
+chroot resolve wrongly. These historical failures do not justify making / rw.
+Do not rewrite the proven layout or remove persistent state during rollback.
 
-1. anchor -> host control's HOST SETUP notification -> public local setup;
-2. local setup -> DHCP -> usable observer notification;
-3. observer -> required DNS, host mappings and agent relays;
-4. host control validates telemetry, its own host addresses/routes, exact
-   policy and current required listeners; publishes/verifies sets, then
-   atomically publishes final authorization;
-5. public readiness checks matching authorization and required units,
-   notifies final READY -> gateway hooks and ExecStart.
+## Hardening inventory
 
-Host control must not be ordered After or synchronously wait for public
-readiness/observer before acknowledging host setup. Its monitor may wait
-after that acknowledgement. The anchor has PartOf public network for
-explicit stop/restart propagation, but does not Require public network.
-Host control BindsTo+After anchor; local setup BindsTo+After both. All
-agent consumers bind to the anchor as well as their functional producers.
-Namespace joining is only private-consumer-to-anchor, never reciprocal
-with host control. PartOf is not treated as health monitoring.
+All roles use private roots, closure mounts, NNP, strict system/home/kernel/
+clock/hostname/control-group protection, private devices/mounts/tmp/IPC,
+ProtectProc=invisible, private keyring, RemoveIPC, native ABI and EPERM syscall
+errors. All deny namespace creation/entry and @privileged/@resources within
+@system-service; no setns or credential-drop syscall exception remains.
 
-Only host control writes/removes the veth, RA files and allocation/DNS
-publication directory. Only the observer owns its telemetry directory.
-Consumers bind producer directories read-only, without redeclaring their
-RuntimeDirectory. No gateway/proxy can forge either producer's record.
-Both producers use atomic replacement; no record is sourced as shell.
+The common controls below are applied to each service template and its
+instances; role-specific exceptions are explicit rather than inherited as a
+larger shared privilege set:
 
-Planned DAC/mount contract: the anchor publication directory is root-owned
-0755 with 0644 non-secret generation records, separate from its 0700 root/runtime
-tree. Host-control publication uses the existing per-index
-`/run/hermes-agent-network-N` directory, root-owned 0755 with 0644 allocation,
-resolver/config and authorization records. The unique per-instance observer UID
-owns `/run/hermes-network-observer-N`, mode 0755, with 0644 telemetry records.
-These contain network metadata, never credentials or resolver authentication
-material. Consumers get same-path read-only DIRECTORY binds to survive atomic
-replacement, not writable managed-directory declarations or file-bind snapshots.
-Only the gateway resolv.conf intentionally remains a per-start file snapshot.
-Public readiness reads controller publication; host control reads observer
-publication; proxies read only controller config; gateway reads only resolv.conf.
-No consumer can traverse producer private roots. Prove DAC reads with each real
-dynamic identity and deny producer writes, including from gateway/proxy UIDs.
-Producer runtime removal ends record lifetime; recovery must use a new anchor
-and invocation generation, never adopt a stale file left by a failed start.
+| Role | Namespace / identity controls | Capabilities, syscall and address-family boundary | Data/device exception and reason |
+|---|---|---|---|
+| Anchor | Root UID; PrivateNetwork creates the namespace; no PrivateUsers/PIDs | Empty caps; AF_UNIX only; deny namespace syscalls | Owns only its runtime root/publication directory; no manager or host network mounts. Root UID is needed for validated proc namespace-FD access, not to retain capabilities. |
+| Host controller | Root UID; NetworkNamespacePath selects host netns; no PrivateUsers/PIDs | NET_ADMIN bounding only, no ambient caps; AF_NETLINK/AF_UNIX; no SYS_ADMIN/SYS_PTRACE | Writable `/run/systemd/network`, RO D-Bus and networkd Varlink sockets, instance publication. This is trusted host control because manager API authority cannot be made read-only. |
+| Failure reaper | Root UID for manager authorization; no capabilities | Empty caps; AF_UNIX only; no network namespace control | Own root/closure and RO system D-Bus socket only; systemd unit OnFailure schedules it after the controller cleanup. It requests an asynchronous anchor stop and does not wait on its own job. |
+| Local setup | Per-instance DynamicUser; joins anchor netns; no PrivateUsers/PIDs | NET_ADMIN bounding+ambient for local `ip` link/loopback configuration; AF_NETLINK/AF_UNIX | Private root and own process only; no manager, resolver, host filesystem or device exception. |
+| DHCP | Per-instance DynamicUser; joins local namespace; no PrivateUsers/PIDs | NET_ADMIN/NET_BIND_SERVICE/NET_RAW bounding+ambient for packaged dhcpcd client operations; AF_INET/AF_INET6/AF_NETLINK/AF_PACKET/AF_UNIX | Private runtime plus the owner-approved per-instance persistent client state; no host `/run` or `/var` bind. DHCP server leases remain runtime-only. |
+| Network observer | Per-instance DynamicUser; joins anchor netns; no PrivateUsers/PIDs | Empty caps; AF_NETLINK only | Writes its own generation-scoped telemetry; no manager, networkd write, gateway or proxy write path. |
+| DNS | Per-instance DynamicUser; NetworkNamespacePath selects host netns; no PrivateUsers/PIDs | NET_BIND_SERVICE bounding+ambient only; AF_INET/AF_INET6/AF_NETLINK | Reads the single host-resolver snapshot and binds only allocated host-veth addresses; no manager or host-network administration. |
+| Host proxy | Per-instance DynamicUser; NetworkNamespacePath selects host netns; no PrivateUsers/PIDs | Empty caps unless a configured low host port requires NET_BIND_SERVICE; AF_INET | Existing mappings bind only host `127.0.0.1`; child supervisor owns only its required children. No manager or host runtime write path. |
+| Agent relay | Per-instance DynamicUser; joins anchor netns; no PrivateUsers/PIDs | Empty caps unless a configured low agent port requires NET_BIND_SERVICE; AF_INET | Existing relay targets the same agent namespace's loopback. No manager, resolver or host runtime write path. |
+| Readiness | Per-instance DynamicUser; joins anchor netns; no PrivateUsers/PIDs | Empty caps; AF_UNIX only for its own notify socket | Reads generation-scoped authorization; no manager, nftables, resolver, networkd or producer write access. |
+| Public-state fixer | DynamicUser with only the existing `hermes-shared` group; PrivateUsers=identity | DAC_READ_SEARCH/FOWNER bounding+ambient for ACL repair; no usable socket family (explicit socket syscall denial) | Only existing gateway-state bind; no StateDirectory ownership of gateway state. This preserves ACL behavior without importing host `/etc/group`. |
+| Gateway | DynamicUser; joins its agent namespace; PrivateUsers=identity | Empty caps; AF_INET/AF_INET6/AF_UNIX | Existing gateway state, CA bundle and explicit `/dev/kvm` exception only; MDWE is not imposed because JIT/FFI/ONNX/Headroom compatibility is unproven. |
 
-Telemetry DbC, version 1: a bounded JSON object containing the anchor
-generation, namespace inode, interface name/index/MAC, boottime timestamp,
-usable IPv4/IPv6 addresses with prefix lengths, and required default
-routes. Accept exactly the known fields/types, bounded arrays and input
-size (64 KiB), valid canonical addresses, matching interface/MAC/generation and
-non-future fresh timestamps; reject duplicate JSON object keys as well as
-duplicate array entries, invalid address states,
-missing routes, stale/malformed records or dead producer. Keep the current
-address-set equality, overlap checks, exact policy hash and nft readback.
-The freshness/detection budget must fit existing runtime loss assertions;
-do not silently extend their timeouts to make this split pass.
-
-Planned authorization DbC, version 1: at most 4 KiB, exactly version,
-anchor InvocationID/PID/start-time/namespace-inode, controller InvocationID,
-observer InvocationID, allocation/config digest, policy digest, observed
-boottime-nanoseconds, and `authorized=true`. Digests are lowercase SHA256 and
-InvocationIDs are lowercase 32-hex strings; PIDs/start-times/inodes/timestamps
-are positive integers, not booleans or floats. Reject unknown/missing fields,
-duplicate keys, unsupported versions, malformed bounds/types, wrong generation,
-changed producer identity, stale/future timestamps and a dead/non-active producer.
-No permissive parser or shell evaluation is allowed. Observer publishes every
-0.5 seconds; host validation ticks at most once per second and accepts telemetry
-only within two seconds of CLOCK_BOOTTIME. Authorization is refreshed only after
-a complete successful validation tick; readiness revalidates at most every
-0.1 seconds and rejects authorization older than two seconds. These are proposed
-validation budgets, not a measured loss guarantee or permission to raise the
-existing ten-second runtime loss assertions. Parser negative cases and real
-end-to-end revocation timing must pass before this contract is accepted.
-
-Any required process/child loss invalidates authorization. Proxy group
-supervisors fail if any required child exits. Host control ExecStopPost
-must revoke even after SIGKILL/failed start: if set flushing fails, bring
-the owned host link down before deletion and report the failure. It stops
-all consumers and the anchor before recovery; no old namespace reference
-or record may survive into a new generation. Explicit public recovery
-remains required; do not add automatic restart semantics.
-
-Required review/tests: namespace FD access with NET_ADMIN but no
-SYS_ADMIN/SYS_PTRACE; graph ordering and every stop/failure path; observer
-parser negative tests; every internal main/child kill and stale generation;
-private mounts/closure/hooks per role; zero-capability DNS/proxy startup
-except demonstrated bind privilege; existing firewall/DAD/DHCP/DNS/state
-matrix and ordinary activation/rollback. No final topology acceptance,
-enforcement proof or startup-NFR waiver is claimed by this proposal.
-
-### Current pre-split candidate settings
-
-All five services keep `NoNewPrivileges=yes`, `ProtectSystem=strict`,
-`ProtectHome=yes`, `ProtectProc=invisible`, private temporary files, private
-devices/network/mount namespaces, private keyring, `RemoveIPC=yes`, native
-syscall architecture, `SystemCallErrorNumber=EPERM`, and the syscall
-allowlist/denylist below. `ProtectClock`, `ProtectHostname=private`,
-`ProtectKernelLogs`, `ProtectKernelModules`, `ProtectKernelTunables`, and
-`ProtectControlGroups=strict` are enabled per role. `MountAPIVFS=yes` is
-retained for the private roots. `MemoryKSM=true` was removed from all roles:
-these services are separate security domains, and cross-domain page merging is
-not accepted as an implicit optimization.
-
-| Control | G | PF | N | D | R |
-|---|---|---|---|---|---|
-| `PrivateTmp`, `PrivateDevices`, `PrivateNetwork`, `PrivateIPC`, `PrivateMounts` | enabled | enabled | enabled | enabled | enabled |
-| `PrivatePIDs` | off: gateway child lifecycle and process visibility compatibility are unproven | off: no tested need; avoid changing monitor semantics | off: `/proc/1/ns/net` and host PID targeting are required | off: preserve packaged client lifecycle; no test justifies a PID namespace | off: host PID namespace operations are required |
-| `PrivateUsers` | `identity`: preserve existing dynamic identity boundary | `identity`: preserve existing dynamic identity boundary | off: host network namespace and host capabilities must remain effective | off: ambient network capabilities must apply to the joined network namespace | off: same host namespace/capability requirement as setup |
-| `PrivateBPF` | off: no bpffs use; not a packet firewall | same | same | same | same |
-| `ProtectSystem`, `ProtectHome`, `ProtectProc` | strict / yes / invisible | strict / yes / invisible | strict / yes / invisible | strict / yes / invisible | strict / yes / invisible |
-| `ProtectClock`, `ProtectHostname`, kernel logs/modules/tunables, control groups | enabled | enabled | enabled | enabled | enabled |
-| `ProcSubset` | not set: gateway/ONNX compatibility; `/proc/cpuinfo` remains read-only | `pid` | `pid` while retaining `/proc/1/ns/net` | `pid`; DHCP renewal is the runtime compatibility check | `pid` while retaining `/proc/1/ns/net` |
-| Address families | `INET`, `INET6`, `UNIX` | `UNIX` only | `INET`, `INET6`, `NETLINK`, `UNIX` | `INET`, `INET6`, `NETLINK`, `PACKET`, `UNIX` | `INET`, `INET6`, `NETLINK`, `UNIX` |
-| `RestrictNamespaces` | true (deny all) | true (deny all) | `net` only; setup must join host netns | true (deny all) | `net` only; it enters the host netns |
-| `RestrictRealtime` | true | true | true | true | true |
-| `RestrictSUIDSGID` | true | true | true | true | true |
-| `SystemCallFilter` | `@system-service`, deny `@resources` and `@privileged` | same | same plus explicit `setns`, `setuid`, `setgid`, `setgroups`, `setresuid`, `setresgid` | `@system-service`, deny `@resources` and `@privileged` | same explicit namespace/credential-drop exceptions as setup |
-| Device cgroup | `DevicePolicy=closed`, only `/dev/kvm rw` allowed | `DevicePolicy=closed` | `DevicePolicy=closed` | `DevicePolicy=closed` | `DevicePolicy=closed` |
-| Capabilities | bounding and ambient sets empty | bounding/ambient `DAC_READ_SEARCH`, `FOWNER` | `NET_ADMIN`, `SETGID`, `SETUID`, `SYS_ADMIN`, `SYS_PTRACE`; ambient empty | `NET_ADMIN`, `NET_BIND_SERVICE`, `NET_RAW`; ambient equals bounding set | setup set plus `NET_BIND_SERVICE`; ambient empty |
-| `MemoryDenyWriteExecute` | off: Hermes/Headroom JIT/FFI/ONNX compatibility not established | on | on | on | on |
-| Keyring, `RemoveIPC`, umask | private / yes / `0007` | private / yes / `0077` | private / yes / `0077` | private / yes / `0077` | private / yes / `0077` |
-
-The pre-split helpers still use `setns()` and credential-drop syscalls; removing
-these remains required by the approved split. `RestrictSUIDSGID` prevents
-setting filesystem SUID/SGID bits, NOT credential transitions. Earlier
-task-thread rationale claiming the opposite was incorrect; no role has a
-demonstrated filesystem-mode exception. Capability and syscall controls govern
-credential transitions separately. Final generated syscall ordering/enforcement
-still requires proof; the partial candidate is not accepted because it lists
-exceptions.
-
-`ProtectProc=invisible` is defense in depth, not a claim that root or
-`CAP_SYS_PTRACE` cannot inspect host processes. Root-directory + narrow
-bind/socket access and operation tests are the boundary evidence. Dynamic users
-are used for gateway, public-state fixer, and DHCP; setup/readiness remain root
-because they mutate host networking/firewall and control host systemd/networkd
-through privileged interfaces.
-
-## Reviewed but not enabled / resource controls
-
-These are deliberately not omitted by accident. Reasons apply to all five roles
-unless a role-specific distinction is stated.
-
-| Option family | Decision and reason |
+| Control | Enabled/retained/rejected rationale |
 |---|---|
-| `RestrictFileSystems` | not enabled: depends on BPF-LSM availability; a fixed filesystem allowlist would reject the VM's required 9p Nix store. No filesystem-control proof is claimed. |
-| `IPAddressAllow` / `IPAddressDeny` | not enabled: address-only cgroup filters do not encode current nftables protocol/port rules, can be ineffective on unsupported kernels, and must not replace authoritative nftables. |
-| `SocketBindAllow` / `SocketBindDeny` | not enabled: not a substitute for destination/protocol/port nftables policy; setup/readiness create dynamic sockets and DHCP needs raw/packet sockets. |
-| `RestrictNetworkInterfaces` | not enabled: setup/readiness cross host and agent network namespaces and move a veth peer; an interface-name list could silently break that lifecycle. |
-| `PrivateBPF`, custom BPF programs/delegation | no custom BPF. `DevicePolicy`/`DeviceAllow` provide supported device filtering; `PrivateBPF` only isolates bpffs and is not network filtering. No BPF delegation. |
-| `SystemCallLog` | not configured: denied calls return `EPERM`; logging all denied syscall attempts is noisy and has no bounded diagnostic consumer. |
-| `RootImage`, `RootEphemeral`, root-image verification/integrity/encryption | not selected: individual store-path bindings plus ephemeral runtime roots meet the contract without building and maintaining images. These are alternatives, not requirements. |
-| LSM labels/profiles | not added: no per-service AppArmor/SELinux profile exists in the repository; introducing host policy is a separate deployment/compatibility decision. |
-| CPU weights/quotas/affinity, memory high/max/swap/zswap limits, OOM score/policy, task limits, IO weights/limits | no explicit hard limits: no workload measurements or owner-approved availability envelope. Arbitrary limits can make gateway startup, DHCP renewal, ACL maintenance, or recovery fail. |
-| CPU/memory/IO/IP accounting and PSI thresholds | not enabled: no monitoring consumer or operational threshold is defined. No accounting/pressure claim is made. |
-| cgroup delegation/subgroup | disabled/default false; no service manages child cgroups. `DelegateNamespaces=false` remains explicit for gateway/fixer. |
-| `MemoryKSM` | disabled for every role due isolated security domains. |
+| PrivateTmp, PrivateDevices, PrivateNetwork, PrivateIPC, PrivateMounts | Enabled per role. Host roles still have PrivateNetwork but NetworkNamespacePath selects host; only private consumers join anchor. No host role reciprocally joins private anchor. |
+| PrivatePIDs | Not enabled: anchor PID/start/namespace-FD validation uses host PID identity; no final compatibility proof for isolated PID trees in other roles. |
+| PrivateUsers | Retain identity for gateway/fixer. Off for anchor/controller/local/DHCP: proc access and capabilities must apply in the network namespace's owning userns. New dynamic payloads have no host-admin capability; no extra userns claim is made. |
+| PrivateBPF | Off: bpffs isolation is not packet filtering; no role needs bpffs/custom BPF or delegation. |
+| ProtectSystem/Home/Proc | strict/yes/invisible. Explicit state/device/runtime binds are exceptions. Root and manager access are not sandboxed adversarially by these switches. |
+| ProtectClock/Hostname/KernelTunables/KernelModules/KernelLogs/ControlGroups | Enabled; hostname private, cgroups strict; no writer/delegation needed. |
+| MountAPIVFS/ProcSubset | APIVFS enabled. pid subset for helpers; gateway keeps CPU/ONNX proc data for compatibility. |
+| RestrictAddressFamilies | Gateway INET/INET6/UNIX; fixer [] plus explicit ~socket syscall denial; anchor UNIX; local NETLINK/UNIX; controller INET/INET6/NETLINK/UNIX; DHCP INET/INET6/NETLINK/PACKET/UNIX; observer NETLINK; DNS INET/INET6/NETLINK; host proxy and agent relay INET; readiness UNIX for its own notify. Payload default [] is overridden explicitly for every concrete role, not treated as deny-all. |
+| RestrictNamespaces/Realtime/SUIDSGID | Enabled. SUIDSGID denies filesystem mode creation, NOT setuid/setgid; earlier thread rationale was wrong. Manager constructs namespaces before payload restrictions. |
+| SystemCallFilter/Architectures/ErrorNumber/Log | @system-service minus @resources/@privileged; native ABI; EPERM. No universal syscall logging without a bounded consumer. Actual-unit probes, not nsenter, must verify enforcement. |
+| Capabilities/ambient | Per-role table above. Explicit empty strings are required where empty Nix lists omit the systemd directive. Never infer zero root capabilities from a missing directive. |
+| NNP/personality/MDWE | NNP and locked personality everywhere. MDWE on simple helpers; not imposed on gateway because Headroom/JIT/FFI/ONNX compatibility is unproven. |
+| KSM/keyring/IPC/umask | Cross-domain MemoryKSM removed. Private keyring, RemoveIPC, helper umask0077, gateway0007 retained. |
+| DevicePolicy/DeviceAllow | closed cgroup policy; gateway alone allows /dev/kvm rw. Representative real-unit device denial and KVM positive control required. |
+| RestrictFileSystems | Not enabled: BPF-LSM support/effectiveness not proven; hard-coded ext4 would break required 9p VM store. |
+| IPAddressAllow/Deny, bind/interface filters | Not authoritative: cannot encode existing protocol/port destination policy, optional kernel support and moved interfaces need operational proof. nftables remains authoritative. No silently optional BPF replacement. |
+| CPU/affinity, memory/swap/zswap/OOM, tasks, IO limits | No arbitrary quota/affinity/OOM changes without measured workload/availability requirements. Defaults remain; not an isolation guarantee. |
+| CPU/memory/IO/IP accounting, PSI/pressure | No new thresholds/consumer specified; no new effectiveness claim. |
+| cgroup/namespace/BPF delegation | No delegated child cgroups, namespaces or BPF. Gateway/fixer explicit DelegateNamespaces=false retained. |
+| RootImage/RootEphemeral/image integrity/encryption/LSM | Alternatives, not new infrastructure requirements. No maintained per-service AppArmor/SELinux policy or image pipeline exists. Individual roots/closures are the selected mechanism. |
 
-Device filtering is separate from protocol/port network filtering. No custom BPF
-program or optional kernel feature is treated as authoritative. The host
-nftables guard and verified address sets remain the source of network policy.
+## Declarative networkd and DNS
 
-## NixOS networkd and DNS decisions
+Replace handwritten environment.etc network files/manual upstream activation
+with systemd.network.networks using identical `40-hermes-agent-N` keys:
+Name=haN, Kind=veth, RequiredForOnline=no, Address=[0.0.0.0/30,::/64], DHCPServer,
+IPv4Forwarding, IPv6Forwarding, IPv6SendRA, runtime server leases, PoolOffset=2,
+PoolSize=1. `Router=` is omitted: systemd 261 rejects the legacy
+`_server_address` token and uses the DHCP server interface address by default.
+Pinned NixOS emits .network sources into
+reloadTriggers and sets stopIfChanged=false. Enable systemd.network only for
+active agents. In the pinned switch-to-configuration-ng implementation, removing
+the last `X-Reload-Triggers` key is ignored by its unit comparator; a stable,
+content-addressed membership trigger over Hermes' generated network sources is
+therefore appended while agents are active. Addition, content change, and removal
+all change that still-present trigger. Runtime RA drop-ins remain outside NixOS
+and still require the helper's explicit reload/reconfigure.
 
-The handwritten `environment.etc` `.network` file and manual networkd/socket
-activation are replaced by `systemd.network.networks."40-hermes-agent-N"`. The
-key, match (`Name=haN`, `Kind=veth`), `RequiredForOnline=no`, `/30` and `/64`
-addresses, DHCP server, IPv4/IPv6 forwarding, RA, runtime lease, pool
-offset/size, and router semantics remain the same. The pinned NixOS
-`networkd.nix` emits generated `.network` sources into
-`systemd-networkd.reloadTriggers`; its service is wanted by `multi-user.target`
-and has `stopIfChanged=false`. Runtime RA drop-ins are generated under `/run`
-and are still explicitly reloaded/reconfigured by the trusted helper because
-they are not Nix-generated sources.
+Do not change networking.useNetworkd, host dhcpcd/NM uplink ownership or explicit
+wait-online policy. Weak defaults avoid introducing a second uplink wait gate
+or new resolved owner when Hermes alone enables networkd. Narrow ha* exclusions
+preserve coexistence; the generic Nixpkgs warning is not suppressed by taking
+over uplinks. First/change/removal/rollback with networkd already running must
+be exercised using ordinary activation, not manual reload or trigger eval alone.
 
-`systemd.network.enable` is set only when the module has active agents. The
-networkd wait-online integration is disabled with a weak default only when this
-module activates networkd while `networking.useNetworkd=false`; explicit host
-policy wins, and hosts using networkd retain their explicit wait-online policy.
-On hosts not managed by networkd, the Hermes `ha*` interfaces are the only added
-networkd matches; host `networking.useDHCP`, dhcpcd, NetworkManager, and
-unrelated uplinks remain host-owned. `networking.dhcpcd.denyInterfaces` and
-NetworkManager's `interface-name:ha*` exclusion prevent overlap on Hermes veths.
-Nixpkgs emits a generic `systemd.network.enable` + `networking.useDHCP` warning
-in this coexistence case; do not silence it by changing host uplink ownership.
+Agents still get only allocated host-veth proxy resolvers, never public/LAN
+fallbacks. Test the COMPLETE nameserver list in the actual gateway root/mount/
+network context. Controlled A/AAAA getaddrinfo as real UID/GID with CapEff=0,
+normal resolver path, single host-resolver case, host positive and unavailable-
+host negative controls, restoration on every exit and both-agent post-restart
+repetition are required. Preserve UDP/TCP DNS and separate real Internet DNS/
+certificate-verified HTTPS. A legitimate host external upstream is not an agent
+fallback. No resolver watcher or new DNS architecture is introduced.
 
-NixOS networkd can default-enable systemd-resolved. When Hermes alone enables
-networkd on a host with `networking.useNetworkd=false`, the module weakly
-preserves the prior no-resolved default; explicit host
-`services.resolved.enable` decisions take precedence. No new DNS owner is
-introduced.
+## Evidence, rollout and rollback
 
-The DNS design is unchanged: the agent gets only allocated host-veth proxy
-nameservers; the host resolver remains the upstream owner. The VM regression
-inspects the complete `nameserver` list from `/proc/$PID/root/etc/resolv.conf`,
-verifies host-controlled A and AAAA lookups through normal `getaddrinfo()` as
-the agent UID/GID with `CapEff=0`, then repeats with one host resolver only. It
-blocks both UDP/TCP DNS to that host endpoint and requires lookup failure,
-restoring the resolver file and nft rules via an exit trap. This runs for both
-agents and is repeated at existing post-restart probes. Existing UDP/TCP proxy
-checks and the separate real-Internet DNS + certificate-verified HTTPS test
-remain required. Public DNS/TLS failures remain failures; controlled `.test`
-endpoints do not prove Internet reachability.
+Trace: owner/task contracts -> ADR boundaries/DbC -> hermes.nix service and
+record contracts -> flake config/syntax/negative-parser checks -> maintained
+VM startup, DNS, state, failure, enforcement and activation scenarios. Sources:
+systemd 261 systemd.exec and systemd.resource-control; systemd v261
+load-fragment/verbs/bus-util/sd_booted sources; pinned Nixpkgs networkd module;
+iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 
-## Quality scenarios, rollout, and rollback
+Current evidence is partial. Config checks compile generated scripts and run
+record positives/negative cases. A full offline guest confirmed the direct
+systemd D-Bus manager polling now proceeds past startup, then exposed two
+networkd runtime defects: the old `Router=_server_address` was rejected by
+systemd 261, and `UMask=0077` reduced the dynamically created RA drop-in
+directory to 0700 so networkd could not traverse it. The candidate omits the
+invalid Router key (the documented default is the server address) and explicitly
+sets the drop-in directory mode to 0755; these fixes still need a fresh guest
+run. Earlier independent targeted guests proved
+zero-cap anchors, NET_ADMIN controllers/local setup and actual local-unit
+seccomp/family/namespace enforcement, DHCP lifecycle and one controller-SIGKILL
+edge. They did NOT prove full final acceptance. Recent full split guests reached
+DNS and readiness, then failed closed on authorization freshness; no successful
+final runtime or clean shutdown is claimed yet. Historical missing NSS/manager/
+DHCP failures are not descriptions of current role requirements. Bounded
+verbatim final-candidate execution, commands/statuses/closure identities must be
+attached durably; inaccessible scratch paths are not review evidence.
 
-- Startup: each gateway remains blocked until DHCP, SLAAC, firewall readback,
-  resolver publication, and DNS listeners are ready; loss still revokes the sets
-  and stops the gateway.
-- Compatibility: all five families and both VM instances must retain their root,
-  individual Nix closure, effective hooks, identities, device policy,
-  capabilities, and lifecycle behavior. Existing user/shared state and gateway
-  state are not migrated or deleted.
-- Network activation: first enable, changed `.network`, removal, and rollback
-  must use ordinary NixOS activation with networkd already running, no operator
-  manual reload, and unrelated uplink unchanged. Static source/reload-trigger
-  evaluation is necessary but not runtime-switch proof.
-- Rollback: switch to the previous NixOS generation; verify dynamic
-  addresses/routes, runtime RA drop-ins, DNS listeners, service roots, and state
-  sentinels. Runtime directories are service-owned ephemeral state; persistent
-  gateway state remains unchanged.
-- NFR: the existing startup timing target is still not met and remains
-  informational; this ADR does not create a waiver. Bootloader updates, reboot
-  behavior, and public IPv6 reachability remain unproven unless separately
-  tested.
-
-## Traceability and evidence
-
-Trace: task `t_6010650d` and parent investigation comment 234 → this ADR →
-`modules/services/agent/hermes.nix` templates/closures and `systemd.network`
-declarations → `flake.nix` evaluation assertions → `nixos/hermes-module-vm.nix`
-runtime scenarios. No formal SDD is claimed. Sources: systemd 261
-`systemd.exec(5)` and `systemd.resource-control(5)`; pinned Nixpkgs
-`nixos/modules/system/boot/networkd.nix` (network emission and reload trigger
-logic); packaged dhcpcd 10.3.2 binary/source runtime paths.
-
-Evidence status: this remains an incomplete pre-split candidate. Config
-evaluation and offline/Internet VM builds succeeded; image construction is not
-runtime or Internet evidence. Earlier full guest runs failed on missing
-manager/NSS inputs and DHCP paths. The chroot-aware manager
-override/socket/group fixes are present; no final whole-matrix success is
-claimed.
-
-The DHCP layout was exercised with actual production template controls in fresh
-disposable guests. The targeted fixture suppresses gateway/fixer autostart to
-isolate this boundary, uses the real network setup and both DHCP instances, and
-replaces only the outer smoke runner. It checks symlink target identity,
-actual-client-UID write access, `/30` acquisition, matching PID file, rebind,
-stop/start, runtime removal and persistent sentinel retention. These
-namespace-entered filesystem/control checks do not prove the client's
-cgroup/seccomp enforcement; `/proc` capability evidence is from the actual
-client.
-
-The removal matrix ran three guests: no ReadWritePaths + private mode-1777 tmpfs
-passed all four instance/round checks with guest exit 0 and QEMU exit 0.
-Removing tmpfs failed both links with ENOENT. Keeping tmpfs at default 0755
-failed both links with EACCES. Both negative guest probes exited 2 while QEMU
-exited 0; QEMU status alone is not acceptance. Distinct actual client UIDs were
-61470/63371 and effective capabilities were 0x3400 (NET_BIND_SERVICE, NET_ADMIN,
-NET_RAW). State was a writable per-instance idmapped mount; `/var/run` was a
-separate private tmpfs. The native runtime alias alone was also tested with
-direct dhcpcd and no diagnostic pre-start: `/var/run/dhcpcd` was missing for
-both clients. The host `/var/run` alias is not inherited.
-
-The latest full pre-split offline run still failed before either gateway
-started, although both DHCP clients acquired leases and the readiness
-delay hook passed. Its journal reports dnsmasq startup failure, a loopback
-relay bind failure on port 9119, and in-root systemctl rejecting the system
-manager connection as "System has not been booted with systemd as init
-system (PID 1)". A socket bind alone does not make manager clients work in
-this root. Those proxy/manager contracts must be resolved and tested in the
-split; this run is a failure, not whole-task acceptance. Shutdown stalled
-unmounting `/nix/store`; the runner was terminated after retaining output.
-
-Outstanding: implement and independently review the concrete privilege split;
-prove namespace FD access and telemetry/loss contracts, final roots/closures and
-enforcement, full offline/Internet regressions, default-on features, ordinary
-networkd generation switching/rollback, and startup timing. The broad
-config-check conjunction still needs named diagnostics before expanding split
-assertions. No final acceptance, risk waiver, deployment or release
-authorization. The host execution sandbox has no usable system manager;
-host-side security scoring is not runtime evidence.
+Rollout is local-only and requires independent review. Ordinary generation
+activation/rollback must preserve both state sentinels, persistent DHCP state,
+unrelated uplink and host firewall ownership while removing new runtime residue.
+Do not delete state to make rollback tests pass. Bootloader/reboot/public-IPv6
+and startup-NFR limitations remain explicit, not waived by this ADR. The host
+agent sandbox has no usable PID1/system bus; instantiated security/verify and
+actual cgroup/seccomp/device proofs belong in disposable guests. QEMU exit0
+after forced termination or a /nix/store unmount stall is not clean shutdown.

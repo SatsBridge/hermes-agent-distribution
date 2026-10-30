@@ -51,6 +51,19 @@
           })
         ];
       };
+      defaultOnRuntimeVm = internetEnabledVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            services.hermes-specialised-agent = {
+              installDefaultSkills = lib.mkForce true;
+              agents.vm.headroomEnable = lib.mkForce true;
+            };
+
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_DEFAULT_ON_TEST =
+              lib.mkForce "1";
+          })
+        ];
+      };
       explicitDashboardProbe = hermesModuleVm.extendModules {
         modules = [
           {
@@ -95,14 +108,148 @@
           })
         ];
       };
-      hermesModuleVmGatewayStart =
-        hermesModuleVm.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
-      defaultOnGatewayStart = defaultOnProbe.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
+      networkdIdleNetworks = removeAttrs internetEnabledVm.config.systemd.network.networks [
+        "40-hermes-agent-0"
+        "40-hermes-agent-1"
+      ];
+      networkdIdleVm = internetEnabledVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            systemd.services =
+              builtins.listToAttrs (
+                map
+                  (name: {
+                    inherit name;
+                    value = {
+                      enable = lib.mkForce false;
+                      wantedBy = lib.mkForce [ ];
+                      requiredBy = lib.mkForce [ ];
+                      upheldBy = lib.mkForce [ ];
+                    };
+                  })
+                  (
+                    builtins.filter (name: builtins.hasAttr name hermesModuleVm.config.systemd.services) (
+                      nixpkgs-unstable.lib.concatMap
+                        (
+                          role:
+                          map (instance: "${role}@${instance}") [
+                            "vm"
+                            "vm-peer"
+                          ]
+                        )
+                        [
+                          "hermes"
+                          "hermes-pf"
+                          "hermes-network"
+                          "hermes-dhcp"
+                          "hermes-network-ready"
+                          "hermes-netns"
+                          "hermes-host-control"
+                          "hermes-network-failure"
+                          "hermes-network-observer"
+                          "hermes-dns"
+                          "hermes-host-proxy"
+                          "hermes-agent-relay"
+                        ]
+                    )
+                  )
+              )
+              // {
+                hermes-module-vm-agent-smoke = {
+                  enable = lib.mkForce false;
+                  wantedBy = lib.mkForce [ ];
+                  requiredBy = lib.mkForce [ ];
+                  upheldBy = lib.mkForce [ ];
+                };
+                hermes-vm-generation-rollback-launcher = {
+                  enable = lib.mkForce false;
+                  wantedBy = lib.mkForce [ ];
+                  requiredBy = lib.mkForce [ ];
+                  upheldBy = lib.mkForce [ ];
+                };
+              };
+            systemd.network.networks = lib.mkForce networkdIdleNetworks;
+          })
+        ];
+      };
+      networkdChangedVm = internetEnabledVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            systemd = {
+              network.networks."40-hermes-agent-0".extraConfig = "# Hermes networkd activation change probe";
+              services = {
+                hermes-module-vm-agent-smoke = {
+                  enable = lib.mkForce false;
+                  wantedBy = lib.mkForce [ ];
+                  requiredBy = lib.mkForce [ ];
+                  upheldBy = lib.mkForce [ ];
+                };
+                hermes-vm-generation-rollback-launcher = {
+                  enable = lib.mkForce false;
+                  wantedBy = lib.mkForce [ ];
+                  requiredBy = lib.mkForce [ ];
+                  upheldBy = lib.mkForce [ ];
+                };
+              };
+            };
+          })
+        ];
+      };
+      networkdActivationVm = internetEnabledVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            systemd.services = {
+              hermes-module-vm-agent-smoke = {
+                enable = lib.mkForce false;
+                wantedBy = lib.mkForce [ ];
+                requiredBy = lib.mkForce [ ];
+                upheldBy = lib.mkForce [ ];
+              };
+              hermes-vm-generation-rollback-launcher = {
+                wantedBy = [ "multi-user.target" ];
+                environment.HERMES_VM_PREVIOUS_SYSTEM = lib.mkForce networkdIdleVm.config.system.build.toplevel;
+                environment.HERMES_VM_UPDATED_SYSTEM = lib.mkForce networkdChangedVm.config.system.build.toplevel;
+              };
+            };
+          })
+        ];
+      };
+      hermesModuleVmGatewayStart = builtins.elemAt (nixpkgs.lib.splitString " "
+        hermesModuleVm.config.systemd.services."hermes@vm".serviceConfig.ExecStart
+      ) 3;
+      defaultOnGatewayCommand =
+        defaultOnProbe.config.systemd.services."hermes@vm".serviceConfig.ExecStart;
+      defaultOnGatewayStart = builtins.elemAt (nixpkgs.lib.splitString " " defaultOnGatewayCommand) 3;
+      defaultOnGatewaySettings = builtins.fromJSON (
+        builtins.unsafeDiscardStringContext (
+          builtins.readFile (nixpkgs.lib.last (nixpkgs.lib.splitString " " defaultOnGatewayCommand))
+        )
+      );
       hermesModuleVmConfigCheck =
         nixpkgs-unstable.legacyPackages.x86_64-linux.runCommand "hermes-module-vm-config-check" { }
           ''
             test ${toString hermesModuleVm.config.virtualisation.memorySize} -le 2048
             test ${toString hermesModuleVm.config.virtualisation.diskSize} -le 1024
+            ${hermesModuleVm.config.systemd.services.hermes-vm-network-record-tests.serviceConfig.ExecStart}
+            ${hermesModuleVm.pkgs.python3}/bin/python3 -I -B ${./nixos/tests/hermes-runtime/contracts.py} ${./modules/services/agent/hermes-runtime} ${hermesModuleVm.pkgs.coreutils}/bin/chown
+            ${hermesModuleVm.pkgs.python3}/bin/python3 -c 'import pathlib,sys; [compile(pathlib.Path(p).read_text(),p,"exec") for p in sys.argv[1:]]; print("Generated network Python syntax: PASS")' ${
+              nixpkgs-unstable.lib.escapeShellArgs (
+                nixpkgs-unstable.lib.unique (
+                  builtins.filter (path: nixpkgs-unstable.lib.hasSuffix ".py" path) (
+                    nixpkgs-unstable.lib.concatMap
+                      (role: hermesModuleVm.config.systemd.services."hermes-${role}@vm".serviceConfig.BindReadOnlyPaths)
+                      [
+                        "host-control"
+                        "network-observer"
+                        "dns"
+                        "host-proxy"
+                        "agent-relay"
+                        "network-ready"
+                      ]
+                  )
+                )
+              )
+            }
             test ${if hermesModuleVm.config.virtualisation.useNixStoreImage then "false" else "true"} = true
             test ${
               if builtins.hasAttr "nix-store" hermesModuleVm.config.virtualisation.sharedDirectories then
@@ -150,6 +297,16 @@
                   hermesModuleVm.config.environment.etc."systemd/network/40-hermes-agent-0.network".source;
                 hostNetworkConfig = builtins.readFile hostNetworkSource;
                 networkdReloadTriggers = hermesModuleVm.config.systemd.services.systemd-networkd.reloadTriggers;
+                idleNetworkdReloadTriggers = networkdIdleVm.config.systemd.services.systemd-networkd.reloadTriggers;
+                changedHostNetworkSource =
+                  networkdChangedVm.config.environment.etc."systemd/network/40-hermes-agent-0.network".source;
+                changedNetworkdReloadTriggers =
+                  networkdChangedVm.config.systemd.services.systemd-networkd.reloadTriggers;
+                networkdConfigSetTriggers =
+                  triggers:
+                  builtins.filter (
+                    source: nixpkgs-unstable.lib.hasSuffix "-hermes-networkd-config-set" source
+                  ) triggers;
                 guardConfig = hermesModuleVm.config.networking.nftables.tables."hermes-agent-guard".content;
                 hasMnemosyne = value: nixpkgs-unstable.lib.hasInfix "mnemosyne" value;
                 hasMnemosyneEnvironment =
@@ -174,10 +331,12 @@
                     nixpkgs-unstable.lib.take 4 (nixpkgs-unstable.lib.splitString "/" source)
                   );
                 hasStoreRoot = executable: binds: builtins.elem (storeRoot executable) (map storeRoot binds);
-                networkSetup = builtins.head (
-                  nixpkgs-unstable.lib.splitString " " units."hermes-network@vm".serviceConfig.ExecStart
-                );
-                gatewayStart = units."hermes@vm".serviceConfig.ExecStart;
+                networkSetup = builtins.elemAt (nixpkgs-unstable.lib.splitString " "
+                  units."hermes-network@vm".serviceConfig.ExecStart
+                ) 3;
+                gatewayStart = builtins.elemAt (nixpkgs-unstable.lib.splitString " "
+                  units."hermes@vm".serviceConfig.ExecStart
+                ) 3;
                 closureProbe = hermesModuleVm.extendModules {
                   modules = [
                     (
@@ -384,352 +543,1152 @@
                   && (nixpkgs-unstable.lib.hasInfix "BindReadOnlyPaths=/nix/store/" unitFiles.${name}.text);
               in
               if
-                assertionCheckFails duplicateMappingProbe
-                && assertionCheckFails dashboardMappingCollisionProbe
-                && assertionCheckFails invalidAddressProbe
-                && assertionCheckFails invalidProtocolProbe
-                &&
-                  nixpkgs-unstable.lib.hasInfix "ct direction reply"
-                    hermesModuleVm.config.networking.nftables.tables."hermes-agent-guard".content
-                && agent.enable
-                && agent.mainAgent == "vm"
-                && !agent.installDefaultSkills
-                && agent.agents.vm.enable
-                && agent.agents.vm.headroomPort == 18080
-                && !agent.agents.vm.headroomEnable
-                && agent.agents.vm.portMappings == null
-                && agent.agents.vm.settings.kanban.default_assignee == "hermes-vm"
-                && agent.agents.vm-peer.enable
-                && agent.agents.vm-peer.fullName != agent.agents.vm.fullName
-                && agent.agents.vm-peer.headroomPort == 18081
-                && !agent.agents.vm-peer.headroomEnable
-                && builtins.hasAttr "hermes@vm" units
-                && builtins.hasAttr "hermes@vm-peer" units
-                && builtins.hasAttr "hermes@" units
-                && builtins.hasAttr "hermes-network@" units
-                && builtins.hasAttr "hermes-network@vm" units
-                && builtins.hasAttr "hermes-network@vm-peer" units
-                && builtins.hasAttr "hermes-pf@vm" units
-                && builtins.hasAttr "hermes-pf@vm-peer" units
-                && hasStoreView "hermes@vm.service" "hermes@.service"
-                && hasStoreView "hermes@vm-peer.service" "hermes@.service"
-                && hasStoreView "hermes-network@vm.service" "hermes-network@.service"
-                && hasStoreView "hermes-network@vm-peer.service" "hermes-network@.service"
-                && hasSandbox "hermes-pf@.service" null
-                && hasStoreView "hermes-pf@vm.service" "hermes-pf@.service"
-                && hasStoreView "hermes-pf@vm-peer.service" "hermes-pf@.service"
-                && !(hasStoreRoot networkSetup (storeBinds "hermes@vm"))
-                && hasStoreRoot networkSetup (storeBinds "hermes@vm" ++ [ networkSetup ])
-                && !(hasStoreRoot gatewayStart (storeBinds "hermes-network@vm"))
-                && hasStoreRoot gatewayStart (storeBinds "hermes-network@vm" ++ [ gatewayStart ])
-                && hasStoreRoot hello (closureProbeBinds "hermes@vm")
-                && hasJobScripts "hermes@vm"
-                && hasTemplateJobScripts "hermes@vm" "hermes@"
-                && hasStoreRoot directExec (closureProbeBinds "hermes@vm")
-                && !(hasStoreRoot directExec (closureProbeBinds "hermes@vm-peer"))
-                && hasStoreRoot gatewayResource (closureProbeBinds "hermes@vm")
-                && hasStoreRoot gatewayQuotedResource (closureProbeBinds "hermes@vm")
-                && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes@vm-peer"))
-                && !(hasStoreRoot networkResource (closureProbeBinds "hermes@vm"))
-                && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes@vm"))
-                && !(hasStoreRoot gatewayTemplateScript (
-                  closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
-                ))
-                && hasStoreRoot hello (closureProbeBinds "hermes-network@vm")
-                && hasJobScripts "hermes-network@vm"
-                && hasTemplateJobScripts "hermes-network@vm" "hermes-network@"
-                && hasStoreRoot directExec (closureProbeBinds "hermes-network@vm")
-                && !(hasStoreRoot directExec (closureProbeBinds "hermes-network@vm-peer"))
-                && hasStoreRoot networkResource (closureProbeBinds "hermes-network@vm")
-                && hasStoreRoot networkQuotedResource (closureProbeBinds "hermes-network@vm")
-                && !(hasStoreRoot networkResource (closureProbeBinds "hermes-network@vm-peer"))
-                && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes-network@vm"))
-                && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes-network@vm"))
-                && !(hasStoreRoot networkTemplateScript (closureProbeBinds "hermes-pf@"))
-                && hasStoreRoot hello (closureProbeBinds "hermes-pf@vm")
-                && hasJobScripts "hermes-pf@vm"
-                && hasTemplateJobScripts "hermes-pf@" "hermes-pf@"
-                && hasStoreRoot hello (closureProbeBinds "hermes-pf@")
-                && hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm")
-                && !(hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm-peer"))
-                && hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm")
-                && hasStoreRoot publicStateQuotedResource (closureProbeBinds "hermes-pf@vm")
-                && !(hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm-peer"))
-                && !(hasStoreRoot gatewayResource (closureProbeBinds "hermes-pf@vm"))
-                && !(hasStoreRoot networkResource (closureProbeBinds "hermes-pf@vm"))
-                && hasStoreRoot hello (closureProbeBinds "hermes-dhcp@vm")
-                && hasJobScripts "hermes-dhcp@vm"
-                && hasTemplateJobScripts "hermes-dhcp@vm" "hermes-dhcp@"
-                && hasStoreRoot directExec (closureProbeBinds "hermes-dhcp@vm")
-                && hasStoreRoot hello (closureProbeBinds "hermes-network-ready@vm")
-                && hasJobScripts "hermes-network-ready@vm"
-                && hasTemplateJobScripts "hermes-network-ready@vm" "hermes-network-ready@"
-                && hasStoreRoot directExec (closureProbeBinds "hermes-network-ready@vm")
-                && hasStoreRoot figlet (closureProbeBinds "hermes@vm")
-                && effectiveCondition == figlet
-                && builtins.elem cowsay effectiveReloadPost
-                && hasStoreRoot cowsay (closureProbeBinds "hermes-network@vm")
-                && !(disabledPeerExec ? ExecStartPost)
-                && !(hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm-peer"))
-                && effectivePeerExec == figlet
-                && hasStoreRoot figlet (closureProbeBinds "hermes-network@vm-peer")
-                && effectivePfStopPost == toilet
-                && hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm")
-                && effectiveTemplateExecPost == "${closureProbe.pkgs.coreutils}/bin/true"
-                && hasStoreRoot effectiveTemplateExecPost (closureProbeBinds "hermes-network@vm")
-                && !(hasStoreRoot toilet (closureProbeBinds "hermes-network@"))
-                && effectiveReload == "${closureProbe.pkgs.coreutils}/bin/true"
-                && effectiveGatewayReload == null
-                && effectiveNetworkStop == null
-                &&
-                  units."hermes@".serviceConfig.TemporaryFileSystem
-                  == hermesModuleVm.config.systemd.services."hermes@".serviceConfig.TemporaryFileSystem
-                && units."hermes@".serviceConfig.TemporaryFileSystem == [ "/nix:ro" ]
-                && !hasMnemosyneEnvironment units."hermes@".environment
-                && !hasMnemosyneEnvironment units."hermes@vm".environment
-                && !hasMnemosyneRuntimePath units."hermes@"
-                && !hasMnemosyneRuntimePath units."hermes@vm"
-                && !hasMnemosyneClosure units."hermes@"
-                && !hasMnemosyneClosure units."hermes@vm"
-                && !(builtins.elem hermesModuleVm.pkgs.mnemosyne units."hermes@".path)
-                && builtins.all (rule: !(hasMnemosyne rule)) tmpfilesRules
-                && builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule) tmpfilesRules
-                && builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/plugins" rule) tmpfilesRules
-                && !hasMnemosyneEnvironment defaultOnUnits."hermes@".environment
-                && !hasMnemosyneEnvironment defaultOnUnits."hermes@vm".environment
-                && !hasMnemosyneRuntimePath defaultOnUnits."hermes@"
-                && !hasMnemosyneRuntimePath defaultOnUnits."hermes@vm"
-                && !hasMnemosyneClosure defaultOnUnits."hermes@"
-                && !hasMnemosyneClosure defaultOnUnits."hermes@vm"
-                && !(builtins.elem hermesModuleVm.pkgs.mnemosyne defaultOnUnits."hermes@".path)
-                && builtins.elem hermesModuleVm.pkgs.headroom defaultOnUnits."hermes@".path
-                && defaultOnUnits."hermes@vm".serviceConfig.ExecStartPre != [ ]
-                && builtins.any (
-                  path: nixpkgs-unstable.lib.hasInfix "hermes-agent-exec-start-pre" path
-                ) defaultOnUnits."hermes@vm".serviceConfig.BindReadOnlyPaths
-                && builtins.all (rule: !(hasMnemosyne rule)) defaultOnTmpfilesRules
-                && builtins.any (
-                  rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule
-                ) defaultOnTmpfilesRules
-                && hermesModuleVm.config.virtualisation.restrictNetwork
-                && !internetEnabledVm.config.virtualisation.restrictNetwork
-                && internetEnabledVm.config.networking.networkmanager.enable
-                && internetEnabledVm.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ]
-                && !internetEnabledVm.config.networking.useNetworkd
-                &&
-                  internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
-                  == "1"
-                &&
-                  internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
-                  == "1"
-                &&
-                  internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_NM_UPLINK_TEST
-                  == "1"
-                && builtins.elem "1.1.1.1" internetEnabledVm.config.services.dnsmasq.settings.server
-                && nixpkgs-unstable.lib.hasInfix "nameserver 127.0.0.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
-                && !nixpkgs-unstable.lib.hasInfix "nameserver 1.1.1.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
-                &&
-                  units."hermes-network@".serviceConfig.TemporaryFileSystem
-                  == hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig.TemporaryFileSystem
-                && !(hasStoreRoot discardedGatewayResource (
-                  closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
-                ))
-                && !(hasStoreRoot discardedNetworkResource (
-                  closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
-                ))
-                && !(hasStoreRoot figlet (
-                  closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
-                ))
-                && !(hasStoreRoot publicStateTemplateScript (
-                  closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
-                ))
-                && units."hermes@vm".serviceConfig ? ExecStart
-                && units."hermes@vm-peer".serviceConfig ? ExecStart
-                && !(builtins.elem "multi-user.target" unitFiles."hermes@.service".wantedBy)
-                && !(builtins.elem "multi-user.target" unitFiles."hermes-network@.service".wantedBy)
-                && builtins.elem "multi-user.target" unitFiles."hermes@vm.service".wantedBy
-                && builtins.elem "multi-user.target" unitFiles."hermes@vm-peer.service".wantedBy
-                &&
-                  explicitDashboardProbe.config.services.hermes-specialised-agent.agents.vm.portMappings == [
-                    {
-                      hostPort = 18199;
-                      agentPort = 9119;
-                      target = "loopback";
-                      protocol = "both";
-                    }
-                  ]
-                && units."hermes@".serviceConfig.PrivateNetwork
-                && builtins.elem "hermes-network@%i.service" units."hermes@".bindsTo
-                && builtins.elem "hermes-network@%i.service" units."hermes@".after
-                && builtins.elem "hermes-network@%i.service" units."hermes@".unitConfig.JoinsNamespaceOf
-                && builtins.elem "network-online.target" units."hermes-host-control@".after
-                && builtins.elem "network-online.target" units."hermes-host-control@".wants
-                && builtins.hasAttr "hermes-vm-late-resolver" units
-                && builtins.elem "network-online.target" units.hermes-vm-late-resolver.before
-                && !hermesModuleVm.config.networking.resolvconf.enable
-                && !hermesModuleVm.config.networking.useNetworkd
-                && networkManagerProbe.config.networking.networkmanager.enable
-                && networkManagerProbe.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ]
-                && !networkManagerProbe.config.networking.useNetworkd
-                && networkManagerProbe.config.networking.dhcpcd.enable
-                && builtins.elem "ha*" networkManagerProbe.config.networking.dhcpcd.denyInterfaces
-                && units."hermes-dhcp@".serviceConfig.RootDirectory == "%t/hermes-dhcp-%i/root"
-                && units."hermes-network@".serviceConfig.RootDirectory == "%t/hermes-network-%i/root"
-                && units."hermes-network-ready@".serviceConfig.RootDirectory == "%t/hermes-network-ready-%i/root"
-                && units."hermes-pf@".serviceConfig.RootDirectory == "%t/hermes-%i-pf/root"
-                && units."hermes@".serviceConfig.RootDirectory == "%t/hermes-%i/root"
-                &&
-                  units."hermes-network@".serviceConfig.RuntimeDirectory == [
-                    "hermes-network-%i"
-                    "hermes-network-%i/root"
-                  ]
-                &&
-                  units."hermes-network-ready@".serviceConfig.RuntimeDirectory == [
-                    "hermes-network-ready-%i"
-                    "hermes-network-ready-%i/root"
-                    "hermes-agent-network-%i"
-                  ]
-                &&
-                  units."hermes-pf@".serviceConfig.RuntimeDirectory == [
-                    "hermes-%i-pf"
-                    "hermes-%i-pf/root"
-                    "hermes-%i-pf/root/etc"
-                  ]
-                &&
-                  units."hermes@".serviceConfig.RuntimeDirectory == [
-                    "hermes-%i"
-                    "hermes-%i/root"
-                    "hermes-%i/root/etc"
-                  ]
-                && builtins.all (unit: !(units.${unit}.serviceConfig ? MemoryKSM)) [
-                  "hermes-dhcp@"
-                  "hermes-network@"
-                  "hermes-network-ready@"
-                  "hermes-pf@"
-                  "hermes@"
-                ]
-                && builtins.all (unit: builtins.elem "~@privileged" units.${unit}.serviceConfig.SystemCallFilter) [
-                  "hermes-dhcp@"
-                  "hermes-network@"
-                  "hermes-network-ready@"
-                  "hermes-pf@"
-                  "hermes@"
-                ]
-                && units."hermes-dhcp@".serviceConfig.RestrictSUIDSGID
-                && units."hermes-pf@".serviceConfig.RestrictSUIDSGID
-                && units."hermes@".serviceConfig.RestrictSUIDSGID
-                && units."hermes-network@".serviceConfig.RestrictSUIDSGID
-                && units."hermes-network-ready@".serviceConfig.RestrictSUIDSGID
-                && units."hermes-dhcp@".serviceConfig.MemoryDenyWriteExecute
-                && units."hermes-network@".serviceConfig.MemoryDenyWriteExecute
-                && units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
-                && units."hermes-pf@".serviceConfig.MemoryDenyWriteExecute
-                && !(units."hermes@".serviceConfig ? MemoryDenyWriteExecute)
-                && units."hermes-host-control@".serviceConfig.BindPaths == [ "/run/systemd/network" ]
-                && builtins.elem "/run/systemd/network" units."hermes-host-control@".serviceConfig.ReadWritePaths
-                && builtins.elem "/run/systemd/private" units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
-                &&
-                  builtins.elem "/run/systemd/netif/io.systemd.Network"
-                    units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
-                && !(builtins.elem "/run/dbus/system_bus_socket"
-                  units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
+                (
+                  (assertionCheckFails duplicateMappingProbe)
+                  || builtins.trace "Hermes config assertion 1: assertionCheckFails duplicateMappingProbe" false
                 )
-                && builtins.elem "/etc/group" units."hermes-pf@".serviceConfig.BindReadOnlyPaths
-                &&
-                  builtins.elem "/dev/null:/etc/dhcpcd.exit-hook"
+                && (
+                  (assertionCheckFails dashboardMappingCollisionProbe)
+                  || builtins.trace "Hermes config assertion 2: assertionCheckFails dashboardMappingCollisionProbe" false
+                )
+                && (
+                  (assertionCheckFails invalidAddressProbe)
+                  || builtins.trace "Hermes config assertion 3: assertionCheckFails invalidAddressProbe" false
+                )
+                && (
+                  (assertionCheckFails invalidProtocolProbe)
+                  || builtins.trace "Hermes config assertion 4: assertionCheckFails invalidProtocolProbe" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "ct direction reply"
+                    hermesModuleVm.config.networking.nftables.tables."hermes-agent-guard".content
+                  )
+                  || builtins.trace "Hermes config assertion 5: nixpkgs-unstable.lib.hasInfix \"ct direction reply\" hermesModuleVm.config.networking.nftables.tables.\"hermes-agent-guard\".content" false
+                )
+                && (agent.enable || builtins.trace "Hermes config assertion 6: agent.enable" false)
+                && (
+                  (agent.mainAgent == "vm")
+                  || builtins.trace "Hermes config assertion 7: agent.mainAgent == \"vm\"" false
+                )
+                && (
+                  (!agent.installDefaultSkills)
+                  || builtins.trace "Hermes config assertion 8: !agent.installDefaultSkills" false
+                )
+                && (
+                  agent.agents.vm.enable || builtins.trace "Hermes config assertion 9: agent.agents.vm.enable" false
+                )
+                && (
+                  (agent.agents.vm.headroomPort == 18080)
+                  || builtins.trace "Hermes config assertion 10: agent.agents.vm.headroomPort == 18080" false
+                )
+                && (
+                  (!agent.agents.vm.headroomEnable)
+                  || builtins.trace "Hermes config assertion 11: !agent.agents.vm.headroomEnable" false
+                )
+                && (
+                  (agent.agents.vm.portMappings == null)
+                  || builtins.trace "Hermes config assertion 12: agent.agents.vm.portMappings == null" false
+                )
+                && (
+                  (agent.agents.vm.settings.kanban.default_assignee == "hermes-vm")
+                  || builtins.trace "Hermes config assertion 13: agent.agents.vm.settings.kanban.default_assignee == \"hermes-vm\"" false
+                )
+                && (
+                  agent.agents.vm-peer.enable
+                  || builtins.trace "Hermes config assertion 14: agent.agents.vm-peer.enable" false
+                )
+                && (
+                  (agent.agents.vm-peer.fullName != agent.agents.vm.fullName)
+                  || builtins.trace "Hermes config assertion 15: agent.agents.vm-peer.fullName != agent.agents.vm.fullName" false
+                )
+                && (
+                  (agent.agents.vm-peer.headroomPort == 18081)
+                  || builtins.trace "Hermes config assertion 16: agent.agents.vm-peer.headroomPort == 18081" false
+                )
+                && (
+                  (!agent.agents.vm-peer.headroomEnable)
+                  || builtins.trace "Hermes config assertion 17: !agent.agents.vm-peer.headroomEnable" false
+                )
+                && (
+                  (builtins.hasAttr "hermes@vm" units)
+                  || builtins.trace "Hermes config assertion 18: builtins.hasAttr \"hermes@vm\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes@vm-peer" units)
+                  || builtins.trace "Hermes config assertion 19: builtins.hasAttr \"hermes@vm-peer\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes@" units)
+                  || builtins.trace "Hermes config assertion 20: builtins.hasAttr \"hermes@\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-network@" units)
+                  || builtins.trace "Hermes config assertion 21: builtins.hasAttr \"hermes-network@\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-network@vm" units)
+                  || builtins.trace "Hermes config assertion 22: builtins.hasAttr \"hermes-network@vm\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-network@vm-peer" units)
+                  || builtins.trace "Hermes config assertion 23: builtins.hasAttr \"hermes-network@vm-peer\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-pf@vm" units)
+                  || builtins.trace "Hermes config assertion 24: builtins.hasAttr \"hermes-pf@vm\" units" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-pf@vm-peer" units)
+                  || builtins.trace "Hermes config assertion 25: builtins.hasAttr \"hermes-pf@vm-peer\" units" false
+                )
+                && (
+                  (hasStoreView "hermes@vm.service" "hermes@.service")
+                  || builtins.trace "Hermes config assertion 26: hasStoreView \"hermes@vm.service\" \"hermes@.service\"" false
+                )
+                && (
+                  (hasStoreView "hermes@vm-peer.service" "hermes@.service")
+                  || builtins.trace "Hermes config assertion 27: hasStoreView \"hermes@vm-peer.service\" \"hermes@.service\"" false
+                )
+                && (
+                  (hasStoreView "hermes-network@vm.service" "hermes-network@.service")
+                  || builtins.trace "Hermes config assertion 28: hasStoreView \"hermes-network@vm.service\" \"hermes-network@.service\"" false
+                )
+                && (
+                  (hasStoreView "hermes-network@vm-peer.service" "hermes-network@.service")
+                  || builtins.trace "Hermes config assertion 29: hasStoreView \"hermes-network@vm-peer.service\" \"hermes-network@.service\"" false
+                )
+                && (
+                  (hasSandbox "hermes-pf@.service" null)
+                  || builtins.trace "Hermes config assertion 30: hasSandbox \"hermes-pf@.service\" null" false
+                )
+                && (
+                  (hasStoreView "hermes-pf@vm.service" "hermes-pf@.service")
+                  || builtins.trace "Hermes config assertion 31: hasStoreView \"hermes-pf@vm.service\" \"hermes-pf@.service\"" false
+                )
+                && (
+                  (hasStoreView "hermes-pf@vm-peer.service" "hermes-pf@.service")
+                  || builtins.trace "Hermes config assertion 32: hasStoreView \"hermes-pf@vm-peer.service\" \"hermes-pf@.service\"" false
+                )
+                && (
+                  (!(hasStoreRoot networkSetup (storeBinds "hermes@vm")))
+                  || builtins.trace "Hermes config assertion 33: !(hasStoreRoot networkSetup (storeBinds \"hermes@vm\"))" false
+                )
+                && (
+                  (hasStoreRoot networkSetup (storeBinds "hermes@vm" ++ [ networkSetup ]))
+                  || builtins.trace "Hermes config assertion 34: hasStoreRoot networkSetup (storeBinds \"hermes@vm\" ++ [ networkSetup ])" false
+                )
+                && (
+                  (!(hasStoreRoot gatewayStart (storeBinds "hermes-network@vm")))
+                  || builtins.trace "Hermes config assertion 35: !(hasStoreRoot gatewayStart (storeBinds \"hermes-network@vm\"))" false
+                )
+                && (
+                  (hasStoreRoot gatewayStart (storeBinds "hermes-network@vm" ++ [ gatewayStart ]))
+                  || builtins.trace "Hermes config assertion 36: hasStoreRoot gatewayStart (storeBinds \"hermes-network@vm\" ++ [ gatewayStart ])" false
+                )
+                && (
+                  (hasStoreRoot hello (closureProbeBinds "hermes@vm"))
+                  || builtins.trace "Hermes config assertion 37: hasStoreRoot hello (closureProbeBinds \"hermes@vm\")" false
+                )
+                && (
+                  (hasJobScripts "hermes@vm")
+                  || builtins.trace "Hermes config assertion 38: hasJobScripts \"hermes@vm\"" false
+                )
+                && (
+                  (hasTemplateJobScripts "hermes@vm" "hermes@")
+                  || builtins.trace "Hermes config assertion 39: hasTemplateJobScripts \"hermes@vm\" \"hermes@\"" false
+                )
+                && (
+                  (hasStoreRoot directExec (closureProbeBinds "hermes@vm"))
+                  || builtins.trace "Hermes config assertion 40: hasStoreRoot directExec (closureProbeBinds \"hermes@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot directExec (closureProbeBinds "hermes@vm-peer")))
+                  || builtins.trace "Hermes config assertion 41: !(hasStoreRoot directExec (closureProbeBinds \"hermes@vm-peer\"))" false
+                )
+                && (
+                  (hasStoreRoot gatewayResource (closureProbeBinds "hermes@vm"))
+                  || builtins.trace "Hermes config assertion 42: hasStoreRoot gatewayResource (closureProbeBinds \"hermes@vm\")" false
+                )
+                && (
+                  (hasStoreRoot gatewayQuotedResource (closureProbeBinds "hermes@vm"))
+                  || builtins.trace "Hermes config assertion 43: hasStoreRoot gatewayQuotedResource (closureProbeBinds \"hermes@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot gatewayResource (closureProbeBinds "hermes@vm-peer")))
+                  || builtins.trace "Hermes config assertion 44: !(hasStoreRoot gatewayResource (closureProbeBinds \"hermes@vm-peer\"))" false
+                )
+                && (
+                  (!(hasStoreRoot networkResource (closureProbeBinds "hermes@vm")))
+                  || builtins.trace "Hermes config assertion 45: !(hasStoreRoot networkResource (closureProbeBinds \"hermes@vm\"))" false
+                )
+                && (
+                  (!(hasStoreRoot publicStateResource (closureProbeBinds "hermes@vm")))
+                  || builtins.trace "Hermes config assertion 46: !(hasStoreRoot publicStateResource (closureProbeBinds \"hermes@vm\"))" false
+                )
+                && (
+                  (
+                    !(hasStoreRoot gatewayTemplateScript (
+                      closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
+                    ))
+                  )
+                  || builtins.trace "Hermes config assertion 47: !(hasStoreRoot gatewayTemplateScript ( closureProbeBinds \"hermes-network@vm\" ++ closureProbeBinds \"hermes-network@\" ))" false
+                )
+                && (
+                  (hasStoreRoot hello (closureProbeBinds "hermes-network@vm"))
+                  || builtins.trace "Hermes config assertion 48: hasStoreRoot hello (closureProbeBinds \"hermes-network@vm\")" false
+                )
+                && (
+                  (hasJobScripts "hermes-network@vm")
+                  || builtins.trace "Hermes config assertion 49: hasJobScripts \"hermes-network@vm\"" false
+                )
+                && (
+                  (hasTemplateJobScripts "hermes-network@vm" "hermes-network@")
+                  || builtins.trace "Hermes config assertion 50: hasTemplateJobScripts \"hermes-network@vm\" \"hermes-network@\"" false
+                )
+                && (
+                  (hasStoreRoot directExec (closureProbeBinds "hermes-network@vm"))
+                  || builtins.trace "Hermes config assertion 51: hasStoreRoot directExec (closureProbeBinds \"hermes-network@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot directExec (closureProbeBinds "hermes-network@vm-peer")))
+                  || builtins.trace "Hermes config assertion 52: !(hasStoreRoot directExec (closureProbeBinds \"hermes-network@vm-peer\"))" false
+                )
+                && (
+                  (hasStoreRoot networkResource (closureProbeBinds "hermes-network@vm"))
+                  || builtins.trace "Hermes config assertion 53: hasStoreRoot networkResource (closureProbeBinds \"hermes-network@vm\")" false
+                )
+                && (
+                  (hasStoreRoot networkQuotedResource (closureProbeBinds "hermes-network@vm"))
+                  || builtins.trace "Hermes config assertion 54: hasStoreRoot networkQuotedResource (closureProbeBinds \"hermes-network@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot networkResource (closureProbeBinds "hermes-network@vm-peer")))
+                  || builtins.trace "Hermes config assertion 55: !(hasStoreRoot networkResource (closureProbeBinds \"hermes-network@vm-peer\"))" false
+                )
+                && (
+                  (!(hasStoreRoot gatewayResource (closureProbeBinds "hermes-network@vm")))
+                  || builtins.trace "Hermes config assertion 56: !(hasStoreRoot gatewayResource (closureProbeBinds \"hermes-network@vm\"))" false
+                )
+                && (
+                  (!(hasStoreRoot publicStateResource (closureProbeBinds "hermes-network@vm")))
+                  || builtins.trace "Hermes config assertion 57: !(hasStoreRoot publicStateResource (closureProbeBinds \"hermes-network@vm\"))" false
+                )
+                && (
+                  (!(hasStoreRoot networkTemplateScript (closureProbeBinds "hermes-pf@")))
+                  || builtins.trace "Hermes config assertion 58: !(hasStoreRoot networkTemplateScript (closureProbeBinds \"hermes-pf@\"))" false
+                )
+                && (
+                  (hasStoreRoot hello (closureProbeBinds "hermes-pf@vm"))
+                  || builtins.trace "Hermes config assertion 59: hasStoreRoot hello (closureProbeBinds \"hermes-pf@vm\")" false
+                )
+                && (
+                  (hasJobScripts "hermes-pf@vm")
+                  || builtins.trace "Hermes config assertion 60: hasJobScripts \"hermes-pf@vm\"" false
+                )
+                && (
+                  (hasTemplateJobScripts "hermes-pf@" "hermes-pf@")
+                  || builtins.trace "Hermes config assertion 61: hasTemplateJobScripts \"hermes-pf@\" \"hermes-pf@\"" false
+                )
+                && (
+                  (hasStoreRoot hello (closureProbeBinds "hermes-pf@"))
+                  || builtins.trace "Hermes config assertion 62: hasStoreRoot hello (closureProbeBinds \"hermes-pf@\")" false
+                )
+                && (
+                  (hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm"))
+                  || builtins.trace "Hermes config assertion 63: hasStoreRoot directExec (closureProbeBinds \"hermes-pf@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot directExec (closureProbeBinds "hermes-pf@vm-peer")))
+                  || builtins.trace "Hermes config assertion 64: !(hasStoreRoot directExec (closureProbeBinds \"hermes-pf@vm-peer\"))" false
+                )
+                && (
+                  (hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm"))
+                  || builtins.trace "Hermes config assertion 65: hasStoreRoot publicStateResource (closureProbeBinds \"hermes-pf@vm\")" false
+                )
+                && (
+                  (hasStoreRoot publicStateQuotedResource (closureProbeBinds "hermes-pf@vm"))
+                  || builtins.trace "Hermes config assertion 66: hasStoreRoot publicStateQuotedResource (closureProbeBinds \"hermes-pf@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot publicStateResource (closureProbeBinds "hermes-pf@vm-peer")))
+                  || builtins.trace "Hermes config assertion 67: !(hasStoreRoot publicStateResource (closureProbeBinds \"hermes-pf@vm-peer\"))" false
+                )
+                && (
+                  (!(hasStoreRoot gatewayResource (closureProbeBinds "hermes-pf@vm")))
+                  || builtins.trace "Hermes config assertion 68: !(hasStoreRoot gatewayResource (closureProbeBinds \"hermes-pf@vm\"))" false
+                )
+                && (
+                  (!(hasStoreRoot networkResource (closureProbeBinds "hermes-pf@vm")))
+                  || builtins.trace "Hermes config assertion 69: !(hasStoreRoot networkResource (closureProbeBinds \"hermes-pf@vm\"))" false
+                )
+                && (
+                  (hasStoreRoot hello (closureProbeBinds "hermes-dhcp@vm"))
+                  || builtins.trace "Hermes config assertion 70: hasStoreRoot hello (closureProbeBinds \"hermes-dhcp@vm\")" false
+                )
+                && (
+                  (hasJobScripts "hermes-dhcp@vm")
+                  || builtins.trace "Hermes config assertion 71: hasJobScripts \"hermes-dhcp@vm\"" false
+                )
+                && (
+                  (hasTemplateJobScripts "hermes-dhcp@vm" "hermes-dhcp@")
+                  || builtins.trace "Hermes config assertion 72: hasTemplateJobScripts \"hermes-dhcp@vm\" \"hermes-dhcp@\"" false
+                )
+                && (
+                  (hasStoreRoot directExec (closureProbeBinds "hermes-dhcp@vm"))
+                  || builtins.trace "Hermes config assertion 73: hasStoreRoot directExec (closureProbeBinds \"hermes-dhcp@vm\")" false
+                )
+                && (
+                  (hasStoreRoot hello (closureProbeBinds "hermes-network-ready@vm"))
+                  || builtins.trace "Hermes config assertion 74: hasStoreRoot hello (closureProbeBinds \"hermes-network-ready@vm\")" false
+                )
+                && (
+                  (hasJobScripts "hermes-network-ready@vm")
+                  || builtins.trace "Hermes config assertion 75: hasJobScripts \"hermes-network-ready@vm\"" false
+                )
+                && (
+                  (hasTemplateJobScripts "hermes-network-ready@vm" "hermes-network-ready@")
+                  || builtins.trace "Hermes config assertion 76: hasTemplateJobScripts \"hermes-network-ready@vm\" \"hermes-network-ready@\"" false
+                )
+                && (
+                  (hasStoreRoot directExec (closureProbeBinds "hermes-network-ready@vm"))
+                  || builtins.trace "Hermes config assertion 77: hasStoreRoot directExec (closureProbeBinds \"hermes-network-ready@vm\")" false
+                )
+                && (
+                  (hasStoreRoot figlet (closureProbeBinds "hermes@vm"))
+                  || builtins.trace "Hermes config assertion 78: hasStoreRoot figlet (closureProbeBinds \"hermes@vm\")" false
+                )
+                && (
+                  (effectiveCondition == figlet)
+                  || builtins.trace "Hermes config assertion 79: effectiveCondition == figlet" false
+                )
+                && (
+                  (builtins.elem cowsay effectiveReloadPost)
+                  || builtins.trace "Hermes config assertion 80: builtins.elem cowsay effectiveReloadPost" false
+                )
+                && (
+                  (hasStoreRoot cowsay (closureProbeBinds "hermes-network@vm"))
+                  || builtins.trace "Hermes config assertion 81: hasStoreRoot cowsay (closureProbeBinds \"hermes-network@vm\")" false
+                )
+                && (
+                  (!(disabledPeerExec ? ExecStartPost))
+                  || builtins.trace "Hermes config assertion 82: !(disabledPeerExec ? ExecStartPost)" false
+                )
+                && (
+                  (!(hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm-peer")))
+                  || builtins.trace "Hermes config assertion 83: !(hasStoreRoot toilet (closureProbeBinds \"hermes-pf@vm-peer\"))" false
+                )
+                && (
+                  (effectivePeerExec == figlet)
+                  || builtins.trace "Hermes config assertion 84: effectivePeerExec == figlet" false
+                )
+                && (
+                  (hasStoreRoot figlet (closureProbeBinds "hermes-network@vm-peer"))
+                  || builtins.trace "Hermes config assertion 85: hasStoreRoot figlet (closureProbeBinds \"hermes-network@vm-peer\")" false
+                )
+                && (
+                  (effectivePfStopPost == toilet)
+                  || builtins.trace "Hermes config assertion 86: effectivePfStopPost == toilet" false
+                )
+                && (
+                  (hasStoreRoot toilet (closureProbeBinds "hermes-pf@vm"))
+                  || builtins.trace "Hermes config assertion 87: hasStoreRoot toilet (closureProbeBinds \"hermes-pf@vm\")" false
+                )
+                && (
+                  (effectiveTemplateExecPost == "${closureProbe.pkgs.coreutils}/bin/true")
+                  || builtins.trace "Hermes config assertion 88: effectiveTemplateExecPost == \"\${closureProbe.pkgs.coreutils}/bin/true\"" false
+                )
+                && (
+                  (hasStoreRoot effectiveTemplateExecPost (closureProbeBinds "hermes-network@vm"))
+                  || builtins.trace "Hermes config assertion 89: hasStoreRoot effectiveTemplateExecPost (closureProbeBinds \"hermes-network@vm\")" false
+                )
+                && (
+                  (!(hasStoreRoot toilet (closureProbeBinds "hermes-network@")))
+                  || builtins.trace "Hermes config assertion 90: !(hasStoreRoot toilet (closureProbeBinds \"hermes-network@\"))" false
+                )
+                && (
+                  (effectiveReload == "${closureProbe.pkgs.coreutils}/bin/true")
+                  || builtins.trace "Hermes config assertion 91: effectiveReload == \"\${closureProbe.pkgs.coreutils}/bin/true\"" false
+                )
+                && (
+                  (effectiveGatewayReload == null)
+                  || builtins.trace "Hermes config assertion 92: effectiveGatewayReload == null" false
+                )
+                && (
+                  (effectiveNetworkStop == null)
+                  || builtins.trace "Hermes config assertion 93: effectiveNetworkStop == null" false
+                )
+                && (
+                  (
+                    units."hermes@".serviceConfig.TemporaryFileSystem
+                    == hermesModuleVm.config.systemd.services."hermes@".serviceConfig.TemporaryFileSystem
+                  )
+                  || builtins.trace "Hermes config assertion 94: units.\"hermes@\".serviceConfig.TemporaryFileSystem == hermesModuleVm.config.systemd.services.\"hermes@\".serviceConfig.TemporaryFileS" false
+                )
+                && (
+                  (units."hermes@".serviceConfig.TemporaryFileSystem == [ "/nix:ro" ])
+                  || builtins.trace "Hermes config assertion 95: units.\"hermes@\".serviceConfig.TemporaryFileSystem == [ \"/nix:ro\" ]" false
+                )
+                && (
+                  (!hasMnemosyneEnvironment units."hermes@".environment)
+                  || builtins.trace "Hermes config assertion 96: !hasMnemosyneEnvironment units.\"hermes@\".environment" false
+                )
+                && (
+                  (!hasMnemosyneEnvironment units."hermes@vm".environment)
+                  || builtins.trace "Hermes config assertion 97: !hasMnemosyneEnvironment units.\"hermes@vm\".environment" false
+                )
+                && (
+                  (!hasMnemosyneRuntimePath units."hermes@")
+                  || builtins.trace "Hermes config assertion 98: !hasMnemosyneRuntimePath units.\"hermes@\"" false
+                )
+                && (
+                  (!hasMnemosyneRuntimePath units."hermes@vm")
+                  || builtins.trace "Hermes config assertion 99: !hasMnemosyneRuntimePath units.\"hermes@vm\"" false
+                )
+                && (
+                  (!hasMnemosyneClosure units."hermes@")
+                  || builtins.trace "Hermes config assertion 100: !hasMnemosyneClosure units.\"hermes@\"" false
+                )
+                && (
+                  (!hasMnemosyneClosure units."hermes@vm")
+                  || builtins.trace "Hermes config assertion 101: !hasMnemosyneClosure units.\"hermes@vm\"" false
+                )
+                && (
+                  (!(builtins.elem hermesModuleVm.pkgs.mnemosyne units."hermes@".path))
+                  || builtins.trace "Hermes config assertion 102: !(builtins.elem hermesModuleVm.pkgs.mnemosyne units.\"hermes@\".path)" false
+                )
+                && (
+                  (builtins.all (rule: !(hasMnemosyne rule)) tmpfilesRules)
+                  || builtins.trace "Hermes config assertion 103: builtins.all (rule: !(hasMnemosyne rule)) tmpfilesRules" false
+                )
+                && (
+                  (builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule) tmpfilesRules)
+                  || builtins.trace "Hermes config assertion 104: builtins.any (rule: nixpkgs-unstable.lib.hasInfix \"/.hermes/memories\" rule) tmpfilesRules" false
+                )
+                && (
+                  (builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/plugins" rule) tmpfilesRules)
+                  || builtins.trace "Hermes config assertion 105: builtins.any (rule: nixpkgs-unstable.lib.hasInfix \"/.hermes/plugins\" rule) tmpfilesRules" false
+                )
+                && (
+                  (!hasMnemosyneEnvironment defaultOnUnits."hermes@".environment)
+                  || builtins.trace "Hermes config assertion 106: !hasMnemosyneEnvironment defaultOnUnits.\"hermes@\".environment" false
+                )
+                && (
+                  (!hasMnemosyneEnvironment defaultOnUnits."hermes@vm".environment)
+                  || builtins.trace "Hermes config assertion 107: !hasMnemosyneEnvironment defaultOnUnits.\"hermes@vm\".environment" false
+                )
+                && (
+                  (!hasMnemosyneRuntimePath defaultOnUnits."hermes@")
+                  || builtins.trace "Hermes config assertion 108: !hasMnemosyneRuntimePath defaultOnUnits.\"hermes@\"" false
+                )
+                && (
+                  (!hasMnemosyneRuntimePath defaultOnUnits."hermes@vm")
+                  || builtins.trace "Hermes config assertion 109: !hasMnemosyneRuntimePath defaultOnUnits.\"hermes@vm\"" false
+                )
+                && (
+                  (!hasMnemosyneClosure defaultOnUnits."hermes@")
+                  || builtins.trace "Hermes config assertion 110: !hasMnemosyneClosure defaultOnUnits.\"hermes@\"" false
+                )
+                && (
+                  (!hasMnemosyneClosure defaultOnUnits."hermes@vm")
+                  || builtins.trace "Hermes config assertion 111: !hasMnemosyneClosure defaultOnUnits.\"hermes@vm\"" false
+                )
+                && (
+                  (!(builtins.elem hermesModuleVm.pkgs.mnemosyne defaultOnUnits."hermes@".path))
+                  || builtins.trace "Hermes config assertion 112: !(builtins.elem hermesModuleVm.pkgs.mnemosyne defaultOnUnits.\"hermes@\".path)" false
+                )
+                && (
+                  (builtins.elem hermesModuleVm.pkgs.headroom defaultOnUnits."hermes@".path)
+                  || builtins.trace "Hermes config assertion 113: builtins.elem hermesModuleVm.pkgs.headroom defaultOnUnits.\"hermes@\".path" false
+                )
+                && (
+                  (defaultOnUnits."hermes@vm".serviceConfig.ExecStartPre != [ ])
+                  || builtins.trace "Hermes config assertion 114: defaultOnUnits.\"hermes@vm\".serviceConfig.ExecStartPre != [ ]" false
+                )
+                && (
+                  (builtins.any (
+                    path: nixpkgs-unstable.lib.hasSuffix "-install_skills.py" path
+                  ) defaultOnUnits."hermes@vm".serviceConfig.BindReadOnlyPaths)
+                  || builtins.trace "Hermes config assertion 115: default skill installer is bound in gateway closure" false
+                )
+                && (
+                  (builtins.all (rule: !(hasMnemosyne rule)) defaultOnTmpfilesRules)
+                  || builtins.trace "Hermes config assertion 116: builtins.all (rule: !(hasMnemosyne rule)) defaultOnTmpfilesRules" false
+                )
+                && (
+                  (builtins.any (rule: nixpkgs-unstable.lib.hasInfix "/.hermes/memories" rule) defaultOnTmpfilesRules)
+                  || builtins.trace "Hermes config assertion 117: builtins.any ( rule: nixpkgs-unstable.lib.hasInfix \"/.hermes/memories\" rule ) defaultOnTmpfilesRules" false
+                )
+                && (
+                  hermesModuleVm.config.virtualisation.restrictNetwork
+                  || builtins.trace "Hermes config assertion 118: hermesModuleVm.config.virtualisation.restrictNetwork" false
+                )
+                && (
+                  (!internetEnabledVm.config.virtualisation.restrictNetwork)
+                  || builtins.trace "Hermes config assertion 119: !internetEnabledVm.config.virtualisation.restrictNetwork" false
+                )
+                && (
+                  internetEnabledVm.config.networking.networkmanager.enable
+                  || builtins.trace "Hermes config assertion 120: internetEnabledVm.config.networking.networkmanager.enable" false
+                )
+                && (
+                  (internetEnabledVm.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ])
+                  || builtins.trace "Hermes config assertion 121: internetEnabledVm.config.networking.networkmanager.unmanaged == [ \"interface-name:ha*\" ]" false
+                )
+                && (
+                  (!internetEnabledVm.config.networking.useNetworkd)
+                  || builtins.trace "Hermes config assertion 122: !internetEnabledVm.config.networking.useNetworkd" false
+                )
+                && (
+                  (
+                    internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
+                    == "1"
+                  )
+                  || builtins.trace "Hermes config assertion 123: internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST == \"1\"" false
+                )
+                && (
+                  (
+                    internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
+                    == "1"
+                  )
+                  || builtins.trace "Hermes config assertion 124: internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY == \"1\"" false
+                )
+                && (
+                  (
+                    internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_NM_UPLINK_TEST
+                    == "1"
+                  )
+                  || builtins.trace "Hermes config assertion 125: internetEnabledVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_NM_UPLINK_TEST == \"1\"" false
+                )
+                && (
+                  (builtins.elem "1.1.1.1" internetEnabledVm.config.services.dnsmasq.settings.server)
+                  || builtins.trace "Hermes config assertion 126: builtins.elem \"1.1.1.1\" internetEnabledVm.config.services.dnsmasq.settings.server" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "nameserver 127.0.0.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script)
+                  || builtins.trace "Hermes config assertion 127: nixpkgs-unstable.lib.hasInfix \"nameserver 127.0.0.1\" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script" false
+                )
+                && (
+                  (
+                    !nixpkgs-unstable.lib.hasInfix "nameserver 1.1.1.1" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script
+                  )
+                  || builtins.trace "Hermes config assertion 128: !nixpkgs-unstable.lib.hasInfix \"nameserver 1.1.1.1\" internetEnabledVm.config.systemd.services.hermes-vm-late-resolver.script" false
+                )
+                && (
+                  (
+                    units."hermes-network@".serviceConfig.TemporaryFileSystem
+                    == hermesModuleVm.config.systemd.services."hermes-network@".serviceConfig.TemporaryFileSystem
+                  )
+                  || builtins.trace "Hermes config assertion 129: units.\"hermes-network@\".serviceConfig.TemporaryFileSystem == hermesModuleVm.config.systemd.services.\"hermes-network@\".serviceConfi" false
+                )
+                && (
+                  (
+                    !(hasStoreRoot discardedGatewayResource (
+                      closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
+                    ))
+                  )
+                  || builtins.trace "Hermes config assertion 130: !(hasStoreRoot discardedGatewayResource ( closureProbeBinds \"hermes@vm\" ++ closureProbeBinds \"hermes@\" ))" false
+                )
+                && (
+                  (
+                    !(hasStoreRoot discardedNetworkResource (
+                      closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
+                    ))
+                  )
+                  || builtins.trace "Hermes config assertion 131: !(hasStoreRoot discardedNetworkResource ( closureProbeBinds \"hermes-network@vm\" ++ closureProbeBinds \"hermes-network@\" ))" false
+                )
+                && (
+                  (
+                    !(hasStoreRoot figlet (
+                      closureProbeBinds "hermes-network@vm" ++ closureProbeBinds "hermes-network@"
+                    ))
+                  )
+                  || builtins.trace "Hermes config assertion 132: !(hasStoreRoot figlet ( closureProbeBinds \"hermes-network@vm\" ++ closureProbeBinds \"hermes-network@\" ))" false
+                )
+                && (
+                  (
+                    !(hasStoreRoot publicStateTemplateScript (
+                      closureProbeBinds "hermes@vm" ++ closureProbeBinds "hermes@"
+                    ))
+                  )
+                  || builtins.trace "Hermes config assertion 133: !(hasStoreRoot publicStateTemplateScript ( closureProbeBinds \"hermes@vm\" ++ closureProbeBinds \"hermes@\" ))" false
+                )
+                && (
+                  (units."hermes@vm".serviceConfig ? ExecStart)
+                  || builtins.trace "Hermes config assertion 134: units.\"hermes@vm\".serviceConfig ? ExecStart" false
+                )
+                && (
+                  (units."hermes@vm-peer".serviceConfig ? ExecStart)
+                  || builtins.trace "Hermes config assertion 135: units.\"hermes@vm-peer\".serviceConfig ? ExecStart" false
+                )
+                && (
+                  (!(builtins.elem "multi-user.target" unitFiles."hermes@.service".wantedBy))
+                  || builtins.trace "Hermes config assertion 136: !(builtins.elem \"multi-user.target\" unitFiles.\"hermes@.service\".wantedBy)" false
+                )
+                && (
+                  (!(builtins.elem "multi-user.target" unitFiles."hermes-network@.service".wantedBy))
+                  || builtins.trace "Hermes config assertion 137: !(builtins.elem \"multi-user.target\" unitFiles.\"hermes-network@.service\".wantedBy)" false
+                )
+                && (
+                  (builtins.elem "multi-user.target" unitFiles."hermes@vm.service".wantedBy)
+                  || builtins.trace "Hermes config assertion 138: builtins.elem \"multi-user.target\" unitFiles.\"hermes@vm.service\".wantedBy" false
+                )
+                && (
+                  (builtins.elem "multi-user.target" unitFiles."hermes@vm-peer.service".wantedBy)
+                  || builtins.trace "Hermes config assertion 139: builtins.elem \"multi-user.target\" unitFiles.\"hermes@vm-peer.service\".wantedBy" false
+                )
+                && (
+                  (
+                    explicitDashboardProbe.config.services.hermes-specialised-agent.agents.vm.portMappings == [
+                      {
+                        hostPort = 18199;
+                        agentPort = 9119;
+                        target = "loopback";
+                        protocol = "both";
+                      }
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 140: explicitDashboardProbe.config.services.hermes-specialised-agent.agents.vm.portMappings == [ { hostPort = 18199; agentPort = 9119; " false
+                )
+                && (
+                  units."hermes@".serviceConfig.PrivateNetwork
+                  || builtins.trace "Hermes config assertion 141: units.\"hermes@\".serviceConfig.PrivateNetwork" false
+                )
+                && (
+                  (builtins.elem "hermes-network@%i.service" units."hermes@".bindsTo)
+                  || builtins.trace "Hermes config assertion 142: builtins.elem \"hermes-network@%i.service\" units.\"hermes@\".bindsTo" false
+                )
+                && (
+                  (builtins.elem "hermes-network@%i.service" units."hermes@".after)
+                  || builtins.trace "Hermes config assertion 143: builtins.elem \"hermes-network@%i.service\" units.\"hermes@\".after" false
+                )
+                && (
+                  (builtins.elem "hermes-network@%i.service" units."hermes@".unitConfig.JoinsNamespaceOf)
+                  || builtins.trace "Hermes config assertion 144: builtins.elem \"hermes-network@%i.service\" units.\"hermes@\".unitConfig.JoinsNamespaceOf" false
+                )
+                && (
+                  (builtins.elem "network-online.target" units."hermes-host-control@".after)
+                  || builtins.trace "Hermes config assertion 145: builtins.elem \"network-online.target\" units.\"hermes-host-control@\".after" false
+                )
+                && (
+                  (builtins.elem "network-online.target" units."hermes-host-control@".wants)
+                  || builtins.trace "Hermes config assertion 146: builtins.elem \"network-online.target\" units.\"hermes-host-control@\".wants" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-vm-late-resolver" units)
+                  || builtins.trace "Hermes config assertion 147: builtins.hasAttr \"hermes-vm-late-resolver\" units" false
+                )
+                && (
+                  (builtins.elem "network-online.target" units.hermes-vm-late-resolver.before)
+                  || builtins.trace "Hermes config assertion 148: builtins.elem \"network-online.target\" units.hermes-vm-late-resolver.before" false
+                )
+                && (
+                  (!hermesModuleVm.config.networking.resolvconf.enable)
+                  || builtins.trace "Hermes config assertion 149: !hermesModuleVm.config.networking.resolvconf.enable" false
+                )
+                && (
+                  (!hermesModuleVm.config.networking.useNetworkd)
+                  || builtins.trace "Hermes config assertion 150: !hermesModuleVm.config.networking.useNetworkd" false
+                )
+                && (
+                  networkManagerProbe.config.networking.networkmanager.enable
+                  || builtins.trace "Hermes config assertion 151: networkManagerProbe.config.networking.networkmanager.enable" false
+                )
+                && (
+                  (networkManagerProbe.config.networking.networkmanager.unmanaged == [ "interface-name:ha*" ])
+                  || builtins.trace "Hermes config assertion 152: networkManagerProbe.config.networking.networkmanager.unmanaged == [ \"interface-name:ha*\" ]" false
+                )
+                && (
+                  (!networkManagerProbe.config.networking.useNetworkd)
+                  || builtins.trace "Hermes config assertion 153: !networkManagerProbe.config.networking.useNetworkd" false
+                )
+                && (
+                  networkManagerProbe.config.networking.dhcpcd.enable
+                  || builtins.trace "Hermes config assertion 154: networkManagerProbe.config.networking.dhcpcd.enable" false
+                )
+                && (
+                  (builtins.elem "ha*" networkManagerProbe.config.networking.dhcpcd.denyInterfaces)
+                  || builtins.trace "Hermes config assertion 155: builtins.elem \"ha*\" networkManagerProbe.config.networking.dhcpcd.denyInterfaces" false
+                )
+                && (
+                  (units."hermes-dhcp@".serviceConfig.RootDirectory == "%t/hermes-dhcp-%i/root")
+                  || builtins.trace "Hermes config assertion 156: units.\"hermes-dhcp@\".serviceConfig.RootDirectory == \"%t/hermes-dhcp-%i/root\"" false
+                )
+                && (
+                  (units."hermes-network@".serviceConfig.RootDirectory == "%t/hermes-network-%i/root")
+                  || builtins.trace "Hermes config assertion 157: units.\"hermes-network@\".serviceConfig.RootDirectory == \"%t/hermes-network-%i/root\"" false
+                )
+                && (
+                  (units."hermes-network-ready@".serviceConfig.RootDirectory == "%t/hermes-network-ready-%i/root")
+                  || builtins.trace "Hermes config assertion 158: units.\"hermes-network-ready@\".serviceConfig.RootDirectory == \"%t/hermes-network-ready-%i/root\"" false
+                )
+                && (
+                  (units."hermes-pf@".serviceConfig.RootDirectory == "%t/hermes-%i-pf/root")
+                  || builtins.trace "Hermes config assertion 159: units.\"hermes-pf@\".serviceConfig.RootDirectory == \"%t/hermes-%i-pf/root\"" false
+                )
+                && (
+                  (units."hermes@".serviceConfig.RootDirectory == "%t/hermes-%i/root")
+                  || builtins.trace "Hermes config assertion 160: units.\"hermes@\".serviceConfig.RootDirectory == \"%t/hermes-%i/root\"" false
+                )
+                && (
+                  (
+                    units."hermes-network@".serviceConfig.RuntimeDirectory == [
+                      "hermes-network-%i"
+                      "hermes-network-%i/root"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 161: units.\"hermes-network@\".serviceConfig.RuntimeDirectory == [ \"hermes-network-%i\" \"hermes-network-%i/root\" ]" false
+                )
+                && (
+                  (
+                    units."hermes-network-ready@".serviceConfig.RuntimeDirectory == [
+                      "hermes-network-ready-%i"
+                      "hermes-network-ready-%i/root"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 162: units.\"hermes-network-ready@\".serviceConfig.RuntimeDirectory == [ \"hermes-network-ready-%i\" \"hermes-network-ready-%i/root\" ]" false
+                )
+                && (
+                  (
+                    units."hermes-pf@".serviceConfig.RuntimeDirectory == [
+                      "hermes-%i-pf"
+                      "hermes-%i-pf/root"
+                      "hermes-%i-pf/root/etc"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 163: units.\"hermes-pf@\".serviceConfig.RuntimeDirectory == [ \"hermes-%i-pf\" \"hermes-%i-pf/root\" \"hermes-%i-pf/root/etc\" ]" false
+                )
+                && (
+                  (
+                    units."hermes@".serviceConfig.RuntimeDirectory == [
+                      "hermes-%i"
+                      "hermes-%i/root"
+                      "hermes-%i/root/etc"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 164: units.\"hermes@\".serviceConfig.RuntimeDirectory == [ \"hermes-%i\" \"hermes-%i/root\" \"hermes-%i/root/etc\" ]" false
+                )
+                && (
+                  (builtins.all (unit: !(units.${unit}.serviceConfig ? MemoryKSM)) [
+                    "hermes-dhcp@"
+                    "hermes-network@"
+                    "hermes-network-ready@"
+                    "hermes-pf@"
+                    "hermes@"
+                  ])
+                  || builtins.trace "Hermes config assertion 165: builtins.all (unit: !(units.\${unit}.serviceConfig ? MemoryKSM)) [ \"hermes-dhcp@\" \"hermes-network@\" \"hermes-network-ready@\" \"hermes" false
+                )
+                && (
+                  (builtins.all (unit: builtins.elem "~@privileged" units.${unit}.serviceConfig.SystemCallFilter) [
+                    "hermes-dhcp@"
+                    "hermes-network@"
+                    "hermes-network-ready@"
+                    "hermes-pf@"
+                    "hermes@"
+                  ])
+                  || builtins.trace "Hermes config assertion 166: builtins.all (unit: builtins.elem \"~@privileged\" units.\${unit}.serviceConfig.SystemCallFilter) [ \"hermes-dhcp@\" \"hermes-network@\" " false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.RestrictSUIDSGID
+                  || builtins.trace "Hermes config assertion 167: units.\"hermes-dhcp@\".serviceConfig.RestrictSUIDSGID" false
+                )
+                && (
+                  units."hermes-pf@".serviceConfig.RestrictSUIDSGID
+                  || builtins.trace "Hermes config assertion 168: units.\"hermes-pf@\".serviceConfig.RestrictSUIDSGID" false
+                )
+                && (
+                  units."hermes@".serviceConfig.RestrictSUIDSGID
+                  || builtins.trace "Hermes config assertion 169: units.\"hermes@\".serviceConfig.RestrictSUIDSGID" false
+                )
+                && (
+                  units."hermes-network@".serviceConfig.RestrictSUIDSGID
+                  || builtins.trace "Hermes config assertion 170: units.\"hermes-network@\".serviceConfig.RestrictSUIDSGID" false
+                )
+                && (
+                  units."hermes-network-ready@".serviceConfig.RestrictSUIDSGID
+                  || builtins.trace "Hermes config assertion 171: units.\"hermes-network-ready@\".serviceConfig.RestrictSUIDSGID" false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.MemoryDenyWriteExecute
+                  || builtins.trace "Hermes config assertion 172: units.\"hermes-dhcp@\".serviceConfig.MemoryDenyWriteExecute" false
+                )
+                && (
+                  units."hermes-network@".serviceConfig.MemoryDenyWriteExecute
+                  || builtins.trace "Hermes config assertion 173: units.\"hermes-network@\".serviceConfig.MemoryDenyWriteExecute" false
+                )
+                && (
+                  units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
+                  || builtins.trace "Hermes config assertion 174: units.\"hermes-network-ready@\".serviceConfig.MemoryDenyWriteExecute" false
+                )
+                && (
+                  units."hermes-pf@".serviceConfig.MemoryDenyWriteExecute
+                  || builtins.trace "Hermes config assertion 175: units.\"hermes-pf@\".serviceConfig.MemoryDenyWriteExecute" false
+                )
+                && (
+                  (!(units."hermes@".serviceConfig ? MemoryDenyWriteExecute))
+                  || builtins.trace "Hermes config assertion 176: !(units.\"hermes@\".serviceConfig ? MemoryDenyWriteExecute)" false
+                )
+                && (
+                  (units."hermes-host-control@".serviceConfig.BindPaths == [ "/run/systemd/network" ])
+                  || builtins.trace "Hermes config assertion 177: units.\"hermes-host-control@\".serviceConfig.BindPaths == [ \"/run/systemd/network\" ]" false
+                )
+                && (
+                  (builtins.elem "/run/systemd/network" units."hermes-host-control@".serviceConfig.ReadWritePaths)
+                  || builtins.trace "Hermes config assertion 178: builtins.elem \"/run/systemd/network\" units.\"hermes-host-control@\".serviceConfig.ReadWritePaths" false
+                )
+                && (
+                  (builtins.elem "/run/dbus/system_bus_socket"
+                    units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
+                  )
+                  || builtins.trace "Hermes config assertion 179: builtins.elem \"/run/dbus/system_bus_socket\" units.\"hermes-host-control@\".serviceConfig.BindReadOnlyPaths" false
+                )
+                && (
+                  (builtins.elem "/run/systemd/netif/io.systemd.Network"
+                    units."hermes-host-control@".serviceConfig.BindReadOnlyPaths
+                  )
+                  || builtins.trace "Hermes config assertion 180: builtins.elem \"/run/systemd/netif/io.systemd.Network\" units.\"hermes-host-control@\".serviceConfig.BindReadOnlyPaths" false
+                )
+                && (
+                  (
+                    !(builtins.elem "/run/systemd/private" units."hermes-host-control@".serviceConfig.BindReadOnlyPaths)
+                  )
+                  || builtins.trace "Hermes config assertion 181: !(builtins.elem \"/run/systemd/private\" units.\"hermes-host-control@\".serviceConfig.BindReadOnlyPaths )" false
+                )
+                && (
+                  (!(builtins.elem "/etc/group" units."hermes-pf@".serviceConfig.BindReadOnlyPaths))
+                  || builtins.trace "Hermes config assertion 182: !(builtins.elem \"/etc/group\" units.\"hermes-pf@\".serviceConfig.BindReadOnlyPaths)" false
+                )
+                && (
+                  (units."hermes-pf@".serviceConfig.Group == "hermes-shared")
+                  || builtins.trace "Hermes config assertion 183: units.\"hermes-pf@\".serviceConfig.Group == \"hermes-shared\"" false
+                )
+                && (
+                  (builtins.elem "/dev/null:/etc/dhcpcd.exit-hook"
                     units."hermes-dhcp@".serviceConfig.BindReadOnlyPaths
-                && builtins.elem "%S/hermes-%i" units."hermes-pf@".serviceConfig.BindPaths
-                && !(units."hermes-pf@".serviceConfig ? StateDirectory)
-                &&
-                  units."hermes-dhcp@".serviceConfig.StateDirectory == [
-                    "hermes-dhcp-%i:dhcpcd"
-                  ]
-                &&
-                  units."hermes-dhcp@".serviceConfig.RuntimeDirectory == [
-                    "hermes-dhcp-%i:dhcpcd"
-                    "hermes-dhcp-%i/root"
-                  ]
-                &&
-                  units."hermes-dhcp@".serviceConfig.TemporaryFileSystem == [
-                    "/nix:ro"
-                    "/var/run:mode=1777"
-                  ]
-                && !(units."hermes-dhcp@".serviceConfig ? ReadWritePaths)
-                && units."hermes-dhcp@".serviceConfig.PrivateNetwork
-                && units."hermes-dhcp@".serviceConfig.NoNewPrivileges
-                && units."hermes-dhcp@".serviceConfig.ProtectSystem == "strict"
-                && units."hermes-dhcp@".serviceConfig.ProtectProc == "invisible"
-                && units."hermes-dhcp@".serviceConfig.RestrictNamespaces
-                && units."hermes-dhcp@".serviceConfig.DevicePolicy == "closed"
-                &&
-                  units."hermes-dhcp@".serviceConfig.SystemCallFilter == [
-                    "@system-service"
-                    "~@resources"
-                    "~@privileged"
-                  ]
-                &&
-                  units."hermes-dhcp@".serviceConfig.CapabilityBoundingSet == [
-                    "CAP_NET_ADMIN"
-                    "CAP_NET_BIND_SERVICE"
-                    "CAP_NET_RAW"
-                  ]
-                &&
-                  units."hermes-dhcp@".serviceConfig.AmbientCapabilities == [
-                    "CAP_NET_ADMIN"
-                    "CAP_NET_BIND_SERVICE"
-                    "CAP_NET_RAW"
-                  ]
-                && units."hermes-dhcp@".serviceConfig.DynamicUser
-                && units."hermes-dhcp@".serviceConfig.User == "hermes-dhcp-%i"
-                && units."hermes-dhcp@".unitConfig.JoinsNamespaceOf == [ "hermes-network@%i.service" ]
-                && units."hermes-dhcp@vm".serviceConfig ? ExecStart
-                && builtins.any (
-                  path: nixpkgs-unstable.lib.hasInfix "dhcpcd-10.3.2" path
-                ) units."hermes-dhcp@vm".serviceConfig.BindReadOnlyPaths
-                && builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".requires
-                && builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".bindsTo
-                && builtins.elem "nftables.service" units."hermes-dhcp@".partOf
-                && builtins.elem "systemd-networkd.service" units."hermes-dhcp@".after
-                && builtins.elem "systemd-networkd.service" units."hermes-dhcp@".partOf
-                && units."hermes-network-ready@".serviceConfig.Type == "notify"
-                && units."hermes-network-ready@".serviceConfig.Restart == "no"
-                && units."hermes-network-ready@".serviceConfig.TimeoutStartSec == "60s"
-                && builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo
-                && nixpkgs-unstable.lib.hasInfix "Name=ha0" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "Kind=veth" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "Address=0.0.0.0/30" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "Address=::/64" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "DHCPServer=true" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "IPv4Forwarding=true" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "IPv6Forwarding=true" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "IPv6SendRA=true" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "RequiredForOnline=no" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "PersistLeases=runtime" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "PoolOffset=2" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "PoolSize=1" hostNetworkConfig
-                && nixpkgs-unstable.lib.hasInfix "Router=_server_address" hostNetworkConfig
-                && !(disabledAgentProbe.config.systemd.network.networks ? "40-hermes-agent-0")
-                && !disabledAgentProbe.config.systemd.network.enable
-                && units."hermes-network@".serviceConfig.RestrictNamespaces
-                && units."hermes-host-control@".serviceConfig.RestrictNamespaces
-                && units."hermes-netns@".serviceConfig.RestrictNamespaces
-                && units."hermes-netns@".serviceConfig.CapabilityBoundingSet == ""
-                && units."hermes-host-control@".serviceConfig.CapabilityBoundingSet == [ "CAP_NET_ADMIN" ]
-                && units."hermes-host-control@".serviceConfig.NetworkNamespacePath == "/proc/1/ns/net"
-                && !(units."hermes-host-control@".unitConfig ? JoinsNamespaceOf)
-                && units."hermes-network@".unitConfig.JoinsNamespaceOf == [ "hermes-netns@%i.service" ]
-                && builtins.elem "hermes-host-control@%i.service" units."hermes-network@".bindsTo
-                && builtins.elem "hermes-netns@%i.service" units."hermes-host-control@".bindsTo
-                && units."hermes-network-ready@".serviceConfig.RestrictNamespaces == [ "net" ]
-                && units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
-                && !(units."hermes-network-ready@".serviceConfig ? ReadWritePaths)
-                && builtins.elem "~@privileged" units."hermes-network@".serviceConfig.SystemCallFilter
-                && builtins.elem "~@privileged" units."hermes-network-ready@".serviceConfig.SystemCallFilter
-                && !(builtins.elem "setns" units."hermes-network@".serviceConfig.SystemCallFilter)
-                && !(builtins.elem "setns" units."hermes-host-control@".serviceConfig.SystemCallFilter)
-                && builtins.elem "setns" units."hermes-network-ready@".serviceConfig.SystemCallFilter
-                &&
-                  builtins.all
+                  )
+                  || builtins.trace "Hermes config assertion 184: builtins.elem \"/dev/null:/etc/dhcpcd.exit-hook\" units.\"hermes-dhcp@\".serviceConfig.BindReadOnlyPaths" false
+                )
+                && (
+                  (builtins.elem "%S/hermes-%i" units."hermes-pf@".serviceConfig.BindPaths)
+                  || builtins.trace "Hermes config assertion 185: builtins.elem \"%S/hermes-%i\" units.\"hermes-pf@\".serviceConfig.BindPaths" false
+                )
+                && (
+                  (!(units."hermes-pf@".serviceConfig ? StateDirectory))
+                  || builtins.trace "Hermes config assertion 186: !(units.\"hermes-pf@\".serviceConfig ? StateDirectory)" false
+                )
+                && (
+                  (
+                    units."hermes-dhcp@".serviceConfig.StateDirectory == [
+                      "hermes-dhcp-%i:dhcpcd"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 187: units.\"hermes-dhcp@\".serviceConfig.StateDirectory == [ \"hermes-dhcp-%i:dhcpcd\" ]" false
+                )
+                && (
+                  (
+                    units."hermes-dhcp@".serviceConfig.RuntimeDirectory == [
+                      "hermes-dhcp-%i:dhcpcd"
+                      "hermes-dhcp-%i/root"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 188: units.\"hermes-dhcp@\".serviceConfig.RuntimeDirectory == [ \"hermes-dhcp-%i:dhcpcd\" \"hermes-dhcp-%i/root\" ]" false
+                )
+                && (
+                  (
+                    units."hermes-dhcp@".serviceConfig.TemporaryFileSystem == [
+                      "/nix:ro"
+                      "/var/run:mode=1777"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 189: units.\"hermes-dhcp@\".serviceConfig.TemporaryFileSystem == [ \"/nix:ro\" \"/var/run:mode=1777\" ]" false
+                )
+                && (
+                  (!(units."hermes-dhcp@".serviceConfig ? ReadWritePaths))
+                  || builtins.trace "Hermes config assertion 190: !(units.\"hermes-dhcp@\".serviceConfig ? ReadWritePaths)" false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.PrivateNetwork
+                  || builtins.trace "Hermes config assertion 191: units.\"hermes-dhcp@\".serviceConfig.PrivateNetwork" false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.NoNewPrivileges
+                  || builtins.trace "Hermes config assertion 192: units.\"hermes-dhcp@\".serviceConfig.NoNewPrivileges" false
+                )
+                && (
+                  (units."hermes-dhcp@".serviceConfig.ProtectSystem == "strict")
+                  || builtins.trace "Hermes config assertion 193: units.\"hermes-dhcp@\".serviceConfig.ProtectSystem == \"strict\"" false
+                )
+                && (
+                  (units."hermes-dhcp@".serviceConfig.ProtectProc == "invisible")
+                  || builtins.trace "Hermes config assertion 194: units.\"hermes-dhcp@\".serviceConfig.ProtectProc == \"invisible\"" false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.RestrictNamespaces
+                  || builtins.trace "Hermes config assertion 195: units.\"hermes-dhcp@\".serviceConfig.RestrictNamespaces" false
+                )
+                && (
+                  (units."hermes-dhcp@".serviceConfig.DevicePolicy == "closed")
+                  || builtins.trace "Hermes config assertion 196: units.\"hermes-dhcp@\".serviceConfig.DevicePolicy == \"closed\"" false
+                )
+                && (
+                  (
+                    units."hermes-dhcp@".serviceConfig.SystemCallFilter == [
+                      "@system-service"
+                      "~@resources"
+                      "~@privileged"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 197: units.\"hermes-dhcp@\".serviceConfig.SystemCallFilter == [ \"@system-service\" \"~@resources\" \"~@privileged\" ]" false
+                )
+                && (
+                  (
+                    units."hermes-dhcp@".serviceConfig.CapabilityBoundingSet == [
+                      "CAP_NET_ADMIN"
+                      "CAP_NET_BIND_SERVICE"
+                      "CAP_NET_RAW"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 198: units.\"hermes-dhcp@\".serviceConfig.CapabilityBoundingSet == [ \"CAP_NET_ADMIN\" \"CAP_NET_BIND_SERVICE\" \"CAP_NET_RAW\" ]" false
+                )
+                && (
+                  (
+                    units."hermes-dhcp@".serviceConfig.AmbientCapabilities == [
+                      "CAP_NET_ADMIN"
+                      "CAP_NET_BIND_SERVICE"
+                      "CAP_NET_RAW"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 199: units.\"hermes-dhcp@\".serviceConfig.AmbientCapabilities == [ \"CAP_NET_ADMIN\" \"CAP_NET_BIND_SERVICE\" \"CAP_NET_RAW\" ]" false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.DynamicUser
+                  || builtins.trace "Hermes config assertion 200: units.\"hermes-dhcp@\".serviceConfig.DynamicUser" false
+                )
+                && (
+                  (units."hermes-dhcp@".serviceConfig.User == "hn-dh-%i")
+                  || builtins.trace "Hermes config assertion 201: units.\"hermes-dhcp@\".serviceConfig.User == \"hn-dh-%i\"" false
+                )
+                && (
+                  (units."hermes-dhcp@".unitConfig.JoinsNamespaceOf == [ "hermes-network@%i.service" ])
+                  || builtins.trace "Hermes config assertion 202: units.\"hermes-dhcp@\".unitConfig.JoinsNamespaceOf == [ \"hermes-network@%i.service\" ]" false
+                )
+                && (
+                  (units."hermes-dhcp@vm".serviceConfig ? ExecStart)
+                  || builtins.trace "Hermes config assertion 203: units.\"hermes-dhcp@vm\".serviceConfig ? ExecStart" false
+                )
+                && (
+                  (builtins.any (
+                    path: nixpkgs-unstable.lib.hasInfix "dhcpcd-10.3.2" path
+                  ) units."hermes-dhcp@vm".serviceConfig.BindReadOnlyPaths)
+                  || builtins.trace "Hermes config assertion 204: builtins.any ( path: nixpkgs-unstable.lib.hasInfix \"dhcpcd-10.3.2\" path ) units.\"hermes-dhcp@vm\".serviceConfig.BindReadOnlyPaths" false
+                )
+                && (
+                  (builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".requires)
+                  || builtins.trace "Hermes config assertion 205: builtins.elem \"hermes-dhcp@%i.service\" units.\"hermes-network-ready@\".requires" false
+                )
+                && (
+                  (builtins.elem "hermes-dhcp@%i.service" units."hermes-network-ready@".bindsTo)
+                  || builtins.trace "Hermes config assertion 206: builtins.elem \"hermes-dhcp@%i.service\" units.\"hermes-network-ready@\".bindsTo" false
+                )
+                && (
+                  (builtins.elem "nftables.service" units."hermes-dhcp@".partOf)
+                  || builtins.trace "Hermes config assertion 207: builtins.elem \"nftables.service\" units.\"hermes-dhcp@\".partOf" false
+                )
+                && (
+                  (builtins.elem "systemd-networkd.service" units."hermes-dhcp@".after)
+                  || builtins.trace "Hermes config assertion 208: builtins.elem \"systemd-networkd.service\" units.\"hermes-dhcp@\".after" false
+                )
+                && (
+                  (builtins.elem "systemd-networkd.service" units."hermes-dhcp@".partOf)
+                  || builtins.trace "Hermes config assertion 209: builtins.elem \"systemd-networkd.service\" units.\"hermes-dhcp@\".partOf" false
+                )
+                && (
+                  (units."hermes-network-ready@".serviceConfig.Type == "notify")
+                  || builtins.trace "Hermes config assertion 210: units.\"hermes-network-ready@\".serviceConfig.Type == \"notify\"" false
+                )
+                && (
+                  (units."hermes-network-ready@".serviceConfig.Restart == "no")
+                  || builtins.trace "Hermes config assertion 211: units.\"hermes-network-ready@\".serviceConfig.Restart == \"no\"" false
+                )
+                && (
+                  (units."hermes-network-ready@".serviceConfig.TimeoutStartSec == "60s")
+                  || builtins.trace "Hermes config assertion 212: units.\"hermes-network-ready@\".serviceConfig.TimeoutStartSec == \"60s\"" false
+                )
+                && (
+                  (builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo)
+                  || builtins.trace "Hermes config assertion 213: builtins.elem \"hermes-network-ready@%i.service\" units.\"hermes@\".bindsTo" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "Name=ha0" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 214: nixpkgs-unstable.lib.hasInfix \"Name=ha0\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "Kind=veth" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 215: nixpkgs-unstable.lib.hasInfix \"Kind=veth\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "Address=0.0.0.0/30" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 216: nixpkgs-unstable.lib.hasInfix \"Address=0.0.0.0/30\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "Address=::/64" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 217: nixpkgs-unstable.lib.hasInfix \"Address=::/64\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "DHCPServer=true" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 218: nixpkgs-unstable.lib.hasInfix \"DHCPServer=true\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "IPv4Forwarding=true" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 219: nixpkgs-unstable.lib.hasInfix \"IPv4Forwarding=true\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "IPv6Forwarding=true" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 220: nixpkgs-unstable.lib.hasInfix \"IPv6Forwarding=true\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "IPv6SendRA=true" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 221: nixpkgs-unstable.lib.hasInfix \"IPv6SendRA=true\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "RequiredForOnline=no" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 222: nixpkgs-unstable.lib.hasInfix \"RequiredForOnline=no\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "PersistLeases=runtime" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 223: nixpkgs-unstable.lib.hasInfix \"PersistLeases=runtime\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "PoolOffset=2" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 224: nixpkgs-unstable.lib.hasInfix \"PoolOffset=2\" hostNetworkConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "PoolSize=1" hostNetworkConfig)
+                  || builtins.trace "Hermes config assertion 225: nixpkgs-unstable.lib.hasInfix \"PoolSize=1\" hostNetworkConfig" false
+                )
+                && (
+                  (!(nixpkgs-unstable.lib.hasInfix "Router=" hostNetworkConfig))
+                  || builtins.trace "Hermes config assertion 226: !(nixpkgs-unstable.lib.hasInfix \"Router=\" hostNetworkConfig)" false
+                )
+                && (
+                  (!(disabledAgentProbe.config.systemd.network.networks ? "40-hermes-agent-0"))
+                  || builtins.trace "Hermes config assertion 227: !(disabledAgentProbe.config.systemd.network.networks ? \"40-hermes-agent-0\")" false
+                )
+                && (
+                  (!disabledAgentProbe.config.systemd.network.enable)
+                  || builtins.trace "Hermes config assertion 228: !disabledAgentProbe.config.systemd.network.enable" false
+                )
+                && (
+                  units."hermes-network@".serviceConfig.RestrictNamespaces
+                  || builtins.trace "Hermes config assertion 229: units.\"hermes-network@\".serviceConfig.RestrictNamespaces" false
+                )
+                && (
+                  units."hermes-network@".serviceConfig.DynamicUser
+                  || builtins.trace "Hermes config assertion 230: units.\"hermes-network@\".serviceConfig.DynamicUser" false
+                )
+                && (
+                  (units."hermes-network@".serviceConfig.AmbientCapabilities == [ "CAP_NET_ADMIN" ])
+                  || builtins.trace "Hermes config assertion 231: units.\"hermes-network@\".serviceConfig.AmbientCapabilities == [ \"CAP_NET_ADMIN\" ]" false
+                )
+                && (
+                  units."hermes-host-control@".serviceConfig.RestrictNamespaces
+                  || builtins.trace "Hermes config assertion 232: units.\"hermes-host-control@\".serviceConfig.RestrictNamespaces" false
+                )
+                && (
+                  units."hermes-netns@".serviceConfig.RestrictNamespaces
+                  || builtins.trace "Hermes config assertion 233: units.\"hermes-netns@\".serviceConfig.RestrictNamespaces" false
+                )
+                && (
+                  (units."hermes-netns@".serviceConfig.CapabilityBoundingSet == "")
+                  || builtins.trace "Hermes config assertion 234: units.\"hermes-netns@\".serviceConfig.CapabilityBoundingSet == \"\"" false
+                )
+                && (
+                  (units."hermes-host-control@".serviceConfig.CapabilityBoundingSet == [ "CAP_NET_ADMIN" ])
+                  || builtins.trace "Hermes config assertion 235: units.\"hermes-host-control@\".serviceConfig.CapabilityBoundingSet == [ \"CAP_NET_ADMIN\" ]" false
+                )
+                && (
+                  (units."hermes-host-control@".serviceConfig.NetworkNamespacePath == "/proc/1/ns/net")
+                  || builtins.trace "Hermes config assertion 236: units.\"hermes-host-control@\".serviceConfig.NetworkNamespacePath == \"/proc/1/ns/net\"" false
+                )
+                && (
+                  (!(units."hermes-host-control@".unitConfig ? JoinsNamespaceOf))
+                  || builtins.trace "Hermes config assertion 237: !(units.\"hermes-host-control@\".unitConfig ? JoinsNamespaceOf)" false
+                )
+                && (
+                  (units."hermes-network@".unitConfig.JoinsNamespaceOf == [ "hermes-netns@%i.service" ])
+                  || builtins.trace "Hermes config assertion 238: units.\"hermes-network@\".unitConfig.JoinsNamespaceOf == [ \"hermes-netns@%i.service\" ]" false
+                )
+                && (
+                  (builtins.elem "hermes-host-control@%i.service" units."hermes-network@".bindsTo)
+                  || builtins.trace "Hermes config assertion 239: builtins.elem \"hermes-host-control@%i.service\" units.\"hermes-network@\".bindsTo" false
+                )
+                && (
+                  (builtins.elem "hermes-netns@%i.service" units."hermes-host-control@".bindsTo)
+                  || builtins.trace "Hermes config assertion 240: builtins.elem \"hermes-netns@%i.service\" units.\"hermes-host-control@\".bindsTo" false
+                )
+                && (
+                  (builtins.elem "hermes-network-failure@%i.service"
+                    units."hermes-host-control@".unitConfig.OnFailure
+                  )
+                  || builtins.trace "Hermes config assertion 260: host-control OnFailure schedules the namespace stop helper" false
+                )
+                && (
+                  (units."hermes-network-failure@".serviceConfig.RootDirectory == "%t/hermes-network-failure-%i/root")
+                  || builtins.trace "Hermes config assertion 261: network-failure has an isolated root" false
+                )
+                && (
+                  (units."hermes-network-failure@".serviceConfig.CapabilityBoundingSet == "")
+                  || builtins.trace "Hermes config assertion 262: network-failure has an empty capability bounding set" false
+                )
+                && (
+                  (units."hermes-network-failure@".serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ])
+                  || builtins.trace "Hermes config assertion 263: network-failure only opens AF_UNIX" false
+                )
+                && (
+                  (builtins.elem "/run/dbus/system_bus_socket"
+                    units."hermes-network-failure@".serviceConfig.BindReadOnlyPaths
+                  )
+                  || builtins.trace "Hermes config assertion 264: network-failure gets only the D-Bus manager socket" false
+                )
+                && (
+                  units."hermes-network-ready@".serviceConfig.RestrictNamespaces
+                  || builtins.trace "Hermes config assertion 241: units.\"hermes-network-ready@\".serviceConfig.RestrictNamespaces" false
+                )
+                && (
+                  units."hermes-network-ready@".serviceConfig.MemoryDenyWriteExecute
+                  || builtins.trace "Hermes config assertion 242: units.\"hermes-network-ready@\".serviceConfig.MemoryDenyWriteExecute" false
+                )
+                && (
+                  (!(units."hermes-network-ready@".serviceConfig ? ReadWritePaths))
+                  || builtins.trace "Hermes config assertion 243: !(units.\"hermes-network-ready@\".serviceConfig ? ReadWritePaths)" false
+                )
+                && (
+                  (builtins.any (
+                    path: nixpkgs-unstable.lib.hasInfix "/run/hermes-observation-vm" path
+                  ) units."hermes-network-ready@vm".serviceConfig.BindReadOnlyPaths)
+                  || builtins.trace "Hermes config assertion 255: network-ready instance binds its observer telemetry read-only" false
+                )
+                && (
+                  (builtins.elem "~@privileged" units."hermes-network@".serviceConfig.SystemCallFilter)
+                  || builtins.trace "Hermes config assertion 244: builtins.elem \"~@privileged\" units.\"hermes-network@\".serviceConfig.SystemCallFilter" false
+                )
+                && (
+                  (builtins.elem "~@privileged" units."hermes-network-ready@".serviceConfig.SystemCallFilter)
+                  || builtins.trace "Hermes config assertion 245: builtins.elem \"~@privileged\" units.\"hermes-network-ready@\".serviceConfig.SystemCallFilter" false
+                )
+                && (
+                  (!(builtins.elem "setns" units."hermes-network@".serviceConfig.SystemCallFilter))
+                  || builtins.trace "Hermes config assertion 246: !(builtins.elem \"setns\" units.\"hermes-network@\".serviceConfig.SystemCallFilter)" false
+                )
+                && (
+                  (!(builtins.elem "setns" units."hermes-host-control@".serviceConfig.SystemCallFilter))
+                  || builtins.trace "Hermes config assertion 247: !(builtins.elem \"setns\" units.\"hermes-host-control@\".serviceConfig.SystemCallFilter)" false
+                )
+                && (
+                  (!(builtins.elem "setns" units."hermes-network-ready@".serviceConfig.SystemCallFilter))
+                  || builtins.trace "Hermes config assertion 248: !(builtins.elem \"setns\" units.\"hermes-network-ready@\".serviceConfig.SystemCallFilter)" false
+                )
+                && (
+                  (builtins.all
                     (syscall: !(builtins.elem syscall units."hermes-network@".serviceConfig.SystemCallFilter))
                     [
                       "setgid"
@@ -738,9 +1697,12 @@
                       "setresuid"
                       "setuid"
                     ]
-                &&
-                  builtins.all
-                    (syscall: builtins.elem syscall units."hermes-network-ready@".serviceConfig.SystemCallFilter)
+                  )
+                  || builtins.trace "Hermes config assertion 249: builtins.all (syscall: !(builtins.elem syscall units.\"hermes-network@\".serviceConfig.SystemCallFilter)) [ \"setgid\" \"setgroups\" \"se" false
+                )
+                && (
+                  (builtins.all
+                    (syscall: !(builtins.elem syscall units."hermes-network-ready@".serviceConfig.SystemCallFilter))
                     [
                       "setgid"
                       "setgroups"
@@ -748,56 +1710,323 @@
                       "setresuid"
                       "setuid"
                     ]
-                &&
-                  units."hermes-network@".serviceConfig.CapabilityBoundingSet == [
-                    "CAP_NET_ADMIN"
-                  ]
-                &&
-                  units."hermes-network-ready@".serviceConfig.CapabilityBoundingSet == [
-                    "CAP_NET_ADMIN"
-                    "CAP_NET_BIND_SERVICE"
-                    "CAP_SETGID"
-                    "CAP_SETUID"
-                    "CAP_SYS_ADMIN"
-                    "CAP_SYS_PTRACE"
-                  ]
-                && existingNetworkdProbe.config.networking.useNetworkd
-                && existingNetworkdProbe.config.systemd.network.wait-online.enable
-                && networkManagerProbe.config.systemd.network.wait-online.enable == false
-                && networkManagerProbe.config.networking.dhcpcd.enable
-                && units."hermes-network@".serviceConfig.PrivateNetwork
-                && units."hermes-network@".serviceConfig.Type == "oneshot"
-                && units."hermes-network@vm".serviceConfig ? ExecStart
-                && units."hermes-host-control@vm".serviceConfig ? ExecStopPost
-                && units."hermes-network@vm-peer".serviceConfig ? ExecStart
-                && units."hermes-host-control@vm-peer".serviceConfig ? ExecStopPost
-                && !(builtins.elem "CAP_SYS_PTRACE" units."hermes-network@".serviceConfig.CapabilityBoundingSet)
-                && units."hermes-pf@".serviceConfig.PrivateNetwork
-                && units."hermes-pf@".serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ]
-                && builtins.elem "hermes@%i.service" units."hermes-pf@".partOf
-                && builtins.length units."hermes@".serviceConfig.ExecStartPre == 1
-                && units."hermes-pf@".serviceConfig ? ExecStart
-                && hermesModuleVm.config.networking.nftables.enable
-                && hermesModuleVm.config.networking.firewall.backend == "nftables"
-                && hermesModuleVm.config.networking.firewall.filterForward
-                && hermesModuleVm.config.networking.nat.enable
-                && hermesModuleVm.config.networking.nat.enableIPv6
-                && hermesModuleVm.config.systemd.network.enable
-                && !hermesModuleVm.config.systemd.network.wait-online.enable
-                && !hermesModuleVm.config.services.resolved.enable
-                && builtins.elem hostNetworkSource networkdReloadTriggers
-                && !hermesModuleVm.config.systemd.services.systemd-networkd.stopIfChanged
-                && nixpkgs-unstable.lib.hasInfix "policy drop" guardConfig
-                && nixpkgs-unstable.lib.hasInfix "iifname != { \"ha0\", \"ha1\" } accept" guardConfig
-                && builtins.elem "ha0" hermesModuleVm.config.networking.nat.internalInterfaces
-                && builtins.elem "ha1" hermesModuleVm.config.networking.nat.internalInterfaces
-                && builtins.hasAttr "hermes-agent-guard" hermesModuleVm.config.networking.nftables.tables
-                && nixpkgs-unstable.lib.hasInfix "ha0" hermesModuleVm.config.networking.firewall.extraInputRules
-                && nixpkgs-unstable.lib.hasInfix "ha1" hermesModuleVm.config.networking.firewall.extraInputRules
-                && nixpkgs-unstable.lib.hasInfix "ha0" hermesModuleVm.config.networking.firewall.extraForwardRules
-                && nixpkgs-unstable.lib.hasInfix "ha1" hermesModuleVm.config.networking.firewall.extraForwardRules
-                && builtins.elem "%S/hermes-vm-peer" units."hermes@vm".serviceConfig.BindPaths
-                && builtins.elem "%S/hermes-vm" units."hermes@vm-peer".serviceConfig.BindPaths
+                  )
+                  || builtins.trace "Hermes config assertion 250: builtins.all (syscall: !(builtins.elem syscall units.\"hermes-network-ready@\".serviceConfig.SystemCallFilter)) [ \"setgid\" \"setgroup" false
+                )
+                && (
+                  (
+                    units."hermes-network@".serviceConfig.CapabilityBoundingSet == [
+                      "CAP_NET_ADMIN"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 251: units.\"hermes-network@\".serviceConfig.CapabilityBoundingSet == [ \"CAP_NET_ADMIN\" ]" false
+                )
+                && (
+                  (units."hermes-network-ready@".serviceConfig.CapabilityBoundingSet == "")
+                  || builtins.trace "Hermes config assertion 252: units.\"hermes-network-ready@\".serviceConfig.CapabilityBoundingSet == \"\"" false
+                )
+                && (
+                  units."hermes-network-ready@".serviceConfig.DynamicUser
+                  || builtins.trace "Hermes config assertion 253: units.\"hermes-network-ready@\".serviceConfig.DynamicUser" false
+                )
+                && (
+                  (units."hermes-network-ready@".serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ])
+                  || builtins.trace "Hermes config assertion 254: units.\"hermes-network-ready@\".serviceConfig.RestrictAddressFamilies == [ \"AF_UNIX\" ]" false
+                )
+                && (
+                  (units."hermes-network-observer@".serviceConfig.CapabilityBoundingSet == "")
+                  || builtins.trace "Hermes config assertion 255: units.\"hermes-network-observer@\".serviceConfig.CapabilityBoundingSet == \"\"" false
+                )
+                && (
+                  (units."hermes-host-proxy@".serviceConfig.CapabilityBoundingSet == "")
+                  || builtins.trace "Hermes config assertion 256: units.\"hermes-host-proxy@\".serviceConfig.CapabilityBoundingSet == \"\"" false
+                )
+                && (
+                  (units."hermes-dns@".serviceConfig.CapabilityBoundingSet == [ "CAP_NET_BIND_SERVICE" ])
+                  || builtins.trace "Hermes config assertion 257: units.\"hermes-dns@\".serviceConfig.CapabilityBoundingSet == [ \"CAP_NET_BIND_SERVICE\" ]" false
+                )
+                && (
+                  (builtins.all
+                    (
+                      role:
+                      let
+                        service = units."hermes-${role}@".serviceConfig;
+                      in
+                      service.DynamicUser
+                      && service.RestrictNamespaces
+                      && service.DevicePolicy == "closed"
+                      && service.ProtectSystem == "strict"
+                      && builtins.elem "~@privileged" service.SystemCallFilter
+                      && !(builtins.elem "setns" service.SystemCallFilter)
+                      && !(service ? BindPaths)
+                    )
+                    [
+                      "network-observer"
+                      "dns"
+                      "host-proxy"
+                      "agent-relay"
+                      "network-ready"
+                    ]
+                  )
+                  || builtins.trace "Hermes config assertion 258: builtins.all ( role: let service = units.\"hermes-\${role}@\".serviceConfig; in service.DynamicUser && service.RestrictNamespaces && " false
+                )
+                && (
+                  existingNetworkdProbe.config.networking.useNetworkd
+                  || builtins.trace "Hermes config assertion 259: existingNetworkdProbe.config.networking.useNetworkd" false
+                )
+                && (
+                  existingNetworkdProbe.config.systemd.network.wait-online.enable
+                  || builtins.trace "Hermes config assertion 260: existingNetworkdProbe.config.systemd.network.wait-online.enable" false
+                )
+                && (
+                  (networkManagerProbe.config.systemd.network.wait-online.enable == false)
+                  || builtins.trace "Hermes config assertion 261: networkManagerProbe.config.systemd.network.wait-online.enable == false" false
+                )
+                && (
+                  networkManagerProbe.config.networking.dhcpcd.enable
+                  || builtins.trace "Hermes config assertion 262: networkManagerProbe.config.networking.dhcpcd.enable" false
+                )
+                && (
+                  units."hermes-network@".serviceConfig.PrivateNetwork
+                  || builtins.trace "Hermes config assertion 263: units.\"hermes-network@\".serviceConfig.PrivateNetwork" false
+                )
+                && (
+                  (units."hermes-network@".serviceConfig.Type == "oneshot")
+                  || builtins.trace "Hermes config assertion 264: units.\"hermes-network@\".serviceConfig.Type == \"oneshot\"" false
+                )
+                && (
+                  (units."hermes-network@vm".serviceConfig ? ExecStart)
+                  || builtins.trace "Hermes config assertion 265: units.\"hermes-network@vm\".serviceConfig ? ExecStart" false
+                )
+                && (
+                  (units."hermes-host-control@vm".serviceConfig ? ExecStopPost)
+                  || builtins.trace "Hermes config assertion 266: units.\"hermes-host-control@vm\".serviceConfig ? ExecStopPost" false
+                )
+                && (
+                  (units."hermes-network@vm-peer".serviceConfig ? ExecStart)
+                  || builtins.trace "Hermes config assertion 267: units.\"hermes-network@vm-peer\".serviceConfig ? ExecStart" false
+                )
+                && (
+                  (units."hermes-host-control@vm-peer".serviceConfig ? ExecStopPost)
+                  || builtins.trace "Hermes config assertion 268: units.\"hermes-host-control@vm-peer\".serviceConfig ? ExecStopPost" false
+                )
+                && (
+                  (!(builtins.elem "CAP_SYS_PTRACE" units."hermes-network@".serviceConfig.CapabilityBoundingSet))
+                  || builtins.trace "Hermes config assertion 269: !(builtins.elem \"CAP_SYS_PTRACE\" units.\"hermes-network@\".serviceConfig.CapabilityBoundingSet)" false
+                )
+                && (
+                  units."hermes-pf@".serviceConfig.PrivateNetwork
+                  || builtins.trace "Hermes config assertion 270: units.\"hermes-pf@\".serviceConfig.PrivateNetwork" false
+                )
+                && (
+                  (units."hermes-pf@".serviceConfig.RestrictAddressFamilies == [ ])
+                  || builtins.trace "Hermes config assertion 271: units.\"hermes-pf@\".serviceConfig.RestrictAddressFamilies == [ ]" false
+                )
+                && (
+                  (builtins.elem "~socket" units."hermes-pf@".serviceConfig.SystemCallFilter)
+                  || builtins.trace "Hermes config assertion 272: builtins.elem \"~socket\" units.\"hermes-pf@\".serviceConfig.SystemCallFilter" false
+                )
+                && (
+                  (builtins.elem "hermes@%i.service" units."hermes-pf@".partOf)
+                  || builtins.trace "Hermes config assertion 273: builtins.elem \"hermes@%i.service\" units.\"hermes-pf@\".partOf" false
+                )
+                && (
+                  (builtins.length units."hermes@".serviceConfig.ExecStartPre == 1)
+                  || builtins.trace "Hermes config assertion 274: builtins.length units.\"hermes@\".serviceConfig.ExecStartPre == 1" false
+                )
+                && (
+                  (units."hermes-pf@".serviceConfig ? ExecStart)
+                  || builtins.trace "Hermes config assertion 275: units.\"hermes-pf@\".serviceConfig ? ExecStart" false
+                )
+                && (
+                  hermesModuleVm.config.networking.nftables.enable
+                  || builtins.trace "Hermes config assertion 276: hermesModuleVm.config.networking.nftables.enable" false
+                )
+                && (
+                  (hermesModuleVm.config.networking.firewall.backend == "nftables")
+                  || builtins.trace "Hermes config assertion 277: hermesModuleVm.config.networking.firewall.backend == \"nftables\"" false
+                )
+                && (
+                  hermesModuleVm.config.networking.firewall.filterForward
+                  || builtins.trace "Hermes config assertion 278: hermesModuleVm.config.networking.firewall.filterForward" false
+                )
+                && (
+                  hermesModuleVm.config.networking.nat.enable
+                  || builtins.trace "Hermes config assertion 279: hermesModuleVm.config.networking.nat.enable" false
+                )
+                && (
+                  hermesModuleVm.config.networking.nat.enableIPv6
+                  || builtins.trace "Hermes config assertion 280: hermesModuleVm.config.networking.nat.enableIPv6" false
+                )
+                && (
+                  hermesModuleVm.config.systemd.network.enable
+                  || builtins.trace "Hermes config assertion 281: hermesModuleVm.config.systemd.network.enable" false
+                )
+                && (
+                  (!hermesModuleVm.config.systemd.network.wait-online.enable)
+                  || builtins.trace "Hermes config assertion 282: !hermesModuleVm.config.systemd.network.wait-online.enable" false
+                )
+                && (
+                  (!hermesModuleVm.config.services.resolved.enable)
+                  || builtins.trace "Hermes config assertion 283: !hermesModuleVm.config.services.resolved.enable" false
+                )
+                && (
+                  (builtins.elem hostNetworkSource networkdReloadTriggers)
+                  || builtins.trace "Hermes config assertion 284: builtins.elem hostNetworkSource networkdReloadTriggers" false
+                )
+                && (
+                  (!hermesModuleVm.config.systemd.services.systemd-networkd.stopIfChanged)
+                  || builtins.trace "Hermes config assertion 285: !hermesModuleVm.config.systemd.services.systemd-networkd.stopIfChanged" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "policy drop" guardConfig)
+                  || builtins.trace "Hermes config assertion 286: nixpkgs-unstable.lib.hasInfix \"policy drop\" guardConfig" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "iifname != { \"ha0\", \"ha1\" } accept" guardConfig)
+                  || builtins.trace "Hermes config assertion 287: nixpkgs-unstable.lib.hasInfix \"iifname != { \\\"ha0\\\", \\\"ha1\\\" } accept\" guardConfig" false
+                )
+                && (
+                  (builtins.elem "ha0" hermesModuleVm.config.networking.nat.internalInterfaces)
+                  || builtins.trace "Hermes config assertion 288: builtins.elem \"ha0\" hermesModuleVm.config.networking.nat.internalInterfaces" false
+                )
+                && (
+                  (builtins.elem "ha1" hermesModuleVm.config.networking.nat.internalInterfaces)
+                  || builtins.trace "Hermes config assertion 289: builtins.elem \"ha1\" hermesModuleVm.config.networking.nat.internalInterfaces" false
+                )
+                && (
+                  (builtins.hasAttr "hermes-agent-guard" hermesModuleVm.config.networking.nftables.tables)
+                  || builtins.trace "Hermes config assertion 290: builtins.hasAttr \"hermes-agent-guard\" hermesModuleVm.config.networking.nftables.tables" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "ha0" hermesModuleVm.config.networking.firewall.extraInputRules)
+                  || builtins.trace "Hermes config assertion 291: nixpkgs-unstable.lib.hasInfix \"ha0\" hermesModuleVm.config.networking.firewall.extraInputRules" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "ha1" hermesModuleVm.config.networking.firewall.extraInputRules)
+                  || builtins.trace "Hermes config assertion 292: nixpkgs-unstable.lib.hasInfix \"ha1\" hermesModuleVm.config.networking.firewall.extraInputRules" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "ha0" hermesModuleVm.config.networking.firewall.extraForwardRules)
+                  || builtins.trace "Hermes config assertion 293: nixpkgs-unstable.lib.hasInfix \"ha0\" hermesModuleVm.config.networking.firewall.extraForwardRules" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "ha1" hermesModuleVm.config.networking.firewall.extraForwardRules)
+                  || builtins.trace "Hermes config assertion 294: nixpkgs-unstable.lib.hasInfix \"ha1\" hermesModuleVm.config.networking.firewall.extraForwardRules" false
+                )
+                && (
+                  (builtins.elem "%S/hermes-vm-peer" units."hermes@vm".serviceConfig.BindPaths)
+                  || builtins.trace "Hermes config assertion 295: builtins.elem \"%S/hermes-vm-peer\" units.\"hermes@vm\".serviceConfig.BindPaths" false
+                )
+                && (
+                  (builtins.elem "%S/hermes-vm" units."hermes@vm-peer".serviceConfig.BindPaths)
+                  || builtins.trace "Hermes config assertion 296: builtins.elem \"%S/hermes-vm\" units.\"hermes@vm-peer\".serviceConfig.BindPaths" false
+                )
+                && (
+                  networkdIdleVm.config.systemd.network.enable
+                  || builtins.trace "Hermes config assertion 297: networkdIdleVm.config.systemd.network.enable" false
+                )
+                && (
+                  (
+                    !builtins.hasAttr "40-hermes-agent-0" networkdIdleVm.config.systemd.network.networks
+                    && !builtins.hasAttr "40-hermes-agent-1" networkdIdleVm.config.systemd.network.networks
+                  )
+                  || builtins.trace "Hermes config assertion 298: previous-generation network entries are removed" false
+                )
+                && (
+                  (
+                    !builtins.hasAttr "systemd/network/40-hermes-agent-0.network" networkdIdleVm.config.environment.etc
+                    && !builtins.hasAttr "systemd/network/40-hermes-agent-1.network" networkdIdleVm.config.environment.etc
+                  )
+                  || builtins.trace "Hermes config assertion 299: previous generation has no Hermes .network sources" false
+                )
+                && (
+                  (changedHostNetworkSource != hostNetworkSource)
+                  || builtins.trace "Hermes config assertion 300: changedHostNetworkSource != hostNetworkSource" false
+                )
+                && (
+                  (builtins.elem changedHostNetworkSource changedNetworkdReloadTriggers)
+                  || builtins.trace "Hermes config assertion 301: changed network source is in reloadTriggers" false
+                )
+                && (
+                  (nixpkgs-unstable.lib.hasInfix "# Hermes networkd activation change probe" (
+                    builtins.readFile changedHostNetworkSource
+                  ))
+                  || builtins.trace "Hermes config assertion 302: changed network source has the activation probe comment" false
+                )
+                && (
+                  (
+                    networkdActivationVm.config.systemd.services.hermes-vm-generation-rollback-launcher.environment.HERMES_VM_PREVIOUS_SYSTEM
+                    == networkdIdleVm.config.system.build.toplevel
+                  )
+                  || builtins.trace "Hermes config assertion 303: launcher previous system path is pinned" false
+                )
+                && (
+                  (
+                    networkdActivationVm.config.systemd.services.hermes-vm-generation-rollback-launcher.environment.HERMES_VM_UPDATED_SYSTEM
+                    == networkdChangedVm.config.system.build.toplevel
+                  )
+                  || builtins.trace "Hermes config assertion 304: launcher changed system path is pinned" false
+                )
+                && (
+                  (builtins.elem "multi-user.target"
+                    networkdActivationVm.config.systemd.units."hermes-vm-generation-rollback-launcher.service".wantedBy
+                  )
+                  || builtins.trace "Hermes config assertion 305: activation launcher is enabled only for the probe VM" false
+                )
+                && (
+                  (
+                    networkdIdleVm.config.systemd.services."hermes@vm".wantedBy == [ ]
+                    && networkdIdleVm.config.systemd.services."hermes-pf@vm".wantedBy == [ ]
+                  )
+                  || builtins.trace "Hermes config assertion 306: previous generation does not want Hermes service instances" false
+                )
+                && (
+                  builtins.length (networkdConfigSetTriggers networkdReloadTriggers) == 1
+                  && builtins.length (networkdConfigSetTriggers idleNetworkdReloadTriggers) == 1
+                  && builtins.length (networkdConfigSetTriggers changedNetworkdReloadTriggers) == 1
+                  || builtins.trace "Hermes config assertion 307: all active generations retain one membership reload trigger" false
+                )
+                && (
+                  (builtins.head (networkdConfigSetTriggers networkdReloadTriggers))
+                  != (builtins.head (networkdConfigSetTriggers idleNetworkdReloadTriggers))
+                  || builtins.trace "Hermes config assertion 308: removal changes membership reload trigger" false
+                )
+                && (
+                  (builtins.head (networkdConfigSetTriggers networkdReloadTriggers))
+                  != (builtins.head (networkdConfigSetTriggers changedNetworkdReloadTriggers))
+                  || builtins.trace "Hermes config assertion 309: source update changes membership reload trigger" false
+                )
+                && (
+                  nixpkgs-unstable.lib.hasInfix "removed:systemd/network/40-hermes-agent-0.network" (
+                    builtins.readFile (builtins.head (networkdConfigSetTriggers idleNetworkdReloadTriggers))
+                  )
+                  || builtins.trace "Hermes config assertion 310: removed network is represented in the always-present trigger" false
+                )
+                && (
+                  (
+                    builtins.length (
+                      networkdConfigSetTriggers (
+                        disabledAgentProbe.config.systemd.services.systemd-networkd.reloadTriggers or [ ]
+                      )
+                    ) == 0
+                  )
+                  || builtins.trace "Hermes config assertion 311: zero-agent configuration adds no membership reload trigger" false
+                )
+                && (
+                  defaultOnRuntimeVm.config.services.hermes-specialised-agent.installDefaultSkills
+                  && defaultOnRuntimeVm.config.services.hermes-specialised-agent.agents.vm.headroomEnable
+                  &&
+                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
+                    == "1"
+                  &&
+                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
+                    == "1"
+                  &&
+                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_DEFAULT_ON_TEST
+                    == "1"
+                  || builtins.trace "Hermes config assertion 312: runtime default-on probe enables skills and Headroom" false
+                )
               then
                 "true"
               else
@@ -809,7 +2038,7 @@
                 && builtins.hasAttr "hermes-module-vm-agent-smoke" hermesModuleVm.config.systemd.services
                 &&
                   hermesModuleVm.config.systemd.services.hermes-module-vm-agent-smoke.serviceConfig.TimeoutStartSec
-                  == "3600s"
+                  == "5400s"
               then
                 "true"
               else
@@ -826,6 +2055,18 @@
             test -f ${hermesModuleVmGatewayStart}
             test -f ${defaultOnGatewayStart}
             ! grep -Fq -- '--intercept-tool-results' ${defaultOnGatewayStart}
+            test ${
+              if
+                defaultOnGatewaySettings.headroom != null
+                && builtins.elem "--memory" defaultOnGatewaySettings.headroom
+                && builtins.elem "--learn" defaultOnGatewaySettings.headroom
+                && builtins.elem "--code-graph" defaultOnGatewaySettings.headroom
+                && !(builtins.elem "--intercept-tool-results" defaultOnGatewaySettings.headroom)
+              then
+                "true"
+              else
+                "false"
+            } = true
             ! grep -Fqi 'mnemosyne' ${hermesAgentClosure}/store-paths
             touch "$out"
           '';
@@ -904,6 +2145,8 @@
       nixosConfigurations.hermes-module-vm = hermesModuleVm;
       nixosConfigurations.hermes-module-vm-explicit-dashboard = explicitDashboardProbe;
       nixosConfigurations.hermes-module-vm-internet = internetEnabledVm;
+      nixosConfigurations.hermes-module-vm-default-on = defaultOnRuntimeVm;
+      nixosConfigurations.hermes-module-vm-networkd-activation = networkdActivationVm;
       overlays.default =
         final: prev:
         let

@@ -6,37 +6,29 @@
   ...
 }:
 let
-  addressFilter = pkgs.writeText "hermes-agent-address-filter.py" ''
-    import json
-    import sys
 
-    def usable(item, family, prefix):
-        if item.get("family") != family or item.get("prefixlen") != prefix or item.get("scope") != "global":
-            return False
-        if set(item.get("flags", [])) & {"tentative", "dadfailed", "deprecated"} or any(item.get(flag) for flag in ("tentative", "dadfailed", "deprecated")):
-            return False
-        return not any(value is not None and value != "forever" and int(value) <= 0 for value in (item.get("valid_life_time"), item.get("preferred_life_time")))
-
-    if sys.argv[1:] == ["--self-test"]:
-        fixture = [
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::1"},
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::2", "tentative": True},
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::3", "dadfailed": True},
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::4", "deprecated": True},
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::5", "flags": ["tentative"]},
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::6", "preferred_life_time": 0},
-            {"family": "inet6", "prefixlen": 64, "scope": "global", "local": "2001:db8::7", "valid_life_time": 0},
-        ]
-        assert [item["local"] for item in fixture if usable(item, "inet6", 64)] == ["2001:db8::1"]
-        sys.exit(0)
-
-    expected_family, expected_prefix = sys.argv[1], int(sys.argv[2])
-    data = json.load(sys.stdin)
-    for link in data:
-        for item in link.get("addr_info", []):
-            if usable(item, expected_family, expected_prefix):
-                print(item["local"])
-  '';
+  networkRecord = pkgs.writeTextFile {
+    name = "hermes-network-record";
+    destination = "/network_record.py";
+    text = builtins.readFile ./hermes-network/network_record.py;
+  };
+  networkPython = pkgs.python3.withPackages (p: [ p.dbus-python ]);
+  controllerLibrary = pkgs.linkFarm "hermes-controller-lib" [
+    {
+      name = "setup.py";
+      path = ./hermes-network/setup.py;
+    }
+    {
+      name = "systemd_manager.py";
+      path = ./hermes-network/systemd_manager.py;
+    }
+  ];
+  pythonCommand =
+    script: settings:
+    let
+      settingsFile = pkgs.writeText "${baseNameOf script}.json" (builtins.toJSON settings);
+    in
+    "${pkgs.python3}/bin/python3 -I -B ${script} ${settingsFile}";
   agentFullNameDuplicatesMessage = lib.concatStringsSep ", " (
     mapAttrsToList (n: count: "\"${n}\" (${toString count} times)") duplicateAgentFullNamesCounts
   );
@@ -348,16 +340,7 @@ let
       util-linux
       ;
   };
-  gatewayOwnershipExecStartPre = pkgs.writeShellApplication {
-    name = "hermes-agent-exec-start-pre";
-    runtimeInputs = [ pkgs.coreutils ];
-    text = ''
-      uid="$(stat --printf=%u -- "''${RUNTIME_DIRECTORY%%:*}")"
-      gid="$(stat --printf=%g -- "''${RUNTIME_DIRECTORY%%:*}")"
-
-      exec chown -R "$uid:$gid" -- "$HOME"
-    '';
-  };
+  gatewayOwnershipExecStartPre = "${pkgs.python3}/bin/python3 -I -B ${./hermes-runtime/ownership.py} ${pkgs.coreutils}/bin/chown";
 
   isIPv4Address =
     address:
@@ -519,6 +502,20 @@ let
         };
     }) activeAgentNames
   );
+  networkdConfigSetTrigger = pkgs.writeText "hermes-networkd-config-set" (
+    builtins.toJSON (
+      map (
+        network:
+        let
+          file = "systemd/network/40-hermes-agent-${toString network.index}.network";
+        in
+        if builtins.hasAttr file config.environment.etc then
+          config.environment.etc.${file}.source
+        else
+          "removed:${file}"
+      ) (builtins.attrValues agentNetworks)
+    )
+  );
   # The priority -150 guard owns per-agent authorization before these NixOS chain passthroughs.
   agentFirewallInputRules = concatStringsSep "\n" (
     map (network: ''iifname "${network.hostIf}" accept'') (builtins.attrValues agentNetworks)
@@ -602,463 +599,6 @@ let
   agentFirewallForwardRules = concatStringsSep "\n" (
     map (network: ''iifname "${network.hostIf}" accept'') (builtins.attrValues agentNetworks)
   );
-  mkAgentNetworkSetup =
-    name: network: portMappings:
-    let
-      loopbackMappings = lib.unique (
-        lib.concatMap (
-          mapping:
-          map (protocol: {
-            inherit protocol;
-            inherit (mapping) agentPort;
-          }) (mappingProtocols mapping)
-        ) (builtins.filter (mapping: mapping.target == "loopback") portMappings)
-      );
-      namespaceRelayCommands = concatStringsSep "\n" (
-        map (
-          mapping:
-          let
-            checkFlags = if mapping.protocol == "tcp" then "-ltn" else "-lun";
-            relay =
-              if mapping.protocol == "tcp" then
-                "TCP4-LISTEN:${toString mapping.agentPort},bind=\"$agent_ip\",reuseaddr,fork TCP4:127.0.0.1:${toString mapping.agentPort}"
-              else
-                "UDP4-RECVFROM:${toString mapping.agentPort},bind=\"$agent_ip\",fork UDP4-SENDTO:127.0.0.1:${toString mapping.agentPort}";
-          in
-          ''
-            ${lib.getExe' pkgs.util-linux "setpriv"} --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
-              ${lib.getExe' pkgs.socat "socat"} \
-              ${relay} >/dev/null 2>&1 &
-            relay_pid=$!
-            relay_pids+=("$relay_pid")
-            for _ in {1..50}; do
-              if ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "$agent_ip:${toString mapping.agentPort}"; then break; fi
-              sleep 0.1
-            done
-            ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.agentPort}" | grep -Fq "$agent_ip:${toString mapping.agentPort}" || {
-              fail_ready "${mapping.protocol} loopback relay failed to bind namespace port ${toString mapping.agentPort}"
-            }
-          ''
-        ) loopbackMappings
-      );
-      hostForwardCommands = concatStringsSep "\n" (
-        map (
-          mapping:
-          let
-            checkFlags = if mapping.protocol == "tcp" then "-ltn" else "-lun";
-            proxy =
-              if mapping.protocol == "tcp" then
-                "TCP4-LISTEN:${toString mapping.hostPort},bind=127.0.0.1,reuseaddr,fork TCP4:\"$agent_ip\":${toString mapping.agentPort}"
-              else
-                "UDP4-RECVFROM:${toString mapping.hostPort},bind=127.0.0.1,fork UDP4-SENDTO:\"$agent_ip\":${toString mapping.agentPort}";
-          in
-          ''
-            if host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -q .; then
-              fail_ready "Host loopback port ${toString mapping.hostPort} is already in use"
-            fi
-            ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.util-linux "setpriv"} \
-              --no-new-privs --reuid=nobody --regid=nogroup --clear-groups -- \
-              ${lib.getExe' pkgs.socat "socat"} \
-              ${proxy} >/dev/null &
-            proxy_pid=$!
-            proxy_pids+=("$proxy_pid")
-            for _ in {1..50}; do
-              if host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}"; then
-                echo "Forwarding host 127.0.0.1:${toString mapping.hostPort} (${mapping.protocol}) to hermes@${name} port ${toString mapping.agentPort}"
-                break
-              fi
-              sleep 0.1
-            done
-            host ${lib.getExe' pkgs.iproute2 "ss"} -H ${checkFlags} "sport = :${toString mapping.hostPort}" | grep -Fq "127.0.0.1:${toString mapping.hostPort}" || {
-              fail_ready "Host loopback ${mapping.protocol} forwarding proxy failed to bind port ${toString mapping.hostPort}"
-            }
-          ''
-        ) (expandMappings portMappings)
-      );
-    in
-    pkgs.writeShellApplication {
-      name = "hermes-agent-network-${toString network.index}";
-      runtimeInputs = builtins.attrValues {
-        inherit (pkgs)
-          coreutils
-          gawk
-          gnugrep
-          iproute2
-          nftables
-          python3
-          systemd
-          util-linux
-          dnsmasq
-          socat
-          ;
-      };
-      text = ''
-        host() {
-          if [[ "$operation" == host-setup || "$operation" == host-cleanup ]]; then
-            "$@"
-          else
-            ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- "$@"
-          fi
-        }
-        # Verb chroot detection and sd_booted() need separate explicit prerequisites.
-        export SYSTEMD_OFFLINE=0
-        host_if=${lib.escapeShellArg network.hostIf}
-        peer_if=${lib.escapeShellArg network.peerIf}
-        peer_mac=${lib.escapeShellArg network.peerMac}
-        alias=${lib.escapeShellArg "hermes-agent-${name}"}
-        host4_set=${lib.escapeShellArg network.host4Set}
-        peer4_set=${lib.escapeShellArg network.peer4Set}
-        host6_set=${lib.escapeShellArg network.host6Set}
-        peer6_set=${lib.escapeShellArg network.peer6Set}
-        ra_dropin=/run/systemd/network/40-hermes-agent-${toString network.index}.network.d/50-hermes-ipv6-prefix.conf
-        runtime_dir=/run/hermes-agent-network-${toString network.index}
-        policy_hash=${
-          lib.escapeShellArg (
-            builtins.hashString "sha256" (
-              builtins.toJSON [
-                agentInputGuardRules
-                agentForwardGuardRules
-              ]
-            )
-          )
-        }
-        operation=''${1:-setup}
-
-        dns_pid=
-        proxy_pids=()
-        relay_pids=()
-        created_link=0
-
-        read_addresses() {
-          local family="$1" device="$2" prefix="$3" output
-          if [[ "$device" == "$host_if" ]]; then
-            output=$(host ${lib.getExe' pkgs.iproute2 "ip"} -j "$family" address show dev "$device")
-          else
-            output=$(${lib.getExe' pkgs.iproute2 "ip"} -j "$family" address show dev "$device")
-          fi
-          ${lib.getExe' pkgs.python3 "python3"} ${addressFilter} \
-            "$([[ "$family" == -4 ]] && printf inet || printf inet6)" "$prefix" <<<"$output" | sort -u
-        }
-
-        flush_firewall() {
-          if ! {
-            printf 'flush set inet hermes-agent-guard %s\n' "$host4_set" "$peer4_set" "$host6_set" "$peer6_set"
-          } | host ${lib.getExe' pkgs.nftables "nft"} -f -; then
-            echo "${name}: firewall revocation failed; blocking the owned host link" >&2
-            host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" down || true
-            return 1
-          fi
-        }
-
-        stop_gateway() {
-          ${lib.getExe' pkgs.systemd "systemctl"} --no-block stop "hermes@${name}.service" || true
-        }
-
-        fail_ready() {
-          echo "${name}: $*" >&2
-          flush_firewall || true
-          stop_gateway
-          ${lib.getExe' pkgs.systemd "systemctl"} --no-block stop "hermes-network@${name}.service" || true
-          exit 1
-        }
-
-        networkd_reload() {
-          ${lib.getExe' pkgs.util-linux "flock"} --exclusive --wait 15 /run/systemd/network/.hermes-networkd.lock \
-            ${lib.getExe' pkgs.systemd "networkctl"} reload
-        }
-
-        networkd_reconfigure() {
-          # shellcheck disable=SC2016
-          ${lib.getExe' pkgs.util-linux "flock"} --exclusive --wait 15 /run/systemd/network/.hermes-networkd.lock \
-            ${lib.getExe' pkgs.bash "bash"} -c '
-              ${lib.getExe' pkgs.systemd "networkctl"} reload &&
-              ${lib.getExe' pkgs.systemd "networkctl"} reconfigure "$1"
-            ' -- "$host_if"
-        }
-
-        verify_guard_chain() {
-          local chain="$1" hook="$2" expected="$3" actual
-          actual=$(host ${lib.getExe' pkgs.nftables "nft"} list chain inet hermes-agent-guard "$chain") || return
-          ${lib.getExe' pkgs.python3 "python3"} -c '
-        import difflib, ipaddress, re, sys
-        hook, expected = sys.argv[1:]
-        actual = sys.stdin.read()
-        if not re.search(rf"type filter hook {hook} priority (?:-150|mangle); policy drop;", actual):
-            raise SystemExit(f"{hook} guard hook/priority/policy readback mismatch")
-        def rules(text, live=False):
-            lines = []
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or (live and line.startswith(("table ", "chain ", "type ", "}"))):
-                    continue
-                marker = line.find("hermes-policy-")
-                if marker >= 0:
-                    line = line[:line.rfind("comment", 0, marker)].rstrip()
-                line = line.replace("meta l4proto tcp", "meta l4proto 6")
-                line = line.replace("meta l4proto udp", "meta l4proto 17")
-                line = line.replace("meta l4proto ipv6-icmp", "meta l4proto 58")
-                def canonicalize_addresses(match):
-                    keyword, values = match.groups()
-                    networks = [ipaddress.ip_network(value.strip(), strict=False) for value in values.split(",")]
-                    return keyword + "{ " + ", ".join(map(str, ipaddress.collapse_addresses(networks))) + " }"
-                line = re.sub(r"(ip6? (?:saddr|daddr) )[{]([^}]*)[}]", canonicalize_addresses, line)
-                lines.append(" ".join(line.split()))
-            return lines
-        expected_rules = rules(expected)
-        actual_rules = rules(actual, live=True)
-        if expected_rules != actual_rules:
-            diff = chr(10).join(difflib.unified_diff(expected_rules, actual_rules, fromfile="configured", tofile="live", lineterm=""))
-            raise SystemExit(f"{hook} guard policy differs from the current configured rules{chr(10)}{diff}")
-        ' "$hook" "$expected" <<<"$actual"
-        }
-
-        verify_guard_policy() {
-          verify_guard_chain hermes_agent_input_guard input ${lib.escapeShellArg agentInputGuardRules} || return
-          verify_guard_chain hermes_agent_forward_guard forward ${lib.escapeShellArg agentForwardGuardRules}
-        }
-
-        cleanup() {
-          set +e
-          flush_firewall
-
-          if [[ -n "$dns_pid" ]]; then
-            kill "$dns_pid" 2>/dev/null || true
-            wait "$dns_pid" 2>/dev/null || true
-          fi
-          for proxy_pid in "''${proxy_pids[@]}"; do
-            kill "$proxy_pid" 2>/dev/null || true
-            wait "$proxy_pid" 2>/dev/null || true
-          done
-          for relay_pid in "''${relay_pids[@]}"; do
-            kill "$relay_pid" 2>/dev/null || true
-            wait "$relay_pid" 2>/dev/null || true
-          done
-          if [[ "$operation" != ready && -e "$ra_dropin" ]]; then
-            rm -f -- "$ra_dropin"
-            networkd_reload >/dev/null 2>&1 || true
-          fi
-          if (( created_link )); then
-            host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
-          elif [[ "$operation" != ready ]] && host ${lib.getExe' pkgs.iproute2 "ip"} -details link show dev "$host_if" 2>/dev/null | grep -Fq "alias $alias"; then
-            host ${lib.getExe' pkgs.iproute2 "ip"} link delete dev "$host_if" 2>/dev/null || true
-          fi
-        }
-        setup_error() {
-          local status=$?
-          trap - ERR EXIT
-          cleanup
-          if [[ "$operation" == ready ]]; then
-            ${lib.getExe' pkgs.systemd "systemctl"} --no-block stop "hermes-network@${name}.service" || true
-          fi
-          exit "$status"
-        }
-
-        check_routes() {
-          local subnet4="$1" subnet6="$2" routes4 routes6 addresses4 addresses6
-          routes4="$(host ${lib.getExe' pkgs.iproute2 "ip"} -4 route show table all)"
-          routes6="$(host ${lib.getExe' pkgs.iproute2 "ip"} -6 route show table all)"
-          addresses4="$(host ${lib.getExe' pkgs.iproute2 "ip"} -o -4 address show)"
-          addresses6="$(host ${lib.getExe' pkgs.iproute2 "ip"} -o -6 address show)"
-          ${lib.getExe' pkgs.python3 "python3"} - "$subnet4" "$subnet6" "$host_if" "$routes4" "$routes6" "$addresses4" "$addresses6" <<'PY'
-        import ipaddress
-        import sys
-
-        subnet4, subnet6, interface, routes4, routes6, addresses4, addresses6 = sys.argv[1:]
-        for target, routes, addresses, family, key in (
-            (subnet4, routes4, addresses4, 4, "inet"),
-            (subnet6, routes6, addresses6, 6, "inet6"),
-        ):
-            target = ipaddress.ip_network(target)
-            for line in routes.splitlines():
-                if f"dev {interface}" in line or line.split()[0] == "default":
-                    continue
-                try:
-                    route = ipaddress.ip_network(line.split()[0], strict=False)
-                except ValueError:
-                    continue
-                if route.version == family and route.prefixlen and target.overlaps(route):
-                    raise SystemExit(f"Hermes subnet {target} overlaps host route {route}: {line}")
-            for line in addresses.splitlines():
-                fields = line.split()
-                if len(fields) < 4 or fields[1] == interface:
-                    continue
-                try:
-                    address = ipaddress.ip_interface(fields[fields.index(key) + 1])
-                except (ValueError, IndexError):
-                    continue
-                if target.overlaps(address.network):
-                    raise SystemExit(f"Hermes subnet {target} overlaps host address {address}: {line}")
-        PY
-        }
-
-        if [[ "$operation" == host-cleanup ]]; then
-          cleanup
-          exit 0
-        fi
-        if [[ "$operation" == ready ]]; then
-          trap cleanup EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          trap setup_error ERR
-          for attempt in {1..300}; do
-            mapfile -t host4 < <(read_addresses -4 "$host_if" 30)
-            mapfile -t peer4 < <(read_addresses -4 "$peer_if" 30)
-            mapfile -t host6 < <(read_addresses -6 "$host_if" 64)
-            if (( ''${#host4[@]} == 1 && ''${#peer4[@]} == 1 && ''${#host6[@]} > 0 )); then
-              host_ip="''${host4[0]}"
-              agent_ip="''${peer4[0]}"
-              host_ip6="''${host6[0]}"
-              prefix6=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/64").network)' "$host_ip6")
-              mapfile -t peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); sys.stdout.write("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
-              if (( attempt % 25 == 0 && ''${#peer6[@]} == 0 )) \
-                && ${lib.getExe' pkgs.python3 "python3"} -c 'import json,sys; sys.exit(not any(a.get("dadfailed", False) for l in json.load(sys.stdin) for a in l.get("addr_info", [])))' \
-                  <<<"$(${lib.getExe' pkgs.iproute2 "ip"} -j -6 address show dev "$peer_if")"; then
-                fail_ready "SLAAC DAD failed on $peer_if"
-              fi
-              if (( ''${#peer6[@]} > 0 )) \
-                && ${lib.getExe' pkgs.iproute2 "ip"} -4 route show default | grep -Fq "via $host_ip dev $peer_if" \
-                && ${lib.getExe' pkgs.iproute2 "ip"} -6 route show default | grep -Fq "dev $peer_if"; then
-                break
-              fi
-            fi
-            if (( attempt == 300 )); then fail_ready "DHCP/SLAAC readiness timed out on $peer_if"; fi
-            sleep 0.1
-          done
-          subnet4=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/30").network)' "$host_ip")
-          check_routes "$subnet4" "$prefix6"
-          {
-            for set in "$host4_set" "$peer4_set" "$host6_set" "$peer6_set"; do printf 'flush set inet hermes-agent-guard %s\n' "$set"; done
-            printf 'add element inet hermes-agent-guard %s { %s }\n' "$host4_set" "$host_ip"
-            printf 'add element inet hermes-agent-guard %s { %s }\n' "$peer4_set" "$agent_ip"
-            for address in "''${host6[@]}"; do printf 'add element inet hermes-agent-guard %s { %s }\n' "$host6_set" "$address"; done
-            for address in "''${peer6[@]}"; do printf 'add element inet hermes-agent-guard %s { %s }\n' "$peer6_set" "$address"; done
-          } | host ${lib.getExe' pkgs.nftables "nft"} -f -
-          verify_set() {
-            local set="$1" expected="$2" actual
-            actual=$(host ${lib.getExe' pkgs.nftables "nft"} -n list set inet hermes-agent-guard "$set" | ${lib.getExe' pkgs.python3 "python3"} -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"elements\s*=\s*\{([^}]*)\}",s); print(",".join(sorted(x.strip() for x in m.group(1).split(",") if x.strip())) if m else "")') || return
-            [[ "$actual" == "$expected" ]]
-          }
-          expected_host6=$(printf '%s\n' "''${host6[@]}" | sort -u | paste -sd,)
-          expected_peer6=$(printf '%s\n' "''${peer6[@]}" | sort -u | paste -sd,)
-          if ! verify_set "$host4_set" "$host_ip" || ! verify_set "$peer4_set" "$agent_ip" \
-            || ! verify_set "$host6_set" "$expected_host6" || ! verify_set "$peer6_set" "$expected_peer6"; then
-            fail_ready "firewall set readback did not match allocation"
-          fi
-          verify_guard_policy || fail_ready "current nftables guard policy readback failed"
-          install -d -m 0750 "$runtime_dir"
-          printf 'nameserver %s\nnameserver %s\noptions attempts:1 timeout:2\n' "$host_ip" "$host_ip6" >"$runtime_dir/resolv.conf.tmp"
-          chmod 0644 "$runtime_dir/resolv.conf.tmp"
-          mv -f -- "$runtime_dir/resolv.conf.tmp" "$runtime_dir/resolv.conf"
-          mapfile -t dns_upstreams < <(awk '$1 == "nameserver" && NF >= 2 { print $2 }' /run/hermes-host-resolv.conf)
-          ((''${#dns_upstreams[@]} > 0)) || fail_ready "No host nameservers in /etc/resolv.conf"
-          dns_args=()
-          for dns_upstream in "''${dns_upstreams[@]}"; do dns_args+=("--server=$dns_upstream"); done
-          ${lib.getExe' pkgs.util-linux "nsenter"} --net=/proc/1/ns/net -- ${lib.getExe' pkgs.dnsmasq "dnsmasq"} \
-            --no-daemon --no-resolv --no-hosts --bind-dynamic --listen-address="$host_ip" --listen-address="$host_ip6" \
-            --user=nobody --group=nogroup --port=53 "''${dns_args[@]}" >/dev/null 2>&1 &
-          dns_pid=$!
-          ${namespaceRelayCommands}
-          ${hostForwardCommands}
-          for _ in {1..50}; do
-            if host ${lib.getExe' pkgs.iproute2 "ss"} -H -lun 'sport = :53' | grep -Fq "$host_ip:53" \
-              && host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn 'sport = :53' | grep -Fq "$host_ip:53" \
-              && host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -lun 'sport = :53' | grep -Fq "$host_ip6" \
-              && host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -ltn 'sport = :53' | grep -Fq "$host_ip6"; then break; fi
-            sleep 0.1
-          done
-          if ! host ${lib.getExe' pkgs.iproute2 "ss"} -H -lun 'sport = :53' | grep -Fq "$host_ip:53" \
-            || ! host ${lib.getExe' pkgs.iproute2 "ss"} -H -ltn 'sport = :53' | grep -Fq "$host_ip:53" \
-            || ! host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -lun 'sport = :53' | grep -Fq "$host_ip6" \
-            || ! host ${lib.getExe' pkgs.iproute2 "ss"} -6 -H -ltn 'sport = :53' | grep -Fq "$host_ip6"; then
-            fail_ready "DNS listener readiness failed for $host_ip/$host_ip6"
-          fi
-          generation=$(printf '%s\n' "$host_ip" "$agent_ip" "''${host6[*]}" "''${peer6[*]}" "$policy_hash" | sha256sum | cut -d' ' -f1)
-          ${lib.getExe' pkgs.systemd "systemd-notify"} --ready --status="${name} network generation $generation verified"
-          echo "${name}: network generation $generation ready on $host_if/$peer_if; DHCPv4, SLAAC, DNS and nftables verified"
-          while sleep 1; do
-            if ! verify_guard_policy; then
-              fail_ready "current nftables guard policy lost; ordinary traffic revoked"
-            fi
-            mapfile -t current_host4 < <(read_addresses -4 "$host_if" 30)
-            mapfile -t current_peer4 < <(read_addresses -4 "$peer_if" 30)
-            mapfile -t current_host6 < <(read_addresses -6 "$host_if" 64)
-            mapfile -t current_peer6 < <(read_addresses -6 "$peer_if" 64 | ${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); sys.stdout.write("\n".join(a for a in sys.stdin.read().splitlines() if ipaddress.ip_address(a) in n))' "$prefix6")
-            if [[ "''${current_host4[*]}" == "''${host4[*]}" && "''${current_peer4[*]}" == "''${peer4[*]}" \
-              && "''${current_host6[*]}" == "''${host6[*]}" && "''${current_peer6[*]}" == "''${peer6[*]}" ]] \
-              && ${lib.getExe' pkgs.iproute2 "ip"} -4 route show default | grep -Fq "via $host_ip dev $peer_if" \
-              && ${lib.getExe' pkgs.iproute2 "ip"} -6 route show default | grep -Fq "dev $peer_if"; then
-              :
-            else
-              fail_ready "DHCP/SLAAC address or route changed; ordinary traffic revoked"
-            fi
-            if ! verify_set "$host4_set" "$host_ip" || ! verify_set "$peer4_set" "$agent_ip" \
-              || ! verify_set "$host6_set" "$expected_host6" || ! verify_set "$peer6_set" "$expected_peer6"; then
-              fail_ready "firewall generation lost; ordinary traffic revoked"
-            fi
-          done
-        fi
-        [[ "$operation" == host-setup ]] || { echo "usage: $0 [host-setup|ready|host-cleanup]" >&2; exit 2; }
-        trap cleanup EXIT
-        trap 'exit 130' INT
-        trap 'exit 0' TERM
-        trap setup_error ERR
-
-        if host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$host_if" >/dev/null 2>&1 \
-          || host ${lib.getExe' pkgs.iproute2 "ip"} link show dev "$peer_if" >/dev/null 2>&1; then
-          echo "Refusing to replace an existing Hermes network interface: $host_if/$peer_if" >&2
-          exit 1
-        fi
-        if [[ -e "$ra_dropin" ]]; then
-          rm -f -- "$ra_dropin"
-          networkd_reload
-        fi
-        anchor_unit=hermes-netns@${lib.escapeShellArg name}.service
-        anchor_pid=$(${lib.getExe' pkgs.systemd "systemctl"} show --property=MainPID --value "$anchor_unit")
-        anchor_generation=$(${lib.getExe' pkgs.systemd "systemctl"} show --property=InvocationID --value "$anchor_unit")
-        [[ "$anchor_pid" =~ ^[1-9][0-9]*$ && "$anchor_pid" -gt 1 && "$anchor_generation" =~ ^[0-9a-f]{32}$ ]] || {
-          echo "${name}: invalid live namespace anchor identity" >&2; exit 1;
-        }
-        anchor_start=$(${lib.getExe' pkgs.python3 "python3"} -c 'import pathlib,sys; print(pathlib.Path("/proc/"+sys.argv[1]+"/stat").read_text().rpartition(")")[2].split()[19])' "$anchor_pid")
-        exec 9<"/proc/$anchor_pid/ns/net"
-        anchor_namespace=$(readlink /proc/self/fd/9)
-        validate_anchor() {
-          [[ "$(${lib.getExe' pkgs.systemd "systemctl"} show --property=MainPID --value "$anchor_unit")" == "$anchor_pid" \
-            && "$(${lib.getExe' pkgs.systemd "systemctl"} show --property=InvocationID --value "$anchor_unit")" == "$anchor_generation" \
-            && "$(${lib.getExe' pkgs.python3 "python3"} -c 'import pathlib,sys; print(pathlib.Path("/proc/"+sys.argv[1]+"/stat").read_text().rpartition(")")[2].split()[19])' "$anchor_pid")" == "$anchor_start" \
-            && "$(readlink "/proc/$anchor_pid/ns/net")" == "$anchor_namespace" ]]
-        }
-        validate_anchor || { echo "${name}: namespace anchor changed before peer move" >&2; exit 1; }
-        host ${lib.getExe' pkgs.iproute2 "ip"} link add "$host_if" type veth peer name "$peer_if"
-        created_link=1
-        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" alias "$alias"
-        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" address "$peer_mac"
-        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$peer_if" netns /proc/self/fd/9
-        validate_anchor || { echo "${name}: namespace anchor changed during peer move" >&2; exit 1; }
-        host ${lib.getExe' pkgs.iproute2 "ip"} link set dev "$host_if" up
-        # Peer movement is acknowledged before carrier-dependent address/RA work.
-        ${lib.getExe' pkgs.systemd "systemd-notify"} --ready --status="${name}: peer moved to anchor $anchor_generation; awaiting carrier/allocation"
-        host_ip=
-        host_ip6=
-        for attempt in {1..300}; do
-          mapfile -t host4 < <(read_addresses -4 "$host_if" 30)
-          mapfile -t host6 < <(read_addresses -6 "$host_if" 64)
-          if (( ''${#host4[@]} == 1 && ''${#host6[@]} > 0 )); then host_ip="''${host4[0]}"; host_ip6="''${host6[0]}"; break; fi
-          sleep 0.1
-        done
-        [[ -n "$host_ip" && -n "$host_ip6" ]] || { echo "${name}: networkd did not allocate host veth addresses within 30s" >&2; exit 1; }
-        subnet4=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/30").network)' "$host_ip")
-        subnet6=$(${lib.getExe' pkgs.python3 "python3"} -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]+"/64").network)' "$host_ip6")
-        check_routes "$subnet4" "$subnet6"
-        install -d -m 0755 "''${ra_dropin%/*}"
-        printf '[IPv6Prefix]\nPrefix=%s\nAddressAutoconfiguration=yes\nOnLink=yes\n' "$subnet6" >"$ra_dropin"
-        chmod 0644 "$ra_dropin"
-        networkd_reconfigure
-        echo "${name}: networkd allocated $host_if $host_ip/$subnet4 and $host_ip6/$subnet6; dynamic SLAAC prefix published"
-        while sleep 1; do
-          validate_anchor || { echo "${name}: namespace anchor generation lost" >&2; exit 1; }
-        done
-      '';
-    };
   cfg = config.services.hermes-specialised-agent;
   inherit (lib)
     concatStringsSep
@@ -1085,27 +625,114 @@ let
       hermesAgentStatePath = "${agentStatePath}/.hermes";
       agentNetwork = agentNetworks.${name};
       portMappings = portMappingsForAgent name;
-      networkSetup = mkAgentNetworkSetup name agentNetwork portMappings;
-      networkLocalSetup = pkgs.writeShellApplication {
-        name = "hermes-agent-local-network-${toString agentNetwork.index}";
-        runtimeInputs = [ pkgs.iproute2 ];
-        text = ''
-          ip link set dev lo up
-          ip link set dev ${lib.escapeShellArg agentNetwork.peerIf} up
-        '';
+      networkPublication = "/run/hermes-agent-network-${toString agentNetwork.index}";
+      observerPublication = "/run/hermes-observation-${name}";
+      proxyRoles = [
+        "dns"
+      ]
+      ++ optional (portMappings != [ ]) "host-proxy"
+      ++ optional (builtins.any (mapping: mapping.target == "loopback") portMappings) "agent-relay";
+      commonSettings = {
+        publication = networkPublication;
+        observation_path = "${observerPublication}/observation.json";
+        interface = agentNetwork.peerIf;
+        mac = agentNetwork.peerMac;
       };
-      dhcpExecStart = pkgs.writeShellApplication {
-        name = "hermes-dhcp-${toString agentNetwork.index}";
-        runtimeInputs = [
-          pkgs.coreutils
-          pkgs.dhcpcd
-        ];
-        text = ''
-          # The private tmpfs is per-command, so create its link in the client process.
-          ln -s /run/dhcpcd /var/run/dhcpcd
-          exec ${lib.getExe pkgs.dhcpcd} --nobackground --waitip=4 --timeout=25 \
-            --nohook=resolv.conf,hostname,ntp.conf --config=/dev/null ${agentNetwork.peerIf}
-        '';
+      networkCommand =
+        role: script: settings:
+        let
+          settingsFile = pkgs.writeText "hermes-${role}-${name}.json" (builtins.toJSON settings);
+        in
+        "${
+          if role == "host-control" then networkPython else pkgs.python3
+        }/bin/python3 -I -B ${script} ${networkRecord} ${settingsFile}";
+      hostRecord = networkCommand "host-control" ./hermes-network/host.py (
+        commonSettings
+        // {
+          inherit name;
+          controller_library = controllerLibrary;
+          ra_dropin = "/run/systemd/network/40-hermes-agent-${toString agentNetwork.index}.network.d/50-hermes-ipv6-prefix.conf";
+          policy = builtins.hashString "sha256" (
+            builtins.toJSON [
+              agentInputGuardRules
+              agentForwardGuardRules
+            ]
+          );
+          host_interface = agentNetwork.hostIf;
+          proxy_roles = proxyRoles;
+          mappings = expandMappings portMappings;
+          set_names = [
+            agentNetwork.host4Set
+            agentNetwork.peer4Set
+            agentNetwork.host6Set
+            agentNetwork.peer6Set
+          ];
+          policy_rules = [
+            [
+              "input"
+              agentInputGuardRules
+            ]
+            [
+              "forward"
+              agentForwardGuardRules
+            ]
+          ];
+          tools = {
+            networkctl = "${pkgs.systemd}/bin/networkctl";
+            ip = "${pkgs.iproute2}/bin/ip";
+            ss = "${pkgs.iproute2}/bin/ss";
+            nft = "${pkgs.nftables}/bin/nft";
+          };
+        }
+      );
+      networkFailureStop = "${networkPython}/bin/python3 -I -B ${./hermes-network/stop.py} ${controllerLibrary} ${name}";
+      observer = networkCommand "network-observer" ./hermes-network/observer.py (
+        commonSettings
+        // {
+          tools = {
+            ip = "${pkgs.iproute2}/bin/ip";
+            ss = "${pkgs.iproute2}/bin/ss";
+          };
+        }
+      );
+      readiness = networkCommand "network-ready" ./hermes-network/ready.py (
+        commonSettings // { publication = networkPublication; }
+      );
+      proxyProgram =
+        role:
+        networkCommand role ./hermes-network/proxy.py (
+          commonSettings
+          // {
+            inherit role;
+            tools =
+              if role == "dns" then
+                { dnsmasq = "${pkgs.dnsmasq}/bin/dnsmasq"; }
+              else
+                { socat = "${pkgs.socat}/bin/socat"; };
+          }
+          // lib.optionalAttrs (role != "dns") {
+            mappings =
+              if role == "host-proxy" then
+                expandMappings portMappings
+              else
+                lib.unique (
+                  lib.concatMap (
+                    mapping:
+                    map (protocol: {
+                      inherit protocol;
+                      inherit (mapping) agentPort;
+                    }) (mappingProtocols mapping)
+                  ) (builtins.filter (mapping: mapping.target == "loopback") portMappings)
+                );
+          }
+        );
+      networkLocalSetup = pythonCommand ./hermes-runtime/local.py {
+        interface = agentNetwork.peerIf;
+        ip = "${pkgs.iproute2}/bin/ip";
+      };
+      dhcpExecStart = pythonCommand ./hermes-runtime/dhcp.py {
+        interface = agentNetwork.peerIf;
+        dhcpcd = lib.getExe pkgs.dhcpcd;
       };
 
       agentConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
@@ -1122,67 +749,37 @@ let
           path = "/var/lib/${name}/.hermes";
         }) (builtins.filter (agent: agent.enable && agent.name != agentStateId) agentFullNames)
       );
-      execStart = pkgs.writeShellApplication {
-        name = "hermes-agent-exec-start";
-        runtimeInputs = [ agentCfg.package ] ++ optional agentCfg.headroomEnable pkgs.headroom;
-        text = ''
-          cd ~/
-          headroom_pid=
-          ${lib.optionalString agentCfg.headroomEnable ''
-            headroom proxy \
-              --port ${toString agentCfg.headroomPort} \
-              --memory \
-              --learn \
-              --code-graph &
-            headroom_pid=$!
-          ''}
-          ${
-            concatStringsSep " " (
-              [
-                "hermes"
-                "gateway"
-              ]
-              ++ agentCfg.extraArgs
-            )
-          } &
-          gateway_pid=$!
-          dashboard_pid=
-          ${lib.optionalString (cfg.mainAgent == name) ''
-            ${
-              concatStringsSep " " [
-                "hermes"
-                "dashboard"
-                "--no-open"
-              ]
-            } &
-            dashboard_pid=$!
-          ''}
-          exited_child=
-          if wait -n -p exited_child; then
-            child_status=0
+      execStart = pythonCommand ./hermes-runtime/gateway.py {
+        headroom =
+          if agentCfg.headroomEnable then
+            [
+              "${pkgs.headroom}/bin/headroom"
+              "proxy"
+              "--port"
+              (toString agentCfg.headroomPort)
+              "--memory"
+              "--learn"
+              "--code-graph"
+            ]
           else
-            child_status=$?
-          fi
-          case "$exited_child" in
-            "$headroom_pid") child_name="Headroom proxy" ;;
-            "$gateway_pid") child_name="Hermes gateway" ;;
-            "$dashboard_pid") child_name="Hermes dashboard" ;;
-            *) child_name="unknown child" ;;
-          esac
-          echo "$child_name (pid $exited_child) exited with status $child_status" >&2
-          exit "$child_status"
-        '';
+            null;
+        gateway = [
+          (lib.getExe agentCfg.package)
+          "gateway"
+        ]
+        ++ agentCfg.extraArgs;
+        dashboard =
+          if cfg.mainAgent == name then
+            [
+              (lib.getExe agentCfg.package)
+              "dashboard"
+              "--no-open"
+            ]
+          else
+            null;
       };
-      installSkillsExecStartPre = pkgs.writeShellApplication {
-        name = "hermes-agent-exec-start-pre";
-        runtimeInputs = [ agentCfg.package ];
-        text = ''
-          hermes skills install -y official/creative/concept-diagrams
-          hermes skills install -y official/creative/creative-ideation
-          hermes skills install -y official/software-development/ast-grep
-          hermes skills install -y official/software-development/code-wiki
-          hermes skills install -y official/software-development/subagent-driven-development
-        '';
+      installSkillsExecStartPre = pythonCommand ./hermes-runtime/install_skills.py {
+        hermes = lib.getExe agentCfg.package;
       };
 
       peerNames = builtins.filter (peer: peer != name && _agents.${peer}.enable) (
@@ -1214,13 +811,10 @@ let
         ++ serviceExecRoots "hermes@${name}"
         ++ [
           agentCfg.package
-          execStart
-          gatewayOwnershipExecStartPre
           agentConfig
           profileFarm
           pkgs.cacert
         ]
-        ++ optional cfg.installDefaultSkills installSkillsExecStartPre
         ++ agentCfg.extraPlugins
         ++ peerConfigs
         ++ peerPlugins
@@ -1232,7 +826,6 @@ let
         ++ config.systemd.services."hermes-network@${name}".path
         ++ config.systemd.services."hermes-network@${name}".jobScripts
         ++ serviceExecRoots "hermes-network@${name}"
-        ++ [ networkLocalSetup ]
       );
       hostControlClosure = closureStorePaths (
         config.systemd.services."hermes-host-control@".path
@@ -1241,7 +834,14 @@ let
         ++ config.systemd.services."hermes-host-control@${name}".path
         ++ config.systemd.services."hermes-host-control@${name}".jobScripts
         ++ serviceExecRoots "hermes-host-control@${name}"
-        ++ [ networkSetup ]
+      );
+      networkFailureClosure = closureStorePaths (
+        config.systemd.services."hermes-network-failure@".path
+        ++ config.systemd.services."hermes-network-failure@".jobScripts
+        ++ serviceExecRoots "hermes-network-failure@"
+        ++ config.systemd.services."hermes-network-failure@${name}".path
+        ++ config.systemd.services."hermes-network-failure@${name}".jobScripts
+        ++ serviceExecRoots "hermes-network-failure@${name}"
       );
       netnsClosure = closureStorePaths (
         config.systemd.services."hermes-netns@".path
@@ -1258,7 +858,51 @@ let
         ++ config.systemd.services."hermes-network-ready@${name}".path
         ++ config.systemd.services."hermes-network-ready@${name}".jobScripts
         ++ serviceExecRoots "hermes-network-ready@${name}"
-        ++ [ networkSetup ]
+
+      );
+      payloadServices = builtins.listToAttrs (
+        map (
+          role:
+          let
+            unit = "hermes-${role}@${name}";
+            program = if role == "network-observer" then observer else proxyProgram role;
+            needsBind =
+              role == "dns"
+              || (
+                role == "agent-relay"
+                && builtins.any (mapping: mapping.target == "loopback" && mapping.agentPort < 1024) portMappings
+              )
+              || (role == "host-proxy" && builtins.any (mapping: mapping.hostPort < 1024) portMappings);
+            closure = closureStorePaths (
+              config.systemd.services."hermes-${role}@".path
+              ++ config.systemd.services."hermes-${role}@".jobScripts
+              ++ serviceExecRoots "hermes-${role}@"
+              ++ config.systemd.services.${unit}.path
+              ++ config.systemd.services.${unit}.jobScripts
+              ++ serviceExecRoots unit
+
+            );
+          in
+          {
+            name = unit;
+            value = {
+              overrideStrategy = "asDropin";
+              serviceConfig = {
+                BindReadOnlyPaths = [
+                  networkPublication
+                ]
+                ++ optional (role != "network-observer" && role != "dns") "-${observerPublication}"
+                ++ closure;
+                ExecStart = program;
+                CapabilityBoundingSet = lib.mkForce (if needsBind then [ "CAP_NET_BIND_SERVICE" ] else "");
+                AmbientCapabilities = lib.mkForce (if needsBind then [ "CAP_NET_BIND_SERVICE" ] else "");
+              }
+              // lib.optionalAttrs (role == "network-observer") {
+                RuntimeDirectory = [ "hermes-observation-${name}" ];
+              };
+            };
+          }
+        ) ([ "network-observer" ] ++ proxyRoles)
       );
       dhcpClosure = closureStorePaths (
         config.systemd.services."hermes-dhcp@".path
@@ -1267,10 +911,7 @@ let
         ++ config.systemd.services."hermes-dhcp@${name}".path
         ++ config.systemd.services."hermes-dhcp@${name}".jobScripts
         ++ serviceExecRoots "hermes-dhcp@${name}"
-        ++ [
-          dhcpExecStart
-          pkgs.dhcpcd
-        ]
+        ++ [ pkgs.dhcpcd ]
       );
       publicStateClosure = closureStorePaths (
         lib.subtractLists config.systemd.services."hermes-pf@".path
@@ -1280,24 +921,35 @@ let
       );
     in
     mkIf (cfg.enable && agentCfg.enable) {
-      services = {
+      services = payloadServices // {
         "hermes-netns@${name}" = {
           overrideStrategy = "asDropin";
-          serviceConfig.BindReadOnlyPaths = netnsClosure;
+          serviceConfig = {
+            BindReadOnlyPaths = netnsClosure;
+            RuntimeDirectory = [ "hermes-agent-network-${toString agentNetwork.index}::ro" ];
+          };
         };
         "hermes-host-control@${name}" = {
           overrideStrategy = "asDropin";
           serviceConfig = {
-            BindReadOnlyPaths = hostControlClosure;
-            ExecStart = "${lib.getExe networkSetup} host-setup";
-            ExecStopPost = "${lib.getExe networkSetup} host-cleanup";
+            BindPaths = [ networkPublication ];
+            BindReadOnlyPaths = [ "-${observerPublication}" ] ++ hostControlClosure;
+            ExecStart = "${hostRecord} host-setup";
+            ExecStopPost = "${hostRecord} host-cleanup";
+          };
+        };
+        "hermes-network-failure@${name}" = {
+          overrideStrategy = "asDropin";
+          serviceConfig = {
+            BindReadOnlyPaths = networkFailureClosure;
+            ExecStart = networkFailureStop;
           };
         };
         "hermes-network@${name}" = {
           overrideStrategy = "asDropin";
           serviceConfig = {
             BindReadOnlyPaths = networkClosure;
-            ExecStart = lib.getExe networkLocalSetup;
+            ExecStart = networkLocalSetup;
           };
         };
         "hermes-dhcp@${name}" = {
@@ -1306,16 +958,21 @@ let
           overrideStrategy = "asDropin";
           serviceConfig = {
             BindReadOnlyPaths = dhcpClosure;
-            ExecStart = lib.getExe dhcpExecStart;
+            ExecStart = dhcpExecStart;
           };
         };
         "hermes-network-ready@${name}" = {
+          after = map (role: "hermes-${role}@${name}.service") ([ "network-observer" ] ++ proxyRoles);
+          bindsTo = map (role: "hermes-${role}@${name}.service") ([ "network-observer" ] ++ proxyRoles);
+          requires = map (role: "hermes-${role}@${name}.service") ([ "network-observer" ] ++ proxyRoles);
           overrideStrategy = "asDropin";
           serviceConfig = {
-            BindReadOnlyPaths = networkReadyClosure;
-            ExecStart = "${lib.getExe networkSetup} ready";
-            RuntimeDirectory = [ "hermes-agent-network-${toString agentNetwork.index}" ];
-            ReadWritePaths = [ "/run/hermes-agent-network-${toString agentNetwork.index}" ];
+            BindReadOnlyPaths = [
+              networkPublication
+              "-${observerPublication}"
+            ]
+            ++ networkReadyClosure;
+            ExecStart = readiness;
           };
         };
         "hermes-pf@${name}" = {
@@ -1359,8 +1016,8 @@ let
             ]
             ++ gatewayClosure;
             InaccessiblePaths = nixStoreAliasPaths;
-            ExecStartPre = optional cfg.installDefaultSkills (lib.getExe installSkillsExecStartPre);
-            ExecStart = lib.getExe execStart;
+            ExecStartPre = optional cfg.installDefaultSkills installSkillsExecStartPre;
+            ExecStart = execStart;
           };
           wantedBy = [ "multi-user.target" ];
         };
@@ -1390,723 +1047,555 @@ let
     };
   mkAgentTemplate =
     let
+      payloadSandbox =
+        role:
+        {
+          AmbientCapabilities = "";
+          CapabilityBoundingSet = "";
+          RootDirectory = "%t/hermes-${role}-%i/root";
+          RuntimeDirectory = [
+            "hermes-${role}-%i"
+            "hermes-${role}-%i/root"
+          ];
+          RuntimeDirectoryMode = "0700";
+          RuntimeDirectoryPreserve = false;
+          InaccessiblePaths = nixStoreAliasPaths;
+          KeyringMode = "private";
+          LockPersonality = true;
+          MemoryDenyWriteExecute = true;
+          MountAPIVFS = true;
+          NoNewPrivileges = true;
+          NotifyAccess = "none";
+          DevicePolicy = "closed";
+          PrivateDevices = true;
+          PrivateIPC = true;
+          PrivateMounts = true;
+          PrivateNetwork = true;
+          PrivateTmp = true;
+          ProcSubset = "pid";
+          ProtectClock = true;
+          ProtectControlGroups = "strict";
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          ProtectHostname = "private";
+          ProtectKernelLogs = true;
+          ProtectKernelModules = true;
+          ProtectKernelTunables = true;
+          ProtectProc = "invisible";
+          RemoveIPC = true;
+          RestrictAddressFamilies = [ ];
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          SystemCallArchitectures = "native";
+          SystemCallErrorNumber = "EPERM";
+          SystemCallFilter = [
+            "@system-service"
+            "~@resources"
+            "~@privileged"
+          ];
+          TemporaryFileSystem = [ "/nix:ro" ];
+          TimeoutStartSec = "60s";
+          TimeoutStopSec = "15s";
+          Type = "exec";
+          Restart = "no";
+          UMask = "0077";
+        }
+        //
+          lib.optionalAttrs
+            (
+              !(builtins.elem role [
+                "netns"
+                "host-control"
+                "network-failure"
+              ])
+            )
+            {
+              DynamicUser = true;
+              User = "hn-${
+                {
+                  network = "if";
+                  dhcp = "dh";
+                  network-observer = "ob";
+                  network-ready = "rd";
+                  dns = "dn";
+                  host-proxy = "hp";
+                  agent-relay = "ar";
+                }
+                .${role}
+              }-%i";
+            };
       agentStateSystemdId = "hermes-%i";
       agentStateSystemdPath = "%S/${agentStateSystemdId}";
       hermesAgentStateSystemdPath = "${agentStateSystemdPath}/.hermes";
       publicStateFixerSystemdId = "hermes-%i-pf";
-      grantSkillsAcl = pkgs.writeShellApplication {
+      skillsLibrary = pkgs.writeTextFile {
+        name = "hermes-skills-acl";
+        destination = "/skills_acl.py";
+        text = builtins.readFile ./hermes-runtime/skills_acl.py;
+      };
+      grantSkillsAcl = pkgs.writeTextFile {
         name = "grant-skills-acl";
-        runtimeInputs = builtins.attrValues { inherit (pkgs) acl coreutils findutils; };
-        text = ''
-          skills_dir="$1"
-          jobs="''${2:-$(nproc)}"
-          scope="''${3:-}"
-
-          [[ -d "$skills_dir" ]] || exit 0
-
-          skills_dir_real=$(realpath -m -- "$skills_dir")
-
-          if [[ -n "$scope" ]]; then
-              scope_real=$(realpath -m -- "$scope")
-
-              case "$scope_real" in
-              "$skills_dir_real"|"$skills_dir_real"/*) ;;
-              *)
-                  echo "grant-skills-acl: refusing scope outside skills_dir: $scope (resolved: $scope_real, skills_dir resolved: $skills_dir_real)" >&2
-                  exit 1
-              ;;
-              esac
-
-              search_root="$scope_real"
-          else
-              search_root="$skills_dir_real"
-          fi
-
-          declare -A dirs_to_grant=()
-          declare -a skill_files=()
-
-          if [[ -f "$search_root" ]]; then
-              [[ "$(basename "$search_root")" == "SKILL.md" ]] || exit 0
-              skill_files+=("$search_root")
-          elif [[ -d "$search_root" ]]; then
-              while IFS= read -r -d ${"''"} skill_file; do
-              skill_files+=("$skill_file")
-              done < <(find "$search_root" -name 'SKILL.md' -type f -print0)
-          else
-              exit 0
-          fi
-
-          for skill_file in "''${skill_files[@]}"; do
-              dir=$(dirname "$skill_file")
-
-              while [[ "$dir" != "$skills_dir_real" && "$dir" != "/" ]]; do
-              dirs_to_grant["$dir"]=1
-              dir=$(dirname "$dir")
-              done
-          done
-
-          dirs_to_grant["$skills_dir_real"]=1
-
-          if [[ "''${#skill_files[@]}" -gt 0 ]]; then
-              printf '%s\0' "''${skill_files[@]}" | \
-              xargs -0P "$jobs" -n 50 setfacl -m "g:${sharedStateId}:r--" --
-          fi
-
-          printf '%s\0' "''${!dirs_to_grant[@]}" | \
-              xargs -0P "$jobs" -n 50 setfacl -m "g:${sharedStateId}:r-x" --
-        '';
+        destination = "/bin/grant-skills-acl";
+        executable = true;
+        text =
+          builtins.replaceStrings
+            [ "@python@" "@skills_library@" "@setfacl@" ]
+            [ (toString pkgs.python3) (toString skillsLibrary) "${pkgs.acl}/bin/setfacl" ]
+            (builtins.readFile ./hermes-runtime/grant_skills_acl.py);
       };
-      publicStatePath =
-        builtins.attrValues {
-          inherit (pkgs)
-            acl
-            bash
-            coreutils
-            findutils
-            inotify-tools
-            ;
+      publicStatePath = [
+        pkgs.acl
+        pkgs.python3
+        pkgs.inotify-tools
+        grantSkillsAcl
+      ];
+      publicStateSettings = pkgs.writeText "hermes-public-state.json" (
+        builtins.toJSON {
+          setfacl = "${pkgs.acl}/bin/setfacl";
+          inotifywait = "${pkgs.inotify-tools}/bin/inotifywait";
         }
-        ++ [ grantSkillsAcl ];
-      publicStateExecStart = pkgs.writeShellApplication {
-        name = "hermes-agent-pf-exec-start";
-        runtimeInputs =
-          builtins.attrValues {
-            inherit (pkgs)
-              acl
-              bash
-              coreutils
-              findutils
-              inotify-tools
-              ;
-          }
-          ++ [ grantSkillsAcl ];
-        text = ''
-          # StateDirectoryMode=2700 can leave the ACL mask at ---; raise it so the shared-group r-x grant is effective.
-          setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HOME/"
-          setfacl -m "g:${sharedStateId}:r-x,m::r-x" -- "$HERMES_HOME/"
-          setfacl -m "g:${sharedStateId}:r-x" -- "$HERMES_HOME/cron"
-          setfacl -m "g:${sharedStateId}:r--" -- "$HERMES_HOME/cron/output"
-
-          grant-skills-acl "$HERMES_HOME/skills" 1 "$HERMES_HOME/skills" &
-
-          find "$HERMES_HOME/gateway.pid" "$HERMES_HOME/gateway_state.json" -type f -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
-
-          find "$HERMES_HOME/logs" "$HERMES_HOME/logs/curator" -type d -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
-
-          wait
-
-          (sleep 5;
-
-           grant-skills-acl "$HERMES_HOME/skills" 1 "$HERMES_HOME/skills" &
-           find "$HERMES_HOME/gateway.pid" "$HERMES_HOME/gateway_state.json" "$HERMES_HOME/gateway_state.json" -type f -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &
-
-           find "$HERMES_HOME/logs" "$HERMES_HOME/logs/curator" -type d -exec setfacl -m "g:${sharedStateId}:r--" -- {} \; &) &
-
-          exec inotifywait -mrqe create,moved_to --format '%w%f%0' --no-newline -- "$HERMES_HOME/skills" | xargs -0P 1 -n 50 grant-skills-acl "$HERMES_HOME/skills" 1
-        '';
-      };
+      );
+      publicStateExecStart = "${pkgs.python3}/bin/python3 -I -B ${./hermes-runtime/public_state.py} ${skillsLibrary} ${publicStateSettings}";
       publicStateTemplateClosure = closureStorePaths (
         config.systemd.services."hermes-pf@".path
         ++ config.systemd.services."hermes-pf@".jobScripts
         ++ serviceExecRoots "hermes-pf@"
-        ++ [ publicStateExecStart ]
       );
     in
     mkIf cfg.enable {
-      services = {
-        "hermes-netns@" = {
-          description = "Private network namespace lifetime for Hermes agent %i";
-          partOf = [ "hermes-network@%i.service" ];
-          serviceConfig = {
-            ExecStart = "${lib.getExe' pkgs.coreutils "sleep"} infinity";
-            RootDirectory = "%t/hermes-netns-%i/root";
-            RuntimeDirectory = [
-              "hermes-netns-%i"
-              "hermes-netns-%i/root"
-            ];
-            RuntimeDirectoryMode = "0700";
-            CapabilityBoundingSet = "";
-            AmbientCapabilities = "";
-            DevicePolicy = "closed";
-            InaccessiblePaths = nixStoreAliasPaths;
-            KeyringMode = "private";
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            MountAPIVFS = true;
-            NoNewPrivileges = true;
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateMounts = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            ProcSubset = "pid";
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            ProtectSystem = "strict";
-            RemoveIPC = true;
-            RestrictAddressFamilies = [ "AF_UNIX" ];
-            RestrictNamespaces = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
-            ];
-            TemporaryFileSystem = [ "/nix:ro" ];
-            TimeoutStartSec = "30s";
-            TimeoutStopSec = "15s";
-            Type = "exec";
-            UMask = "0077";
+      services =
+        (builtins.listToAttrs (
+          map
+            (role: {
+              name = "hermes-${role}@";
+              value = {
+                description = "Hermes ${role} for agent %i";
+                after = [
+                  "hermes-netns@%i.service"
+                ]
+                ++ lib.optionals (role != "network-observer") [
+                  "hermes-dhcp@%i.service"
+                  "hermes-network-observer@%i.service"
+                ];
+                bindsTo = [
+                  "hermes-netns@%i.service"
+                ]
+                ++ lib.optionals (role != "network-observer") [
+                  "hermes-dhcp@%i.service"
+                  "hermes-network-observer@%i.service"
+                ];
+                requires = [ "hermes-netns@%i.service" ];
+                partOf = [ "hermes-network@%i.service" ];
+                unitConfig.JoinsNamespaceOf = lib.optionals (role == "network-observer" || role == "agent-relay") [
+                  "hermes-netns@%i.service"
+                ];
+                serviceConfig =
+                  payloadSandbox role
+                  // {
+                    NetworkNamespacePath = if role == "dns" || role == "host-proxy" then "/proc/1/ns/net" else "";
+                    RestrictAddressFamilies =
+                      if role == "network-observer" then
+                        [ "AF_NETLINK" ]
+                      else if role == "dns" then
+                        [
+                          "AF_INET"
+                          "AF_INET6"
+                          "AF_NETLINK"
+                        ]
+                      else
+                        [ "AF_INET" ];
+                  }
+                  // lib.optionalAttrs (role == "dns") {
+                    CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+                    AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+                  }
+                  // lib.optionalAttrs (role == "dns") {
+                    BindReadOnlyPaths = [ "/etc/resolv.conf:/run/hermes-host-resolv.conf" ];
+                  };
+              };
+            })
+            [
+              "network-observer"
+              "dns"
+              "host-proxy"
+              "agent-relay"
+            ]
+        ))
+        // {
+          "hermes-netns@" = {
+            description = "Private network namespace lifetime for Hermes agent %i";
+            partOf = [ "hermes-network@%i.service" ];
+            serviceConfig = payloadSandbox "netns" // {
+              ExecStart = "${lib.getExe' pkgs.coreutils "sleep"} infinity";
+              SystemCallFilter = [
+                "@system-service"
+                "~@resources"
+                "~@privileged"
+                "~socket"
+              ];
+              TimeoutStartSec = "30s";
+            };
           };
-        };
-        "hermes-network@" = {
-          description = "Bring up the isolated local link for Hermes agent %i";
-          after = [
-            "hermes-netns@%i.service"
-            "hermes-host-control@%i.service"
-          ];
-          bindsTo = [
-            "hermes-netns@%i.service"
-            "hermes-host-control@%i.service"
-          ];
-          requires = [
-            "hermes-netns@%i.service"
-            "hermes-host-control@%i.service"
-          ];
-          partOf = [
-            "nftables.service"
-            "systemd-networkd.service"
-            "hermes-network-ready@%i.service"
-            "hermes@%i.service"
-          ];
-          unitConfig.JoinsNamespaceOf = [ "hermes-netns@%i.service" ];
-          serviceConfig = {
-            RootDirectory = "%t/hermes-network-%i/root";
-            RuntimeDirectory = [
-              "hermes-network-%i"
-              "hermes-network-%i/root"
+          "hermes-network@" = {
+            description = "Bring up the isolated local link for Hermes agent %i";
+            after = [
+              "hermes-netns@%i.service"
+              "hermes-host-control@%i.service"
             ];
-            RuntimeDirectoryMode = "0700";
-            CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
-            AmbientCapabilities = "";
-            DevicePolicy = "closed";
-            InaccessiblePaths = nixStoreAliasPaths;
-            KeyringMode = "private";
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            MountAPIVFS = true;
-            NoNewPrivileges = true;
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateMounts = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            ProcSubset = "pid";
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            ProtectSystem = "strict";
-            RemoveIPC = true;
-            RestrictAddressFamilies = [
-              "AF_NETLINK"
-              "AF_UNIX"
+            bindsTo = [
+              "hermes-netns@%i.service"
+              "hermes-host-control@%i.service"
             ];
-            RestrictNamespaces = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
+            requires = [
+              "hermes-netns@%i.service"
+              "hermes-host-control@%i.service"
             ];
-            TemporaryFileSystem = [ "/nix:ro" ];
-            TimeoutStartSec = "30s";
-            TimeoutStopSec = "15s";
-            Type = "oneshot";
-            RemainAfterExit = true;
-            UMask = "0077";
+            partOf = [
+              "nftables.service"
+              "systemd-networkd.service"
+              "hermes-network-ready@%i.service"
+              "hermes@%i.service"
+            ];
+            unitConfig.JoinsNamespaceOf = [ "hermes-netns@%i.service" ];
+            serviceConfig = payloadSandbox "network" // {
+              CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+              AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+              RestrictAddressFamilies = [ "AF_NETLINK" ];
+              TimeoutStartSec = "30s";
+              Type = "oneshot";
+              RemainAfterExit = true;
+            };
           };
-        };
-        "hermes-host-control@" = {
-          after = [
-            "hermes-netns@%i.service"
-            "network-online.target"
-            "nftables.service"
-            "systemd-networkd.service"
-          ];
-          bindsTo = [ "hermes-netns@%i.service" ];
-          description = "Configure host veth and networkd for Hermes agent %i";
-          partOf = [
-            "nftables.service"
-            "systemd-networkd.service"
-            "hermes-network@%i.service"
-          ];
-          requires = [
-            "hermes-netns@%i.service"
-            "nftables.service"
-            "systemd-networkd.service"
-          ];
-          wants = [ "network-online.target" ];
-          serviceConfig = {
-            AmbientCapabilities = "";
-            NetworkNamespacePath = "/proc/1/ns/net";
-            BindPaths = [ "/run/systemd/network" ];
-            BindReadOnlyPaths = [
-              "${pkgs.writeTextDir ".keep" ""}:/run/systemd/system"
-              "/run/systemd/private"
-              "/run/systemd/netif/io.systemd.Network"
+          "hermes-host-control@" = {
+            after = [
+              "dbus.service"
+              "hermes-netns@%i.service"
+              "hermes-network-observer@%i.service"
+              "network-online.target"
+              "nftables.service"
+              "systemd-networkd.service"
             ];
-            CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
-            InaccessiblePaths = nixStoreAliasPaths;
-            KeyringMode = "private";
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            MountAPIVFS = true;
-            NoNewPrivileges = true;
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateMounts = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            ProcSubset = "pid";
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            ProtectSystem = "strict";
-            ReadWritePaths = [ "/run/systemd/network" ];
-            DevicePolicy = "closed";
-            RemoveIPC = true;
-            RestrictAddressFamilies = [
-              "AF_INET"
-              "AF_INET6"
-              "AF_NETLINK"
-              "AF_UNIX"
+            bindsTo = [
+              "dbus.service"
+              "hermes-netns@%i.service"
+              "hermes-network-observer@%i.service"
             ];
-            RestrictNamespaces = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            RootDirectory = "%t/hermes-host-control-%i/root";
-            RuntimeDirectory = [
-              "hermes-host-control-%i"
-              "hermes-host-control-%i/root"
+            description = "Configure host veth and networkd for Hermes agent %i";
+            partOf = [
+              "nftables.service"
+              "systemd-networkd.service"
+              "hermes-network@%i.service"
             ];
-            RuntimeDirectoryMode = "0700";
-            RuntimeDirectoryPreserve = false;
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
+            requires = [
+              "dbus.service"
+              "hermes-netns@%i.service"
+              "hermes-network-observer@%i.service"
+              "nftables.service"
+              "systemd-networkd.service"
             ];
-            TemporaryFileSystem = [ "/nix:ro" ];
-            TimeoutStartSec = "30s";
-            TimeoutStopSec = "15s";
-            Type = "notify";
-            NotifyAccess = "all";
-            UMask = "0077";
+            wants = [ "network-online.target" ];
+            unitConfig.OnFailure = [ "hermes-network-failure@%i.service" ];
+            serviceConfig = payloadSandbox "host-control" // {
+              NetworkNamespacePath = "/proc/1/ns/net";
+              BindPaths = [ "/run/systemd/network" ];
+              BindReadOnlyPaths = [
+                "${pkgs.writeTextDir ".keep" ""}:/run/systemd/system"
+                "/run/dbus/system_bus_socket"
+                "/run/systemd/netif/io.systemd.Network"
+              ];
+              CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+              ReadWritePaths = [ "/run/systemd/network" ];
+              RestrictAddressFamilies = [
+                "AF_NETLINK"
+                "AF_UNIX"
+              ];
+              TimeoutStartSec = "30s";
+              Type = "notify";
+              NotifyAccess = "main";
+            };
           };
-        };
-        "hermes-dhcp@" = {
-          after = [
-            "hermes-network@%i.service"
-            "systemd-networkd.service"
-          ];
-          bindsTo = [ "hermes-network@%i.service" ];
-          description = "Acquire the isolated DHCP lease for Hermes agent %i";
-          partOf = [
-            "nftables.service"
-            "systemd-networkd.service"
-          ];
-          unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
-          serviceConfig = {
-            AmbientCapabilities = [
-              "CAP_NET_ADMIN"
-              "CAP_NET_BIND_SERVICE"
-              "CAP_NET_RAW"
+          "hermes-network-failure@" = {
+            description = "Stop failed Hermes network namespace for agent %i";
+            after = [ "hermes-host-control@%i.service" ];
+            enableDefaultPath = false;
+            serviceConfig = payloadSandbox "network-failure" // {
+              AmbientCapabilities = "";
+              BindReadOnlyPaths = [ "/run/dbus/system_bus_socket" ];
+              CapabilityBoundingSet = "";
+              DynamicUser = false;
+              RestrictAddressFamilies = [ "AF_UNIX" ];
+              Type = "oneshot";
+              User = "root";
+            };
+          };
+          "hermes-dhcp@" = {
+            after = [
+              "hermes-network@%i.service"
+              "systemd-networkd.service"
             ];
+            bindsTo = [ "hermes-network@%i.service" ];
+            description = "Acquire the isolated DHCP lease for Hermes agent %i";
+            partOf = [
+              "nftables.service"
+              "systemd-networkd.service"
+            ];
+            unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
+            serviceConfig = payloadSandbox "dhcp" // {
+              AmbientCapabilities = [
+                "CAP_NET_ADMIN"
+                "CAP_NET_BIND_SERVICE"
+                "CAP_NET_RAW"
+              ];
 
-            CapabilityBoundingSet = [
-              "CAP_NET_ADMIN"
-              "CAP_NET_BIND_SERVICE"
-              "CAP_NET_RAW"
-            ];
-            NoNewPrivileges = true;
-            DynamicUser = true;
-            BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ];
-            CoredumpFilter = "0x00";
-            DevicePolicy = "closed";
-            InaccessiblePaths = nixStoreAliasPaths;
-            KeyringMode = "private";
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateNetwork = true;
-            PrivateMounts = true;
-            PrivateTmp = true;
-            MountAPIVFS = true;
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            ProcSubset = "pid";
-            ProtectSystem = "strict";
-            RootDirectory = "%t/hermes-dhcp-%i/root";
-            StateDirectory = [ "hermes-dhcp-%i:dhcpcd" ];
-            RuntimeDirectory = [
-              "hermes-dhcp-%i:dhcpcd"
-              "hermes-dhcp-%i/root"
-            ];
-            RuntimeDirectoryMode = "0700";
-            RuntimeDirectoryPreserve = false;
-            RestrictAddressFamilies = [
-              "AF_INET"
-              "AF_INET6"
-              "AF_NETLINK"
-              "AF_PACKET"
-              "AF_UNIX"
-            ];
-            RestrictNamespaces = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            RemoveIPC = true;
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
-            ];
-            TemporaryFileSystem = [
-              "/nix:ro"
-              # A private writable parent lets DynamicUser create the fixed-path compatibility link.
-              "/var/run:mode=1777"
-            ];
-            TimeoutStartSec = "30s";
-            TimeoutStopSec = "15s";
-            Type = "exec";
-            Restart = "no";
-            UMask = "0077";
-            User = "hermes-dhcp-%i";
+              CapabilityBoundingSet = [
+                "CAP_NET_ADMIN"
+                "CAP_NET_BIND_SERVICE"
+                "CAP_NET_RAW"
+              ];
+              BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ];
+              CoredumpFilter = "0x00";
+              StateDirectory = [ "hermes-dhcp-%i:dhcpcd" ];
+              RuntimeDirectory = [
+                "hermes-dhcp-%i:dhcpcd"
+                "hermes-dhcp-%i/root"
+              ];
+              RestrictAddressFamilies = [
+                "AF_INET"
+                "AF_INET6"
+                "AF_NETLINK"
+                "AF_PACKET"
+                "AF_UNIX"
+              ];
+              TemporaryFileSystem = [
+                "/nix:ro"
+                # A private writable parent lets DynamicUser create the fixed-path compatibility link.
+                "/var/run:mode=1777"
+              ];
+              TimeoutStartSec = "30s";
+            };
           };
-        };
-        "hermes-network-ready@" = {
-          after = [
-            "hermes-network@%i.service"
-            "hermes-dhcp@%i.service"
-          ];
-          bindsTo = [
-            "hermes-network@%i.service"
-            "hermes-dhcp@%i.service"
-          ];
-          description = "Verify DHCP, SLAAC and firewall readiness for Hermes agent %i";
-          partOf = [
-            "nftables.service"
-            "systemd-networkd.service"
-            "hermes@%i.service"
-          ];
-          requires = [
-            "hermes-network@%i.service"
-            "hermes-dhcp@%i.service"
-          ];
-          unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
-          serviceConfig = {
-            AmbientCapabilities = [ ];
-            BindReadOnlyPaths = [
-              "/etc/resolv.conf:/run/hermes-host-resolv.conf"
-              "${pkgs.writeTextDir ".keep" ""}:/run/systemd/system"
-              "/run/systemd/private"
+          "hermes-network-ready@" = {
+            after = [
+              "hermes-network@%i.service"
+              "hermes-dhcp@%i.service"
             ];
-            CapabilityBoundingSet = [
-              "CAP_NET_ADMIN"
-              "CAP_NET_BIND_SERVICE"
-              "CAP_SETGID"
-              "CAP_SETUID"
-              "CAP_SYS_ADMIN"
-              "CAP_SYS_PTRACE"
+            bindsTo = [
+              "hermes-network@%i.service"
+              "hermes-dhcp@%i.service"
             ];
-            InaccessiblePaths = nixStoreAliasPaths;
-            KeyringMode = "private";
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            MountAPIVFS = true;
-            NoNewPrivileges = true;
-            NotifyAccess = "all";
-            DevicePolicy = "closed";
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateMounts = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            ProcSubset = "pid";
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectSystem = "strict";
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            RemoveIPC = true;
-            RestrictAddressFamilies = [
-              "AF_INET"
-              "AF_INET6"
-              "AF_NETLINK"
-              "AF_UNIX"
+            description = "Verify DHCP, SLAAC and firewall readiness for Hermes agent %i";
+            partOf = [
+              "nftables.service"
+              "systemd-networkd.service"
+              "hermes@%i.service"
             ];
-            RestrictNamespaces = [ "net" ];
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            RootDirectory = "%t/hermes-network-ready-%i/root";
-            RuntimeDirectory = [
-              "hermes-network-ready-%i"
-              "hermes-network-ready-%i/root"
-              "hermes-agent-network-%i"
+            requires = [
+              "hermes-network@%i.service"
+              "hermes-dhcp@%i.service"
             ];
-            RuntimeDirectoryMode = "0755";
-            RuntimeDirectoryPreserve = false;
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
-              "setgid"
-              "setgroups"
-              "setresgid"
-              "setresuid"
-              "setuid"
-              "setns"
-            ];
-            TemporaryFileSystem = [ "/nix:ro" ];
-            TimeoutStartSec = "60s";
-            TimeoutStopSec = "15s";
-            Type = "notify";
-            Restart = "no";
-            UMask = "0077";
+            unitConfig.JoinsNamespaceOf = [ "hermes-netns@%i.service" ];
+            serviceConfig = payloadSandbox "network-ready" // {
+              Type = "notify";
+              NotifyAccess = "main";
+              RestrictAddressFamilies = [ "AF_UNIX" ];
+            };
           };
-        };
-        "hermes-pf@" = {
-          after = [ "hermes@%i.service" ];
-          description = "Hermes Agent Public State Fixer";
-          partOf = [ "hermes@%i.service" ];
-          enableDefaultPath = false;
-          environment = {
-            HERMES_HOME = hermesAgentStateSystemdPath;
-            HOME = agentStateSystemdPath;
+          "hermes-pf@" = {
+            after = [ "hermes@%i.service" ];
+            description = "Hermes Agent Public State Fixer";
+            partOf = [ "hermes@%i.service" ];
+            enableDefaultPath = false;
+            environment = {
+              HERMES_HOME = hermesAgentStateSystemdPath;
+              HOME = agentStateSystemdPath;
+            };
+            path = publicStatePath;
+            serviceConfig = {
+              AmbientCapabilities = [
+                "CAP_DAC_READ_SEARCH"
+                "CAP_FOWNER"
+              ];
+              CapabilityBoundingSet = [
+                "CAP_DAC_READ_SEARCH"
+                "CAP_FOWNER"
+              ];
+              CoredumpFilter = "0x00";
+              DelegateNamespaces = false;
+              DevicePolicy = "closed";
+              DynamicUser = true;
+              InaccessiblePaths = nixStoreAliasPaths;
+              TemporaryFileSystem = [ "/nix:ro" ];
+              ExecStart = [ publicStateExecStart ];
+              Group = sharedStateId;
+              KeyringMode = "private";
+              LockPersonality = true;
+              MemoryDenyWriteExecute = true;
+              MountAPIVFS = true;
+              NoNewPrivileges = true;
+              NotifyAccess = "none";
+              PrivateDevices = true;
+              PrivateIPC = true;
+              PrivateMounts = true;
+              PrivateNetwork = true;
+              PrivateTmp = true;
+              PrivateUsers = "identity";
+              ProcSubset = "pid";
+              ProtectClock = true;
+              ProtectControlGroups = "strict";
+              ProtectHome = true;
+              ProtectHostname = "private";
+              ProtectKernelLogs = true;
+              ProtectKernelModules = true;
+              ProtectKernelTunables = true;
+              ProtectProc = "invisible";
+              ProtectSystem = "strict";
+              ReadWritePaths = [ agentStateSystemdPath ];
+              RemoveIPC = true;
+              Restart = "always";
+              BindReadOnlyPaths = publicStateTemplateClosure;
+              # RootDirectory hides the host state tree; the fixer must change gateway ACLs there.
+              BindPaths = [ agentStateSystemdPath ];
+              RestrictAddressFamilies = [ ];
+              RestrictNamespaces = true;
+              RestrictRealtime = true;
+              RestrictSUIDSGID = true;
+              RootDirectory = "%t/hermes-%i-pf/root";
+              RuntimeDirectory = [
+                "hermes-%i-pf"
+                "hermes-%i-pf/root"
+                "hermes-%i-pf/root/etc"
+              ];
+              RuntimeDirectoryMode = "0700";
+              RuntimeDirectoryPreserve = false;
+              SetLoginEnvironment = false;
+              SupplementaryGroups = [ sharedStateId ];
+              SystemCallArchitectures = "native";
+              SystemCallErrorNumber = "EPERM";
+              SystemCallFilter = [
+                "@system-service"
+                "~@resources"
+                "~@privileged"
+                "~socket"
+              ];
+              Type = "exec";
+              UMask = "0077";
+              User = publicStateFixerSystemdId;
+            };
+            wantedBy = [ "hermes@%i.service" ];
           };
-          path = publicStatePath;
-          serviceConfig = {
-            AmbientCapabilities = [
-              "CAP_DAC_READ_SEARCH"
-              "CAP_FOWNER"
+          "hermes@" = {
+            after = [
+              "network-online.target"
+              "hermes-network@%i.service"
+              "hermes-network-ready@%i.service"
             ];
-            CapabilityBoundingSet = [
-              "CAP_DAC_READ_SEARCH"
-              "CAP_FOWNER"
+            bindsTo = [
+              "network-online.target"
+              "hermes-network@%i.service"
+              "hermes-network-ready@%i.service"
             ];
-            CoredumpFilter = "0x00";
-            DelegateNamespaces = false;
-            DevicePolicy = "closed";
-            DynamicUser = true;
-            InaccessiblePaths = nixStoreAliasPaths;
-            TemporaryFileSystem = [ "/nix:ro" ];
-            ExecStart = [ (lib.getExe publicStateExecStart) ];
-            Group = publicStateFixerSystemdId;
-            KeyringMode = "private";
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            MountAPIVFS = true;
-            NoNewPrivileges = true;
-            NotifyAccess = "none";
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateMounts = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            PrivateUsers = "identity";
-            ProcSubset = "pid";
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            ProtectSystem = "strict";
-            ReadWritePaths = [ agentStateSystemdPath ];
-            RemoveIPC = true;
-            Restart = "always";
-            BindReadOnlyPaths = [ "/etc/group" ] ++ publicStateTemplateClosure;
-            # RootDirectory hides the host state tree; the fixer must change gateway ACLs there.
-            BindPaths = [ agentStateSystemdPath ];
-            RestrictAddressFamilies = [ "AF_UNIX" ];
-            RestrictNamespaces = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            RootDirectory = "%t/hermes-%i-pf/root";
-            RuntimeDirectory = [
-              "hermes-%i-pf"
-              "hermes-%i-pf/root"
-              "hermes-%i-pf/root/etc"
+            partOf = [
+              "nftables.service"
+              "systemd-networkd.service"
             ];
-            RuntimeDirectoryMode = "0700";
-            RuntimeDirectoryPreserve = false;
-            SetLoginEnvironment = false;
-            SupplementaryGroups = [ sharedStateId ];
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
-            ];
-            Type = "exec";
-            UMask = "0077";
-            User = publicStateFixerSystemdId;
-          };
-          wantedBy = [ "hermes@%i.service" ];
-        };
-        "hermes@" = {
-          after = [
-            "network-online.target"
-            "hermes-network@%i.service"
-            "hermes-network-ready@%i.service"
-          ];
-          bindsTo = [
-            "network-online.target"
-            "hermes-network@%i.service"
-            "hermes-network-ready@%i.service"
-          ];
-          partOf = [
-            "nftables.service"
-            "systemd-networkd.service"
-          ];
-          description = "Hermes Agent Gateway";
-          enableDefaultPath = false;
-          environment = {
-            HEADROOM_BEACON = "off";
-            #HEADROOM_OTEL_METRICS_ENABLED = "1";
-            HEADROOM_SAVINGS_PROFILE = "coding";
-            HEADROOM_TELEMETRY = "on";
-            HERMES_HOME = hermesAgentStateSystemdPath;
-            HERMES_KANBAN_HOME = sharedStatePath;
-            HOME = agentStateSystemdPath;
-            PONYTAIL_DEFAULT_MODE = "ultra";
-            RTK_TELEMETRY_DISABLED = "1";
-            SSH_AUTH_SOCK = "%t/${agentStateSystemdId}/ssh-agent.socket";
-            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-          };
-          path = hermesRuntimePath;
-          serviceConfig = {
-            AmbientCapabilities = [ "" ];
-            BindPaths = [
-              "/dev/kvm"
-              sharedStatePath
-            ];
-            BindReadOnlyPaths = [
-              "${lib.getExe' pkgs.bash "sh"}:/bin/sh"
-              "${lib.getExe' pkgs.bash "bash"}:/bin/bash"
-              "${lib.getExe' pkgs.coreutils "env"}:/usr/bin/env"
-              "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt"
-              "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt"
-            ];
-            InaccessiblePaths = nixStoreAliasPaths;
-            TemporaryFileSystem = [ "/nix:ro" ];
-            CapabilityBoundingSet = [ "" ];
-            CoredumpFilter = "0x00";
-            DelegateNamespaces = false;
-            DeviceAllow = [ "/dev/kvm rw" ];
-            DevicePolicy = "closed";
-            DynamicUser = true;
-            ExecStartPre = [ "+${lib.getExe gatewayOwnershipExecStartPre}" ];
-            Group = agentStateSystemdId;
+            description = "Hermes Agent Gateway";
+            enableDefaultPath = false;
+            environment = {
+              HEADROOM_BEACON = "off";
+              #HEADROOM_OTEL_METRICS_ENABLED = "1";
+              HEADROOM_SAVINGS_PROFILE = "coding";
+              HEADROOM_TELEMETRY = "on";
+              HERMES_HOME = hermesAgentStateSystemdPath;
+              HERMES_KANBAN_HOME = sharedStatePath;
+              HOME = agentStateSystemdPath;
+              PONYTAIL_DEFAULT_MODE = "ultra";
+              RTK_TELEMETRY_DISABLED = "1";
+              SSH_AUTH_SOCK = "%t/${agentStateSystemdId}/ssh-agent.socket";
+              SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+            };
+            path = hermesRuntimePath;
+            serviceConfig = {
+              AmbientCapabilities = [ "" ];
+              BindPaths = [
+                "/dev/kvm"
+                sharedStatePath
+              ];
+              BindReadOnlyPaths = [
+                "${lib.getExe' pkgs.bash "sh"}:/bin/sh"
+                "${lib.getExe' pkgs.bash "bash"}:/bin/bash"
+                "${lib.getExe' pkgs.coreutils "env"}:/usr/bin/env"
+                "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt"
+                "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt"
+              ];
+              InaccessiblePaths = nixStoreAliasPaths;
+              TemporaryFileSystem = [ "/nix:ro" ];
+              CapabilityBoundingSet = [ "" ];
+              CoredumpFilter = "0x00";
+              DelegateNamespaces = false;
+              DeviceAllow = [ "/dev/kvm rw" ];
+              DevicePolicy = "closed";
+              DynamicUser = true;
+              ExecStartPre = [ "+${gatewayOwnershipExecStartPre}" ];
+              Group = agentStateSystemdId;
 
-            KeyringMode = "private";
-            LockPersonality = true;
-            MountAPIVFS = true;
-            NoNewPrivileges = true;
-            NotifyAccess = "none";
-            PrivateDevices = true;
-            PrivateIPC = true;
-            PrivateMounts = true;
-            PrivateNetwork = true;
-            PrivateTmp = true;
-            PrivateUsers = "identity";
-            ProtectClock = true;
-            ProtectControlGroups = "strict";
-            ProtectHome = true;
-            ProtectHostname = "private";
-            ProtectKernelLogs = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectProc = "invisible";
-            ProtectSystem = "strict";
-            ReadOnlyPaths = [ "/proc/cpuinfo" ];
-            RemoveIPC = true;
-            Restart = "always";
-            RestrictAddressFamilies = [
-              "AF_INET"
-              "AF_INET6"
-              "AF_UNIX"
-            ];
-            RestrictNamespaces = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            RootDirectory = "%t/${agentStateSystemdId}/root";
-            RuntimeDirectory = [
-              agentStateSystemdId
-              "${agentStateSystemdId}/root"
-              "${agentStateSystemdId}/root/etc"
-            ];
-            RuntimeDirectoryMode = "0700";
-            RuntimeDirectoryPreserve = false;
-            SetLoginEnvironment = false;
-            StateDirectory = [ agentStateSystemdId ];
-            StateDirectoryMode = "2700";
-            SupplementaryGroups = [ sharedStateId ];
-            SystemCallArchitectures = "native";
-            SystemCallErrorNumber = "EPERM";
-            SystemCallFilter = [
-              "@system-service"
-              "~@resources"
-              "~@privileged"
-            ];
-            Type = "exec";
-            UMask = "0007";
-            User = agentStateSystemdId;
+              KeyringMode = "private";
+              LockPersonality = true;
+              MountAPIVFS = true;
+              NoNewPrivileges = true;
+              NotifyAccess = "none";
+              PrivateDevices = true;
+              PrivateIPC = true;
+              PrivateMounts = true;
+              PrivateNetwork = true;
+              PrivateTmp = true;
+              PrivateUsers = "identity";
+              ProtectClock = true;
+              ProtectControlGroups = "strict";
+              ProtectHome = true;
+              ProtectHostname = "private";
+              ProtectKernelLogs = true;
+              ProtectKernelModules = true;
+              ProtectKernelTunables = true;
+              ProtectProc = "invisible";
+              ProtectSystem = "strict";
+              ReadOnlyPaths = [ "/proc/cpuinfo" ];
+              RemoveIPC = true;
+              Restart = "always";
+              RestrictAddressFamilies = [
+                "AF_INET"
+                "AF_INET6"
+                "AF_UNIX"
+              ];
+              RestrictNamespaces = true;
+              RestrictRealtime = true;
+              RestrictSUIDSGID = true;
+              RootDirectory = "%t/${agentStateSystemdId}/root";
+              RuntimeDirectory = [
+                agentStateSystemdId
+                "${agentStateSystemdId}/root"
+                "${agentStateSystemdId}/root/etc"
+              ];
+              RuntimeDirectoryMode = "0700";
+              RuntimeDirectoryPreserve = false;
+              SetLoginEnvironment = false;
+              StateDirectory = [ agentStateSystemdId ];
+              StateDirectoryMode = "2700";
+              SupplementaryGroups = [ sharedStateId ];
+              SystemCallArchitectures = "native";
+              SystemCallErrorNumber = "EPERM";
+              SystemCallFilter = [
+                "@system-service"
+                "~@resources"
+                "~@privileged"
+              ];
+              Type = "exec";
+              UMask = "0007";
+              User = agentStateSystemdId;
+            };
+            unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
           };
-          unitConfig.JoinsNamespaceOf = [ "hermes-network@%i.service" ];
         };
-      };
     };
   sharedState.tmpfiles.rules = [
     "d ${sharedStatePath} 2770 root ${sharedStateId} - -"
@@ -2155,8 +1644,13 @@ in
         ) configuredNetworkPermissions;
         message = "services.hermes-agent: network permission addresses must be literal IPv4 or IPv6 addresses";
       }
+      {
+        assertion = !(cfg.enable && activeAgentNames != [ ]) || config.services.dbus.enable;
+        message = "Hermes host control requires the host system D-Bus service; explicit services.dbus.enable=false is incompatible";
+      }
     ];
 
+    services.dbus.enable = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (lib.mkDefault true);
     networking.nftables.enable = lib.mkIf (cfg.enable && activeAgentNames != [ ]) true;
     networking.firewall.backend = lib.mkIf (cfg.enable && activeAgentNames != [ ]) "nftables";
     networking.firewall.filterForward = lib.mkIf (cfg.enable && activeAgentNames != [ ]) true;
@@ -2231,10 +1725,13 @@ in
                   PersistLeases = "runtime";
                   PoolOffset = 2;
                   PoolSize = 1;
-                  Router = "_server_address";
                 };
               };
             }) agentNetworks
+          );
+          # Keep deletion of the final .network trigger visible to switch-to-configuration.
+          services.systemd-networkd.reloadTriggers = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
+            lib.mkAfter [ networkdConfigSetTrigger ]
           );
           tmpfiles.rules = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [
             "d /run/systemd/network 0755 root root - -"

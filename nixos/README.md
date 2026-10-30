@@ -36,21 +36,32 @@ startup barrier: it requires the DHCPv4 lease, usable SLAAC address/default
 route, verified per-agent nftables sets, resolver file, and DNS/proxy listeners
 before notifying systemd that the gateway may start. Address/route or firewall
 generation loss revokes the sets and stops the gateway. `hermes-pf@NAME` remains
-in its own `PrivateNetwork=yes` namespace with `RestrictAddressFamilies=AF_UNIX`.
+in its own private namespace; it uses numeric shared-group ACLs without importing
+host `/etc/group`, and denies socket creation through its syscall filter.
 Both setup payloads have only `CAP_NET_ADMIN`, with setns and namespace creation
-denied. The host controller acknowledges peer movement before waiting for
-carrier-dependent allocation/RA work; its notification is not final readiness.
+denied. Local setup uses its own dynamic identity and ambient NET_ADMIN; only
+the zero-capability anchor and trusted host controller retain root UID for
+namespace-FD and manager API access; the zero-capability OnFailure reaper uses
+root D-Bus credentials only to stop the anchor after failed host setup. The host
+controller acknowledges peer
+movement before waiting for carrier-dependent allocation/RA work; its
+notification is not final readiness.
 It validates and holds the anchor namespace FD across movement. It remains
 trusted host-control code because its manager socket grants manager API access.
 The DHCP client has only its private-network configuration capabilities, and
 the gateway gets none.
 
-This worktree is an incomplete hardening candidate, not deployment-ready. The
-legacy readiness role still has SYS_ADMIN/SYS_PTRACE/credential-drop privileges
-and starts DNS/proxy children as `nobody`; the authorized unprivileged split
-remains outstanding. The full runtime currently fails on those legacy children
-inside the new root. The passing setup/DHCP boundary tests do not waive that
-failure or the remaining acceptance matrix. See the proposed
+This worktree remains an incomplete hardening candidate, not deployment-ready.
+Readiness, observer, DNS, host mappings and namespace relays now use separate
+dynamic identities and private roots, without SYS_ADMIN/SYS_PTRACE or child
+credential changes. Only DNS and configured low-port proxies retain bind
+privilege. The controller owns exact nft verification and generation-scoped
+authorization; readiness has no manager socket or writable producer mount.
+Private roots are 0700; only separate non-secret publication directories are
+readable by other service identities. Payload NotifyAccess defaults to none;
+readiness notifies from its main process. Current runtime/enforcement/lifecycle
+verification is still in progress; builds or earlier targeted tests do not
+waive any remaining acceptance gate. See the proposed
 [ADR](adr/0001-hermes-service-isolation-and-networkd.md).
 
 agent veths use `haN`/`hbN` interfaces. The host-side `.network` match also
@@ -140,8 +151,10 @@ NixOS firewall/NAT configuration (or explicit nftables forward rules). Existing
 incompatible with the nftables backends and cause configuration evaluation to
 fail. The module uses NixOS `systemd.network.networks` for generated
 `40-hermes-agent-N.network` files, so ordinary generation activation reloads
-networkd when those files change. Dynamic RA drop-ins still use the existing
-runtime reload path. If `networking.useNetworkd` is false, the module does not
+networkd when those files are added, changed, or removed. A content-addressed
+membership trigger covers removals in the pinned NixOS switch implementation.
+Dynamic RA drop-ins still use the existing runtime reload path. If
+`networking.useNetworkd` is false, the module does not
 add a second host `network-online.target` wait gate; explicit networkd wait
 policy remains host-owned. The generic NixOS warning about networkd plus
 `networking.useDHCP` can remain because dhcpcd still owns the host uplink while
@@ -340,8 +353,9 @@ checks the effective per-instance root directories and narrow helper mounts,
 and verifies exact nameserver membership plus a successful one-host-resolver
 DNS case and an unavailable-host-DNS negative control,
 and reads each peer's generated profile from the other agent's live mount
-namespace using that service's UID/GID and supplementary groups. Each wait is
-bounded at 120 seconds, and both agents must retain the same live PID and
+namespace using that service's UID/GID and supplementary groups. The shared
+active-state gate permits up to 180 seconds; per-probe bounds remain shorter.
+Both agents must retain the same live PID and
 restart count with `active/running` state for 10 seconds after startup and
 restarts, including after profile reads. A failure prints unit status and the
 last 80 journal lines per unit. Successful boots print
@@ -363,7 +377,7 @@ activation and dashboard readiness, and verifies that a main-agent restart
 replaces the peer process. `ExecMainStartTimestampMonotonic` is reported
 separately and is not used as the sole startup boundary.
 Gateway start/restart commands are bounded at 180 seconds and the smoke unit
-at 1200 seconds to allow per-store-path mount setup and the expanded live
+at 5400 seconds to allow the full per-store-path, security, loss and lifecycle
 network-policy probes in the 2-GiB guest. The RAM limit increased from 1 GiB
 to 2 GiB with operator approval; the 1-GiB disk limit is unchanged.
 For each real agent, the smoke check also runs `hermes profile list` from that
