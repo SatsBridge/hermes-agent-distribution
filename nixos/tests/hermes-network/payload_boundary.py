@@ -7,6 +7,7 @@ import socket
 import stat
 import sys
 role = sys.argv[1]
+sentinel_name = sys.argv[2]
 expected_caps = {"gateway": 0, "pf": (1 << 2) | (1 << 3), "dhcp": (1 << 10) | (1 << 12) | (1 << 13),
     "host-control": 1 << 12, "network-failure": 0, "netns": 0, "network-observer": 0, "dns": 1 << 10,
     "host-proxy": 0, "agent-relay": 0, "network-ready": 0}[role]
@@ -42,8 +43,8 @@ store_mounts = [fields for fields in mounts if "/nix/store/" in fields[4]]
 assert nix_root is not None and "ro" in nix_root[5].split(","), (role, nix_root)
 assert store_mounts and all("ro" in fields[5].split(",") for fields in store_mounts), (role, store_mounts)
 assert pathlib.Path(sys.executable).is_file() and os.access(sys.executable, os.R_OK | os.X_OK), role
-assert not list(pathlib.Path("/nix/store").glob("*-hermes-vm-unrelated-store-sentinel")), role
-assert not list(pathlib.Path("/nix/.ro-store").glob("*-hermes-vm-unrelated-store-sentinel")), role
+for store_root in ("/nix/store", "/nix/.ro-store"):
+    assert not (pathlib.Path(store_root) / sentinel_name).exists(), (role, store_root)
 for alias in ("/run/current-system", "/run/booted-system", "/run/wrappers", "/etc/static", "/etc/profiles",
     "/etc/profiles/per-user/root/bin/bash", "/etc/systemd/system", "/nix/var/nix/profiles/system",
     "/root/.nix-defexpr", "/root/.nix-profile/bin/bash", "/run/wrappers/bin/sudo"):

@@ -1730,8 +1730,8 @@ in
               };
             }) agentNetworks
           );
-          # Keep deletion of the final .network trigger visible to switch-to-configuration.
-          services.systemd-networkd.reloadTriggers = lib.mkIf (cfg.enable && config.systemd.network.enable) (
+          # Keep the membership trigger across agent and module removal while networkd remains enabled.
+          services.systemd-networkd.reloadTriggers = lib.mkIf config.systemd.network.enable (
             lib.mkAfter [ networkdConfigSetTrigger ]
           );
           tmpfiles.rules = lib.mkIf (cfg.enable && activeAgentNames != [ ]) [

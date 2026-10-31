@@ -11,16 +11,15 @@ let
         config.systemd.services."hermes-network-ready@vm".serviceConfig.BindReadOnlyPaths or [ ];
       closureModule = lib.findFirst (path: lib.hasSuffix "-hermes-network-record" path) null closurePaths;
     in
-    if closureModule == null then
-      ../modules/services/agent/hermes-network/network_record.py
-    else
-      closureModule;
+    if closureModule == null then ../modules/services/agent/hermes-network else closureModule;
   hostRecordPath = ../modules/services/agent/hermes-network/host.py;
   vmNetworkRecordTests = ./tests/hermes-network/records.py;
   vmNetworkObserver = ../modules/services/agent/hermes-network/observer.py;
   vmPayloadBoundaryProbe = ./tests/hermes-network/payload_boundary.py;
   vmPayloadHook = role: {
-    serviceConfig.ExecStartPost = [ "${pkgs.python3}/bin/python3 ${vmPayloadBoundaryProbe} ${role}" ];
+    serviceConfig.ExecStartPost = [
+      "${pkgs.python3}/bin/python3 ${vmPayloadBoundaryProbe} ${role} ${vmStoreSentinelName}"
+    ];
     serviceConfig.BindReadOnlyPaths = lib.optionals (role != "netns") [ "/dev/kvm" ];
   };
   vmNetworkLocalBoundaryProbe = ./tests/hermes-network/local_boundary.py;
@@ -104,6 +103,7 @@ let
       previous_system="$HERMES_VM_PREVIOUS_SYSTEM"
       candidate_system=$(readlink -f /run/current-system)
       updated_system="$HERMES_VM_UPDATED_SYSTEM"
+      removed_system="$HERMES_VM_REMOVED_SYSTEM"
       profile=/nix/var/nix/profiles/system
       install -d /nix/var/nix/profiles
       main_sentinel=/var/lib/hermes-vm/.hermes/skills/.generation-rollback-sentinel
@@ -112,14 +112,17 @@ let
       dhcp_peer_sentinel=/var/lib/hermes-dhcp-vm-peer/.generation-rollback-sentinel
       if [[ ! -x "$previous_system/bin/switch-to-configuration" \
         || ! -x "$candidate_system/bin/switch-to-configuration" \
-        || ! -x "$updated_system/bin/switch-to-configuration" ]]; then
+        || ! -x "$updated_system/bin/switch-to-configuration" \
+        || ! -x "$removed_system/bin/switch-to-configuration" ]]; then
         previous_switch=missing
         candidate_switch=missing
         updated_switch=missing
+        removed_switch=missing
         [[ -x "$previous_system/bin/switch-to-configuration" ]] && previous_switch=available
         [[ -x "$candidate_system/bin/switch-to-configuration" ]] && candidate_switch=available
         [[ -x "$updated_system/bin/switch-to-configuration" ]] && updated_switch=available
-        echo "Generation closure unavailable: previous=$previous_system ($previous_switch); candidate=$candidate_system ($candidate_switch); updated=$updated_system ($updated_switch)" >&2
+        [[ -x "$removed_system/bin/switch-to-configuration" ]] && removed_switch=available
+        echo "Generation closure unavailable: previous=$previous_system ($previous_switch); candidate=$candidate_system ($candidate_switch); updated=$updated_system ($updated_switch); removed=$removed_system ($removed_switch)" >&2
         exit 1
       fi
       [[ ! -e "$main_sentinel" && ! -e "$peer_sentinel" \
@@ -177,7 +180,7 @@ let
         local target="$1"
         for _ in {1..900}; do
           if [[ "$(readlink -f /run/current-system)" == "$target" ]]; then
-            if [[ "$target" == "$previous_system" ]]; then
+            if [[ "$target" == "$previous_system" || "$target" == "$removed_system" ]]; then
               if systemctl is-active --quiet systemd-networkd.service \
                 && ! ip link show dev ha0 >/dev/null 2>&1 \
                 && ! ip link show dev ha1 >/dev/null 2>&1 \
@@ -218,8 +221,11 @@ let
       }
 
       switch_generation() {
-        local label="$1" target="$2" link="$profile-$1-link" reload_before reload_after networkd_pid_before networkd_pid_after
-        if [[ "$(readlink -f /run/current-system)" != "$previous_system" ]]; then
+        local label="$1" target="$2" reload_before reload_after networkd_pid_before networkd_pid_after
+        local link="$profile-$label-link"
+        local current_system
+        current_system=$(readlink -f /run/current-system)
+        if [[ "$current_system" != "$previous_system" && "$current_system" != "$removed_system" ]]; then
           stop_agent_stack
         fi
         ln -sfn "$target" "$link"
@@ -228,7 +234,7 @@ let
         networkd_pid_before=$(systemctl show --property=MainPID --value systemd-networkd.service)
         echo "Applying NixOS generation $label ($target) without changing the disposable VM bootloader"
         timeout --kill-after=10s 240 "$target/bin/switch-to-configuration" test
-        if [[ "$target" != "$previous_system" ]]; then
+        if [[ "$target" != "$previous_system" && "$target" != "$removed_system" ]]; then
           timeout 30s systemctl reset-failed
           timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
             hermes-pf@vm.service hermes-pf@vm-peer.service
@@ -370,9 +376,13 @@ let
       assert_candidate_ready
       switch_generation updated "$updated_system"
       assert_updated_network_config
+      switch_generation last-agent-removal "$removed_system"
+      assert_previous_network_restored
+      switch_generation re-added "$candidate_system"
+      assert_candidate_ready
       switch_generation rollback "$previous_system"
       assert_previous_network_restored
-      echo "HERMES_VM_GENERATION_ROLLBACK_PASSED previous -> added -> changed -> rollback; uplink and skill sentinels preserved"
+      echo "HERMES_VM_GENERATION_ROLLBACK_PASSED module-disabled -> added -> changed -> last-agent-removal -> re-added -> module-disable rollback; uplink and skill sentinels preserved"
     '';
   };
   vmGenerationRollbackLaunch = pkgs.writeShellApplication {
@@ -388,12 +398,16 @@ let
       exec systemd-run --no-block --collect --unit=hermes-vm-generation-rollback \
         --setenv="HERMES_VM_PREVIOUS_SYSTEM=$HERMES_VM_PREVIOUS_SYSTEM" \
         --setenv="HERMES_VM_UPDATED_SYSTEM=$HERMES_VM_UPDATED_SYSTEM" \
+        --setenv="HERMES_VM_REMOVED_SYSTEM=$HERMES_VM_REMOVED_SYSTEM" \
         --property=TimeoutStartSec=2400s --property=SuccessAction=poweroff --property=FailureAction=poweroff \
         --property=StandardOutput=journal+console --property=StandardError=journal+console \
         ${lib.getExe vmGenerationRollbackProbe}
     '';
   };
   vmStoreSentinel = pkgs.writeText "hermes-vm-unrelated-store-sentinel" "Hermes VM unrelated store sentinel\n";
+  vmStoreSentinelName = builtins.unsafeDiscardStringContext (
+    builtins.baseNameOf (toString vmStoreSentinel)
+  );
   vmAgentRuntimeSmoke = pkgs.writeShellApplication {
     name = "hermes-module-vm-agent-smoke";
     runtimeInputs = [
@@ -476,7 +490,7 @@ let
           nsenter --net="$dad_netns_path" -- ip -6 address del "$dad_test_address/64" dev "$dad_peer_if" 2>/dev/null || true
           exec {dad_netns_fd}<&-
         }
-        unset dad_sender_pid dad_sender_log dad_netns_fd dad_netns_path dad_peer_if dad_test_address
+        dad_sender_pid="" dad_sender_log="" dad_netns_fd="" dad_netns_path="" dad_peer_if="" dad_test_address=""
         dad_event_observed=0 dad_namespace_revoked=0
       }
 
@@ -500,7 +514,7 @@ let
           nsenter --target "$ipv6_route_pid" --net -- ${pkgs.bash}/bin/bash -c 'set -e; printf 1 > /proc/sys/net/ipv6/conf/hb0/accept_ra' 2>/dev/null || true
           nsenter --target "$ipv6_route_pid" --net -- ip -6 route replace default via "$ipv6_route_gateway" dev hb0 2>/dev/null || true
         fi
-        unset ipv6_route_pid ipv6_route_gateway
+        ipv6_route_pid="" ipv6_route_gateway=""
         [[ -z "$split_frozen_pid" ]] || kill -CONT "$split_frozen_pid" 2>/dev/null || true
         if [[ -e "$split_override" ]]; then
           rm -f -- "$split_override"
@@ -2016,7 +2030,7 @@ let
         echo "HERMES_VM_IPV6_DEFAULT_ROUTE_LOSS_REVOKED elapsed_ms=$elapsed ipv4_route_preserved=1"
         nsenter --target "$anchor_pid" --net -- ${pkgs.bash}/bin/bash -c 'set -e; printf 1 > /proc/sys/net/ipv6/conf/hb0/accept_ra' 2>/dev/null || true
         nsenter --target "$anchor_pid" --net -- ip -6 route replace default via "$gateway" dev hb0 2>/dev/null || true
-        unset ipv6_route_pid ipv6_route_gateway
+        ipv6_route_pid="" ipv6_route_gateway=""
         timeout --kill-after=5s 180 systemctl stop hermes@vm.service hermes@vm-peer.service hermes-network@vm.service hermes-network@vm-peer.service || return 1
         assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
         assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
@@ -2104,7 +2118,7 @@ let
         rm -f -- "$ipv6_readiness_override"
         systemctl daemon-reload
         systemctl reset-failed
-        unset ipv6_route_pid ipv6_route_gateway
+        ipv6_route_pid="" ipv6_route_gateway=""
         timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
         wait_for_active || return 1
         assert_distinct_namespaces || return 1
@@ -2751,6 +2765,14 @@ let
         echo "Hermes live DAD probe passed"
         exit 0
       fi
+      if [[ "''${HERMES_VM_SECURITY_ONLY:-0}" == 1 ]]; then
+        stop_peer_probes
+        timeout --kill-after=5s 180 systemctl stop "''${units[@]}" || { diagnose; exit 1; }
+        cleanup_test_network
+        check_instantiated_security || { diagnose; exit 1; }
+        echo "HERMES_VM_SECURITY_ONLY_PASSED"
+        exit 0
+      fi
       check_nft_readback_exit_status || { diagnose; exit 1; }
       host_other_ip=$(ip -o -4 address show scope global | awk '$2 != "ha0" && $2 != "ha1" { split($4, a, "/"); print a[1]; exit }')
       [[ -n "$host_other_ip" ]] || { echo "No non-veth host interface address is available for the isolation probe" >&2; diagnose; exit 1; }
@@ -3000,7 +3022,7 @@ in
   systemd.services."hermes-dhcp@" = vmPayloadHook "dhcp";
   systemd.services."hermes-pf@" = vmPayloadHook "pf";
   systemd.services."hermes@".serviceConfig.ExecStartPost = [
-    "${pkgs.python3}/bin/python3 ${vmPayloadBoundaryProbe} gateway"
+    "${pkgs.python3}/bin/python3 ${vmPayloadBoundaryProbe} gateway ${vmStoreSentinelName}"
   ];
   systemd.services."hermes-network@".serviceConfig.ExecStartPost =
     lib.mkDefault "${lib.getExe pkgs.python3} ${vmNetworkLocalBoundaryProbe}";

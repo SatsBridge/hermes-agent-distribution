@@ -270,13 +270,16 @@ Public egress and already-established public flows remain host-uplink dependent.
 Rollback by reverting the module/configuration change, then rebuilding or
 switching to the previous NixOS generation; verify the effective guard rules and
 listeners after rollback. Switching generations does not delete or overwrite
-profile state or user-modified skills. A disposable-VM probe applied the previous
-generation (`2c074133`), candidate, then previous generation again; it verified
-the main and peer skill-state sentinels survived and candidate addresses, routes,
-RA drop-ins, DHCP/readiness units, and DNS listeners were removed on rollback.
-The probe used `switch-to-configuration test` to avoid touching the GRUB
-bootloader; it does not prove bootloader updates, reboot behavior, or a host
-generation switch/deployment.
+profile state or user-modified skills. The disposable networkd activation probe
+uses ordinary `switch-to-configuration test` in this order: module-disabled ->
+agents added -> `.network` changed -> last-agent removal -> agents re-added ->
+module-disable rollback. Each transition requires a real networkd reload without
+restarting networkd, checks the unrelated uplink and gateway/DHCP state sentinels,
+and checks removal of Hermes interfaces, routes, RA drop-ins, readiness, DHCP
+and DNS runtime state. It avoids the bootloader; bootloader updates, reboot
+behavior and deployment on a physical host remain unverified. This fixture gives
+networkd ownership of the test uplink; the separate Internet fixture exercises
+NetworkManager coexistence.
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#hermes-module-vm-config-check
@@ -287,6 +290,27 @@ If `nixos-rebuild` is not installed, its equivalent VM build is:
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm.config.system.build.vm
+```
+
+For focused instantiated-unit sandbox and `systemd-analyze verify/security`
+checks without the full network-failure matrix, build
+`nixosConfigurations.hermes-module-vm-security`. The guest must print
+`HERMES_VM_SECURITY_ONLY_PASSED`; this does not replace the full runtime test.
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm-security.config.system.build.vm
+NIX_DISK_IMAGE="$TMPDIR/hermes-module-vm-security.qcow2" ./result/bin/run-nixos-vm
+```
+
+The separate `hermes-module-vm-networkd-activation` fixture exercises ordinary
+`switch-to-configuration test` through module disable, first enable, source
+change, last-agent removal, re-add and rollback with networkd already running.
+Its QEMU uplink is networkd-owned so the standard wait-online policy is exercised;
+the Internet fixture below covers NetworkManager coexistence.
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm-networkd-activation.config.system.build.vm
+NIX_DISK_IMAGE="$TMPDIR/hermes-networkd-activation.qcow2" ./result/bin/run-nixos-vm
 ```
 
 The default fixture intentionally uses restricted QEMU networking and remains an
@@ -364,8 +388,9 @@ main activation, the first real dashboard-process log, and
 `HERMES_DASHBOARD_READY`. Restart timing starts immediately before
 `systemctl restart hermes@vm.service`. It reports whether first-log latency met
 the 10-second target or 15-second maximum, but timing is informational and does
-not fail the broader smoke; the startup NFR remains unmet on the unchanged runtime
-and this report is not an exception or evidence of compliance.
+not fail the broader smoke. Recent restricted-guest runs measured 69.835s from
+the network-start boundary to the first real dashboard log and 85.091s to
+`HERMES_DASHBOARD_READY`; the 15-second maximum remains unmet and unwaived.
 `HERMES_DASHBOARD_READY` and the independent loopback packaged-UI HTTP check
 remain required. No startup optimization was accepted: the proposed materialized
 closure view's storage cost cannot rely on reflinks or deduplication. It also
@@ -373,9 +398,12 @@ reports peer `ExecStart`/active latency relative to main
 activation and dashboard readiness, and verifies that a main-agent restart
 replaces the peer process. `ExecMainStartTimestampMonotonic` is reported
 separately and is not used as the sole startup boundary.
-Gateway start/restart commands are bounded at 180 seconds and the smoke unit
-at 5400 seconds to allow the full per-store-path, security, loss and lifecycle
-network-policy probes in the 2-GiB guest. The RAM limit increased from 1 GiB
+Gateway start/restart commands are bounded at 180 seconds and the smoke unit at
+5400 seconds for the full per-store-path, security, loss and lifecycle
+network-policy probes in the 2-GiB guest. A smoke timeout is a failure; a QEMU
+runner exit after the guest requests poweroff is not a substitute for the
+`Hermes VM runtime checks passed` marker or for a clean `/nix/store` unmount.
+The RAM limit increased from 1 GiB
 to 2 GiB with operator approval; the 1-GiB disk limit is unchanged.
 For each real agent, the smoke check also runs `hermes profile list` from that
 agent's captured network namespace with its own `HOME` and verifies its default

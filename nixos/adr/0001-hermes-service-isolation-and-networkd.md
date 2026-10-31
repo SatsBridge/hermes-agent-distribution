@@ -325,37 +325,50 @@ systemd 261 systemd.exec and systemd.resource-control; systemd v261
 load-fragment/verbs/bus-util/sd_booted sources; pinned Nixpkgs networkd module;
 iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 
-Current evidence is partial. Config checks compile generated scripts and run
-Historical pre-split guests found that systemd 261 rejects the old
-`Router=_server_address` token and that `UMask=0077` made the dynamic RA drop-in
-directory inaccessible to networkd. The current source omits the invalid Router
-key (using networkd's server-address default) and explicitly sets the drop-in
-directory to 0755. Earlier DHCP-layout and split-role guests are historical
-evidence only; they are not substitutes for a current full-candidate run.
+Current source passes `hermes-module-vm-config-check` and strict `nixfmt`
+formatting. The test-only payload boundary probe checks the exact unrelated-store
+sentinel by basename instead of scanning the 9p store. Cleanup resets state to
+empty strings so its explicit invocation and EXIT trap are idempotent under
+`set -u`.
 
-Current candidate evidence is partial. `hermes-module-vm-config-check` and the
-offline VM image build pass. The observer-level route-family test emits
-`route6=false` when only the IPv4 default is present, and the actual observation
-parser rejects it. A fresh offline guest records
-`HERMES_VM_IPV6_DEFAULT_ROUTE_STARTUP_BLOCKED` (417 ms; IPv4 preserved) and
-`HERMES_VM_IPV6_DEFAULT_ROUTE_LOSS_REVOKED` (2,041 ms; IPv4 preserved); it also
-passes both agents' exact host-only resolver and unavailable-host-DNS probes as
-their service identities with `CapEff=0`. The full offline smoke has NOT reached
-its final success marker: it stops in the late nftables policy-startup/recovery
-matrix. Its failure log and earlier positive markers are attached separately.
-The measured first real dashboard log is about 67 seconds after the network
-startup boundary, above the unchanged 15-second target; this NFR is unwaived.
-There is no clean-shutdown claim: the disposable guest reports failure to
-unmount `/nix/store` before the QEMU runner exits. Internet DNS/verified HTTPS,
-default-on Headroom/skills, ordinary live networkd activation/rollback, and the
-complete unit enforcement/lifecycle matrix remain unverified. No security
-exception, risk acceptance, software acceptance, or release authorization is
-inferred from scores or partial guest evidence.
+Runtime evidence is mixed and is not software acceptance. The restricted offline
+VM `/nix/store/mlz5y116lqpiapx4xrn8v3kbv8y2fy3y-nixos-vm` passed both agents'
+host-only DNS positive/blocked-negative probes, IPv6 default-route startup
+blocking (349 ms) and live-loss revocation (1,537 ms, IPv4 preserved), networkd
+recovery, and all seven split-producer-loss revocations (1.347–4.198 s). It did
+NOT reach `Hermes VM runtime checks passed`: the smoke hit its 5,400 s
+`TimeoutStartSec` while still in the integrated network/security matrix. Systemd
+powered the guest off; the QEMU runner returned 0, but `/nix/store` unmount failed
+and the full-smoke result is failure, not pass. The later cleanup/security-mode
+changes were exercised separately, not by a complete rerun of that offline
+matrix.
 
-Historical missing NSS/manager/DHCP failures are not descriptions of current
-role requirements. Attach bounded verbatim final-candidate output with commands,
-exit statuses and candidate/prior closure identities; inaccessible scratch
-paths are not review evidence.
+The offline cold-start measure was 69.835 s from host-veth start to first
+dashboard log and 85.091 s to `HERMES_DASHBOARD_READY`, against the unchanged
+15 s maximum. This startup NFR is unmet and unwaived. The default-on Headroom/skills
+VM installed skills and ran Headroom, but the peer gateway start job failed on a
+dependency; the smoke timed out waiting for both agents, so default-on success is
+not established.
+
+The focused Internet-recovery VM with `networking.useNetworkd=true` and
+NetworkManager active passed public DNS and certificate-verified HTTPS HTTP 200
+for both service identities before and after nftables/networkd recovery. Public
+IPv6 Internet reachability remains unverified. A networkd-owned-uplink activation
+VM passed ordinary `switch-to-configuration test` through module-disabled, first
+enable, source change, last-agent removal, re-add and module-disable rollback. It
+observed networkd reloads without daemon restart and preserved unrelated-uplink,
+gateway-state and DHCP-state sentinels, printing
+`HERMES_VM_GENERATION_ROLLBACK_PASSED`. This is disposable-guest evidence, not
+physical-host deployment, bootloader or reboot proof.
+
+The focused security VM printed `HERMES_VM_SECURITY_ONLY_PASSED`; all instantiated
+Hermes unit `systemd-analyze verify/security` invocations completed, and actual
+per-role store, capability, seccomp, namespace, family and device probes passed.
+Exposure scores remain heuristic reports, not enforcement proof. Bounded
+verbatim logs, commands, exit statuses and store identities are attached to task
+`t_6010650d`. The offline full-matrix timeout, default-on dependency failure and
+unmet startup NFR remain open; no risk exception, owner acceptance, software
+acceptance or release authorization is inferred.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,

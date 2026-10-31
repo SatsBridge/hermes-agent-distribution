@@ -64,6 +64,13 @@
           })
         ];
       };
+      securityOnlyVm = hermesModuleVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_SECURITY_ONLY = lib.mkForce "1";
+          })
+        ];
+      };
       explicitDashboardProbe = hermesModuleVm.extendModules {
         modules = [
           {
@@ -84,7 +91,9 @@
       existingNetworkdProbe = hermesModuleVm.extendModules {
         modules = [ ({ lib, ... }: { networking.useNetworkd = lib.mkForce true; }) ];
       };
-      networkdRemovedVm = internetEnabledVm.extendModules {
+      # Keep the activation fixture's uplink networkd-owned; the Internet VM tests NM coexistence separately.
+      networkdActivationBaseVm = hermesModuleVm;
+      networkdRemovedVm = networkdActivationBaseVm.extendModules {
         modules = [
           ({ lib, ... }: {
             services.hermes-specialised-agent.agents.vm.enable = lib.mkForce false;
@@ -129,7 +138,10 @@
           })
         ];
       };
-      networkdChangedVm = internetEnabledVm.extendModules {
+      networkdDisabledVm = networkdIdleVm.extendModules {
+        modules = [ ({ lib, ... }: { services.hermes-specialised-agent.enable = lib.mkForce false; }) ];
+      };
+      networkdChangedVm = networkdActivationBaseVm.extendModules {
         modules = [
           ({ lib, ... }: {
             systemd = {
@@ -152,7 +164,7 @@
           })
         ];
       };
-      networkdActivationVm = internetEnabledVm.extendModules {
+      networkdActivationVm = networkdActivationBaseVm.extendModules {
         modules = [
           ({ lib, ... }: {
             systemd.services = {
@@ -164,8 +176,9 @@
               };
               hermes-vm-generation-rollback-launcher = {
                 wantedBy = [ "multi-user.target" ];
-                environment.HERMES_VM_PREVIOUS_SYSTEM = lib.mkForce networkdIdleVm.config.system.build.toplevel;
+                environment.HERMES_VM_PREVIOUS_SYSTEM = lib.mkForce networkdDisabledVm.config.system.build.toplevel;
                 environment.HERMES_VM_UPDATED_SYSTEM = lib.mkForce networkdChangedVm.config.system.build.toplevel;
+                environment.HERMES_VM_REMOVED_SYSTEM = lib.mkForce networkdIdleVm.config.system.build.toplevel;
               };
             };
           })
@@ -1920,9 +1933,9 @@
                 && (
                   (
                     networkdActivationVm.config.systemd.services.hermes-vm-generation-rollback-launcher.environment.HERMES_VM_PREVIOUS_SYSTEM
-                    == networkdIdleVm.config.system.build.toplevel
+                    == networkdDisabledVm.config.system.build.toplevel
                   )
-                  || builtins.trace "Hermes config assertion 303: launcher previous system path is pinned" false
+                  || builtins.trace "Hermes config assertion 303: launcher module-disabled previous system path is pinned" false
                 )
                 && (
                   (
@@ -1939,10 +1952,10 @@
                 )
                 && (
                   (
-                    !(builtins.hasAttr "hermes@vm" networkdIdleVm.config.systemd.services)
-                    && !(builtins.hasAttr "hermes-pf@vm" networkdIdleVm.config.systemd.services)
+                    !(builtins.hasAttr "hermes@vm" networkdDisabledVm.config.systemd.services)
+                    && !(builtins.hasAttr "hermes-pf@vm" networkdDisabledVm.config.systemd.services)
                   )
-                  || builtins.trace "Hermes config assertion 306: previous generation has both agents disabled" false
+                  || builtins.trace "Hermes config assertion 306: previous generation has module and agents disabled" false
                 )
                 && (
                   builtins.length (networkdConfigSetTriggers networkdReloadTriggers) == 1
@@ -1970,9 +1983,15 @@
                       networkdConfigSetTriggers (
                         disabledAgentProbe.config.systemd.services.systemd-networkd.reloadTriggers or [ ]
                       )
-                    ) == 0
+                    ) == 1
                   )
-                  || builtins.trace "Hermes config assertion 311: zero-agent configuration adds no membership reload trigger" false
+                  && disabledAgentProbe.config.networking.useNetworkd
+                  && disabledAgentProbe.config.systemd.network.enable
+                  &&
+                    builtins.head (
+                      networkdConfigSetTriggers disabledAgentProbe.config.systemd.services.systemd-networkd.reloadTriggers
+                    ) != builtins.head (networkdConfigSetTriggers networkdReloadTriggers)
+                  || builtins.trace "Hermes config assertion 311: module disable preserves a changed membership reload trigger for the supported networkd host" false
                 )
                 && (
                   networkdRemovedVm.config.systemd.network.enable
@@ -2004,6 +2023,13 @@
                   ) false
                 )
                 && (
+                  (
+                    networkdActivationVm.config.systemd.services.hermes-vm-generation-rollback-launcher.environment.HERMES_VM_REMOVED_SYSTEM
+                    == networkdIdleVm.config.system.build.toplevel
+                  )
+                  || builtins.trace "Hermes config assertion 314: launcher last-agent-removal system path is pinned" false
+                )
+                && (
                   defaultOnRuntimeVm.config.services.hermes-specialised-agent.installDefaultSkills
                   && defaultOnRuntimeVm.config.services.hermes-specialised-agent.agents.vm.headroomEnable
                   &&
@@ -2016,6 +2042,11 @@
                     defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_DEFAULT_ON_TEST
                     == "1"
                   || builtins.trace "Hermes config assertion 312: runtime default-on probe enables skills and Headroom" false
+                )
+                && (
+                  securityOnlyVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_SECURITY_ONLY
+                  == "1"
+                  || builtins.trace "Hermes config assertion 315: focused security probe enables instantiated-unit verification" false
                 )
               then
                 "true"
@@ -2136,6 +2167,7 @@
       nixosConfigurations.hermes-module-vm-explicit-dashboard = explicitDashboardProbe;
       nixosConfigurations.hermes-module-vm-internet = internetEnabledVm;
       nixosConfigurations.hermes-module-vm-default-on = defaultOnRuntimeVm;
+      nixosConfigurations.hermes-module-vm-security = securityOnlyVm;
       nixosConfigurations.hermes-module-vm-networkd-activation = networkdActivationVm;
       overlays.default =
         final: prev:
