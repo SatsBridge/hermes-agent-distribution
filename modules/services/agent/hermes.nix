@@ -733,6 +733,7 @@ let
       dhcpExecStart = pythonCommand ./hermes-runtime/dhcp.py {
         interface = agentNetwork.peerIf;
         dhcpcd = lib.getExe pkgs.dhcpcd;
+        state = "/var/lib/hermes-dhcp-${name}";
       };
 
       agentConfig = (pkgs.formats.yaml { }).generate "${agentStateId}-config.yaml" (
@@ -1355,11 +1356,18 @@ let
               ];
               BindReadOnlyPaths = [ "/dev/null:/etc/dhcpcd.exit-hook" ];
               CoredumpFilter = "0x00";
-              StateDirectory = [ "hermes-dhcp-%i:dhcpcd" ];
+              StateDirectory = [ "hermes-dhcp-%i" ];
               RuntimeDirectory = [
-                "hermes-dhcp-%i:dhcpcd"
                 "hermes-dhcp-%i/root"
+                "hermes-dhcp-%i/root/var/lib"
+                "hermes-dhcp-%i/dhcpcd"
               ];
+              BindPaths = [
+                "%t/hermes-dhcp-%i/dhcpcd:/run/dhcpcd"
+                "%t/hermes-dhcp-%i/dhcpcd:/var/run/dhcpcd"
+              ];
+              # This is /var/lib inside RootDirectory, not the host path.
+              ReadWritePaths = [ "+/var/lib" ];
               RestrictAddressFamilies = [
                 "AF_INET"
                 "AF_INET6"
@@ -1367,11 +1375,7 @@ let
                 "AF_PACKET"
                 "AF_UNIX"
               ];
-              TemporaryFileSystem = [
-                "/nix:ro"
-                # A private writable parent lets DynamicUser create the fixed-path compatibility link.
-                "/var/run:mode=1777"
-              ];
+              TemporaryFileSystem = [ "/nix:ro" ];
               TimeoutStartSec = "30s";
             };
           };

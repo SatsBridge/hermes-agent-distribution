@@ -83,15 +83,20 @@ try:
     expected, descriptor = initialize(settings, manager, verify_policy)
     while True:
         cycle_deadline = time.monotonic() + 2
-        jobs = []
         manager.deadline = cycle_deadline
         watched = (f"hermes@{name}.service", f"hermes-host-control@{name}.service", f"hermes-network@{name}.service", f"hermes-network-ready@{name}.service")
-        jobs = [job for job in manager.jobs() if job[1] in watched]
+        all_jobs = manager.jobs()
+        jobs = [job for job in all_jobs if job[1] in watched]
         restarts = {(job, unit) for job, unit, operation in jobs if operation == 'restart'}
         bootstrap_restarts = restarts if bootstrap_restarts is None else bootstrap_restarts & restarts
         for job, unit, operation in jobs:
             if operation == 'stop' or (operation == 'restart' and (job, unit) not in bootstrap_restarts):
-                print(f'{name}: stop transaction pending; authorization revoked', flush=True)
+                related = ','.join(
+                    f'{pending_operation}:{pending_unit}'
+                    for _, pending_unit, pending_operation in all_jobs
+                    if pending_unit in watched or pending_unit in ('nftables.service', 'systemd-networkd.service')
+                )
+                print(f'{name}: {operation} transaction job={job} unit={unit} related_jobs=[{related}]; authorization revoked', flush=True)
                 sys.exit(0)
         unit_names = [f"hermes-{role}@{name}.service" for role in roles]
         units = manager.snapshot(unit_names, f"hermes-netns@{name}.service", f"hermes-network-observer@{name}.service")

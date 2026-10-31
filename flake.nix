@@ -1351,32 +1351,37 @@
                 && (
                   (
                     units."hermes-dhcp@".serviceConfig.StateDirectory == [
-                      "hermes-dhcp-%i:dhcpcd"
+                      "hermes-dhcp-%i"
                     ]
                   )
-                  || builtins.trace "Hermes config assertion 187: units.\"hermes-dhcp@\".serviceConfig.StateDirectory == [ \"hermes-dhcp-%i:dhcpcd\" ]" false
+                  || builtins.trace "Hermes config assertion 187: units.\"hermes-dhcp@\".serviceConfig.StateDirectory == [ \"hermes-dhcp-%i\" ]" false
                 )
                 && (
                   (
                     units."hermes-dhcp@".serviceConfig.RuntimeDirectory == [
-                      "hermes-dhcp-%i:dhcpcd"
                       "hermes-dhcp-%i/root"
+                      "hermes-dhcp-%i/root/var/lib"
+                      "hermes-dhcp-%i/dhcpcd"
                     ]
                   )
-                  || builtins.trace "Hermes config assertion 188: units.\"hermes-dhcp@\".serviceConfig.RuntimeDirectory == [ \"hermes-dhcp-%i:dhcpcd\" \"hermes-dhcp-%i/root\" ]" false
+                  || builtins.trace "Hermes config assertion 188: DHCP managed runtime paths contain only its root, in-root state-link parent, and per-instance client runtime directory" false
                 )
                 && (
                   (
-                    units."hermes-dhcp@".serviceConfig.TemporaryFileSystem == [
-                      "/nix:ro"
-                      "/var/run:mode=1777"
+                    units."hermes-dhcp@".serviceConfig.BindPaths == [
+                      "%t/hermes-dhcp-%i/dhcpcd:/run/dhcpcd"
+                      "%t/hermes-dhcp-%i/dhcpcd:/var/run/dhcpcd"
                     ]
                   )
-                  || builtins.trace "Hermes config assertion 189: units.\"hermes-dhcp@\".serviceConfig.TemporaryFileSystem == [ \"/nix:ro\" \"/var/run:mode=1777\" ]" false
+                  || builtins.trace "Hermes config assertion 189: DHCP bind mounts expose only per-instance runtime client paths" false
                 )
                 && (
-                  (!(units."hermes-dhcp@".serviceConfig ? ReadWritePaths))
-                  || builtins.trace "Hermes config assertion 190: !(units.\"hermes-dhcp@\".serviceConfig ? ReadWritePaths)" false
+                  units."hermes-dhcp@".serviceConfig.TemporaryFileSystem == [ "/nix:ro" ]
+                  || builtins.trace "Hermes config assertion 316: DHCP has no broad writable temporary filesystem exception" false
+                )
+                && (
+                  units."hermes-dhcp@".serviceConfig.ReadWritePaths == [ "+/var/lib" ]
+                  || builtins.trace "Hermes config assertion 190: DHCP can write only the in-root state-symlink directory, not host /var" false
                 )
                 && (
                   units."hermes-dhcp@".serviceConfig.PrivateNetwork

@@ -388,9 +388,15 @@ main activation, the first real dashboard-process log, and
 `HERMES_DASHBOARD_READY`. Restart timing starts immediately before
 `systemctl restart hermes@vm.service`. It reports whether first-log latency met
 the 10-second target or 15-second maximum, but timing is informational and does
-not fail the broader smoke. Recent restricted-guest runs measured 69.835s from
-the network-start boundary to the first real dashboard log and 85.091s to
-`HERMES_DASHBOARD_READY`; the 15-second maximum remains unmet and unwaived.
+not fail the broader smoke. The latest focused security-mode guest measured
+70.496s from the network-start boundary to the first real dashboard log and
+87.409s to `HERMES_DASHBOARD_READY`. The Internet-recovery guest measured
+69.526s to its first log and 84.783s to READY. The 15-second maximum remains
+unmet. The owner directed
+that startup time remain as-is, with security prioritized and no further
+optimization requested (task comment 124). This is an accepted operational
+tradeoff, not evidence that the timing target was met. The security and Internet
+fixtures are focused runs, not a full offline-matrix pass.
 `HERMES_DASHBOARD_READY` and the independent loopback packaged-UI HTTP check
 remain required. No startup optimization was accepted: the proposed materialized
 closure view's storage cost cannot rely on reflinks or deduplication. It also

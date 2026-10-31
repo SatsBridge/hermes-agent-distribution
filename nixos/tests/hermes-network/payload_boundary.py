@@ -43,6 +43,25 @@ store_mounts = [fields for fields in mounts if "/nix/store/" in fields[4]]
 assert nix_root is not None and "ro" in nix_root[5].split(","), (role, nix_root)
 assert store_mounts and all("ro" in fields[5].split(",") for fields in store_mounts), (role, store_mounts)
 assert pathlib.Path(sys.executable).is_file() and os.access(sys.executable, os.R_OK | os.X_OK), role
+if role == "dhcp":
+    run_path = pathlib.Path("/run/dhcpcd")
+    var_run_path = pathlib.Path("/var/run/dhcpcd")
+    state_path = pathlib.Path("/var/lib/dhcpcd")
+    assert run_path.is_dir() and var_run_path.is_dir() and state_path.is_dir(), role
+    assert state_path.is_symlink(), state_path
+    assert os.access(run_path, os.R_OK | os.W_OK | os.X_OK), run_path
+    assert os.access(var_run_path, os.R_OK | os.W_OK | os.X_OK), var_run_path
+    state_target = state_path.resolve()
+    state_stat = state_target.stat()
+    state_mount = [line.split() for line in pathlib.Path("/proc/self/mountinfo").read_text().splitlines()
+        if line.split()[4] == str(state_target)]
+    assert os.access(state_path, os.R_OK | os.W_OK | os.X_OK), (
+        role, os.geteuid(), os.getegid(), state_target, state_stat, state_mount
+    )
+    assert state_target.parent == pathlib.Path("/var/lib") and state_target.name.startswith("hermes-dhcp-"), state_target
+    assert (run_path.stat().st_dev, run_path.stat().st_ino) == (
+        var_run_path.stat().st_dev, var_run_path.stat().st_ino
+    ), (run_path, var_run_path)
 for store_root in ("/nix/store", "/nix/.ro-store"):
     assert not (pathlib.Path(store_root) / sentinel_name).exists(), (role, store_root)
 for alias in ("/run/current-system", "/run/booted-system", "/run/wrappers", "/etc/static", "/etc/profiles",

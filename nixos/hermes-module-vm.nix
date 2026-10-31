@@ -405,9 +405,7 @@ let
     '';
   };
   vmStoreSentinel = pkgs.writeText "hermes-vm-unrelated-store-sentinel" "Hermes VM unrelated store sentinel\n";
-  vmStoreSentinelName = builtins.unsafeDiscardStringContext (
-    builtins.baseNameOf (toString vmStoreSentinel)
-  );
+  vmStoreSentinelName = builtins.unsafeDiscardStringContext (baseNameOf (toString vmStoreSentinel));
   vmAgentRuntimeSmoke = pkgs.writeShellApplication {
     name = "hermes-module-vm-agent-smoke";
     runtimeInputs = [
@@ -790,10 +788,19 @@ let
             config=$(<"$found/config.yaml")
             [[ "$config" == *agent_profile_name* && "$config" == *"$7"* ]]
             echo "Read peer profile from service namespace: $expected"
+            peer_env="$found/.env"
+            [[ -f "$peer_env" ]] || { echo "Peer profile .env denial fixture is missing" >&2; exit 1; }
+            if ( exec 3<"$peer_env" ) 2>/dev/null; then
+              echo "Peer profile .env was readable; contents were not read" >&2
+              exit 1
+            fi
+            [[ ! -r "$peer_env" ]] || { echo "Peer profile .env remains readable as the service identity" >&2; exit 1; }
+            echo "PEER_ENV_OPEN_DENIED content_not_read"
           ' -- "$agent" "$peer_id" "$unit" "$uid" "$gid" "$groups" "$peer_display"
       }
 
       check_profiles_in_service_namespaces() {
+        local check_network_probes="''${1:-1}"
         local vm_pid peer_pid vm_netns peer_netns
         local vm_netns_fd peer_netns_fd
         vm_pid=$(service_pid hermes@vm.service)
@@ -818,13 +825,15 @@ let
         timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
         if ! wait_for_active; then diagnose; return 1; fi
         assert_distinct_namespaces || return 1
-        start_peer_probes hermes@vm.service "''${agent_vm_ip}" "''${agent_vm_ip6}" || return 1
-        start_peer_probes hermes@vm-peer.service "''${peer_agent_ip}" "''${peer_agent_ip6}" || return 1
-        check_agent_network hermes@vm.service hb0 "''${host_vm_ip}" "''${agent_vm_ip}" "''${peer_agent_ip}" "''${host_vm_ip6}" "''${agent_vm_ip6}" "''${peer_agent_ip6}" || return 1
-        check_agent_network hermes@vm-peer.service hb1 "''${host_peer_ip}" "''${peer_agent_ip}" "''${agent_vm_ip}" "''${host_peer_ip6}" "''${peer_agent_ip6}" "''${agent_vm_ip6}" || return 1
-        check_dashboard_mapping || return 1
-        check_public_state_network hermes-pf@vm.service || return 1
-        check_public_state_network hermes-pf@vm-peer.service || return 1
+        if [[ "$check_network_probes" == 1 ]]; then
+          start_peer_probes hermes@vm.service "''${agent_vm_ip}" "''${agent_vm_ip6}" || return 1
+          start_peer_probes hermes@vm-peer.service "''${peer_agent_ip}" "''${peer_agent_ip6}" || return 1
+          check_agent_network hermes@vm.service hb0 "''${host_vm_ip}" "''${agent_vm_ip}" "''${peer_agent_ip}" "''${host_vm_ip6}" "''${agent_vm_ip6}" "''${peer_agent_ip6}" || return 1
+          check_agent_network hermes@vm-peer.service hb1 "''${host_peer_ip}" "''${peer_agent_ip}" "''${agent_vm_ip}" "''${host_peer_ip6}" "''${peer_agent_ip6}" "''${agent_vm_ip6}" || return 1
+          check_dashboard_mapping || return 1
+          check_public_state_network hermes-pf@vm.service || return 1
+          check_public_state_network hermes-pf@vm-peer.service || return 1
+        fi
         check_profile vm hermes-vm-peer "hermes-vm-peer" || return 1
         check_profile vm-peer hermes-vm "hermes-vm" || return 1
       }
@@ -1151,16 +1160,18 @@ let
           pid=$(service_pid "$unit") || return 1
           instance="''${unit#hermes-dhcp@}"
           instance="''${instance%.service}"
-          runtime="/run/hermes-dhcp-$instance"
+          runtime="/run/hermes-dhcp-$instance/dhcpcd"
           state="/var/lib/hermes-dhcp-$instance"
-          [[ $(readlink "/proc/$pid/root/var/run/dhcpcd") == /run/dhcpcd \
-            && -L "/proc/$pid/root/var/lib/dhcpcd" ]] || return 1
+          [[ -d "/proc/$pid/root/var/run/dhcpcd" && -L "/proc/$pid/root/var/lib/dhcpcd" ]] || {
+            echo "$unit does not expose its per-instance DHCP runtime and state paths" >&2
+            return 1
+          }
           uid=$(awk '/^Uid:/ {print $3}' "/proc/$pid/status")
           gid=$(awk '/^Gid:/ {print $3}' "/proc/$pid/status")
           # This checks path access as the client identity, not its cgroup/seccomp enforcement.
           nsenter --target "$pid" --mount --root --wd --setuid "$uid" --setgid "$gid" -- \
             "${lib.getExe pkgs.python3}" -c 'import os,sys; assert os.path.samefile("/var/run/dhcpcd",sys.argv[1]); assert os.path.samefile("/var/lib/dhcpcd",sys.argv[2]); assert os.access("/run/dhcpcd",os.W_OK) and os.access("/var/lib/dhcpcd",os.W_OK)' \
-            "$runtime" "$state" || return 1
+            "$runtime" "$state" || { echo "$unit fixed runtime/state path check failed as UID $uid" >&2; return 1; }
           echo "$unit fixed runtime/state paths resolve to writable manager-owned directories as UID $uid"
         done
       }
@@ -1792,6 +1803,7 @@ let
       }
 
       check_dhcp_renewal() {
+        local check_network_probes="''${1:-1}"
         local main_gateway peer_gateway main_dhcp peer_dhcp old_main4 old_main6 old_peer4 old_peer6
         trigger_dhcp_rebind() {
           local host_if="$1" client_pid="$2" client_if="$3" capture_file="$4" expected_ip="$5" unit="$6" capture_pid started_at lease_log
@@ -1854,10 +1866,12 @@ let
             echo "Gateway restarted during same-lease DHCP renewal" >&2
             return 1
           }
-        check_agent_network hermes@vm.service hb0 "$host_vm_ip" "$agent_vm_ip" "$peer_agent_ip" \
-          "$host_vm_ip6" "$agent_vm_ip6" "$peer_agent_ip6" || return 1
-        check_agent_network hermes@vm-peer.service hb1 "$host_peer_ip" "$peer_agent_ip" "$agent_vm_ip" \
-          "$host_peer_ip6" "$peer_agent_ip6" "$agent_vm_ip6" || return 1
+        if [[ "$check_network_probes" == 1 ]]; then
+          check_agent_network hermes@vm.service hb0 "$host_vm_ip" "$agent_vm_ip" "$peer_agent_ip" \
+            "$host_vm_ip6" "$agent_vm_ip6" "$peer_agent_ip6" || return 1
+          check_agent_network hermes@vm-peer.service hb1 "$host_peer_ip" "$peer_agent_ip" "$agent_vm_ip" \
+            "$host_peer_ip6" "$peer_agent_ip6" "$agent_vm_ip6" || return 1
+        fi
         echo "Both DHCP ACKs were applied by their clients; allocations, routes, firewall and gateway processes remained coherent"
       }
 
@@ -2766,6 +2780,8 @@ let
         exit 0
       fi
       if [[ "''${HERMES_VM_SECURITY_ONLY:-0}" == 1 ]]; then
+        check_profiles_in_service_namespaces 0 || { diagnose; exit 1; }
+        check_dhcp_renewal 0 || { diagnose; exit 1; }
         stop_peer_probes
         timeout --kill-after=5s 180 systemctl stop "''${units[@]}" || { diagnose; exit 1; }
         cleanup_test_network

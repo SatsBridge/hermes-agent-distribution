@@ -211,20 +211,25 @@ files at /var/lib/dhcpcd; no CLI runtime/state override exists. Owner authorized
 persistent per-instance client StateDirectory, superseding the initial
 volatile-client-state requirement. Server PersistLeases=runtime is unchanged.
 
-Keep the independently exercised two-entry RuntimeDirectory:
-`hermes-dhcp-%i:dhcpcd`, `hermes-dhcp-%i/root`, and native StateDirectory alias
-`hermes-dhcp-%i:dhcpcd`. One static link in the existing ExecStart wrapper maps
-/var/run/dhcpcd to /run/dhcpcd inside a private /var/run:mode=1777 tmpfs. No
-extra RuntimeDirectory children, mkdir/chown/root initializer, explicit DHCP
-BindPaths or ReadWritePaths. A pre-start-created tmpfs link would disappear in
-the next command's mount namespace. Host /var/run layout is not inherited.
-
-Prior real guest removal matrix: no ReadWritePaths passed both-instance renew/
-stop/start/runtime cleanup/state-sentinel checks; no tmpfs failed ENOENT; mode
-0755 tmpfs failed EACCES. Native absolute alias assignments are invalid (both
-source/destination must be relative); nested runtime relative aliases crossing
-chroot resolve wrongly. These historical failures do not justify making / rw.
-Do not rewrite the proven layout or remove persistent state during rollback.
+RuntimeDirectory aliases create host-level links to their source directory;
+they do not create the fixed `/run/dhcpcd` and `/var/lib/dhcpcd` paths inside
+each distinct RootDirectory. The final implementation therefore uses distinct
+per-instance `hermes-dhcp-%i/dhcpcd` runtime storage and a persistent
+`StateDirectory=hermes-dhcp-%i`. `/run/dhcpcd` and `/var/run/dhcpcd` expose the
+same per-instance volatile directory; `/var/lib/dhcpcd` is a symlink to that
+instance's automatically mounted persistent state. `StateDirectory` remains
+automatically idmapped for the DynamicUser. The existing ExecStart helper
+creates `/var/lib/dhcpcd` as a symlink to that per-instance in-root directory
+before exec. `/var/lib` is a
+private directory under this service's managed RootDirectory runtime tree, not
+the host's `/var/lib`; `ReadWritePaths=+/var/lib` makes only that in-root
+directory writable so the DynamicUser can create the link. This avoids an
+additional BindPaths that would lose the
+manager's DynamicUser ownership mapping. No host `/run` or `/var` is exposed.
+The actual
+client start, renewal, restart, path identity and state-sentinel checks on the
+final candidate are required before treating this boundary as proven; earlier
+results from the alias or non-idmapped bind layouts do not transfer.
 
 ## Hardening inventory
 
@@ -325,50 +330,52 @@ systemd 261 systemd.exec and systemd.resource-control; systemd v261
 load-fragment/verbs/bus-util/sd_booted sources; pinned Nixpkgs networkd module;
 iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 
-Current source passes `hermes-module-vm-config-check` and strict `nixfmt`
-formatting. The test-only payload boundary probe checks the exact unrelated-store
-sentinel by basename instead of scanning the 9p store. Cleanup resets state to
-empty strings so its explicit invocation and EXIT trap are idempotent under
-`set -u`.
+Current checks on this worktree: `hermes-module-vm-config-check`, the Nix
+formatting check, Python syntax and `git diff --check` pass.
 
-Runtime evidence is mixed and is not software acceptance. The restricted offline
-VM `/nix/store/mlz5y116lqpiapx4xrn8v3kbv8y2fy3y-nixos-vm` passed both agents'
-host-only DNS positive/blocked-negative probes, IPv6 default-route startup
-blocking (349 ms) and live-loss revocation (1,537 ms, IPv4 preserved), networkd
-recovery, and all seven split-producer-loss revocations (1.347–4.198 s). It did
-NOT reach `Hermes VM runtime checks passed`: the smoke hit its 5,400 s
-`TimeoutStartSec` while still in the integrated network/security matrix. Systemd
-powered the guest off; the QEMU runner returned 0, but `/nix/store` unmount failed
-and the full-smoke result is failure, not pass. The later cleanup/security-mode
-changes were exercised separately, not by a complete rerun of that offline
-matrix.
+Focused security guest `/nix/store/yn1ys9c8l4in99yv9nick6rzx1rkd1cc-nixos-vm`
+used system closure `/nix/store/5a33505y4bgck076nhz2v1kidk2cv98j-nixos-system-nixos-26.11.20261014.55bfb4d`.
+It printed `HERMES_VM_SECURITY_ONLY_PASSED` after instantiated-unit
+`systemd-analyze verify/security`, per-role store/capability/seccomp/namespace/
+family/device probes, both clients' DHCP ACK/rebind, and checks that their fixed
+runtime/state paths are writable as their DynamicUser identities. The service-
+identity profile checks succeeded for both agents and printed
+`PEER_ENV_OPEN_DENIED content_not_read` for each; the probe opened no bytes.
+First dashboard log was 70.496 s after the network-start boundary and READY was
+87.409 s.
 
-The offline cold-start measure was 69.835 s from host-veth start to first
-dashboard log and 85.091 s to `HERMES_DASHBOARD_READY`, against the unchanged
-15 s maximum. This startup NFR is unmet and unwaived. The default-on Headroom/skills
-VM installed skills and ran Headroom, but the peer gateway start job failed on a
-dependency; the smoke timed out waiting for both agents, so default-on success is
-not established.
+Focused Internet guest `/nix/store/7sskzspp8nb15ljgj8zxn8d920nrd2sw-nixos-vm`
+used system closure `/nix/store/z71h734j4ny00wrz8riqghbr57xijkxq-nixos-system-nixos-26.11.20261014.55bfb4d`.
+It printed `Hermes focused Internet recovery checks passed`: both agents passed
+the exact single-host-resolver positive/blocked-negative check, public DNS,
+TCP/443, certificate-verified HTTPS HTTP 200, and repeats after nftables and
+networkd recovery. Public IPv6 remains untested. The run measured 69.526 s to the
+first dashboard log and 84.783 s to READY.
 
-The focused Internet-recovery VM with `networking.useNetworkd=true` and
-NetworkManager active passed public DNS and certificate-verified HTTPS HTTP 200
-for both service identities before and after nftables/networkd recovery. Public
-IPv6 Internet reachability remains unverified. A networkd-owned-uplink activation
-VM passed ordinary `switch-to-configuration test` through module-disabled, first
-enable, source change, last-agent removal, re-add and module-disable rollback. It
-observed networkd reloads without daemon restart and preserved unrelated-uplink,
-gateway-state and DHCP-state sentinels, printing
-`HERMES_VM_GENERATION_ROLLBACK_PASSED`. This is disposable-guest evidence, not
-physical-host deployment, bootloader or reboot proof.
+The networkd activation guest `/nix/store/rxyfd3hcbzmlk53xmqnz0vy50220p9v2-nixos-vm`
+used system closure `/nix/store/aahp60k5vah9jlkfn2syy80wfqm01y7m-nixos-system-nixos-26.11.20261014.55bfb4d`.
+It printed `HERMES_VM_GENERATION_ROLLBACK_PASSED` for module-disabled -> added ->
+changed -> last-agent-removal -> re-added -> module-disable rollback, preserving
+the uplink, gateway and DHCP state sentinels.
 
-The focused security VM printed `HERMES_VM_SECURITY_ONLY_PASSED`; all instantiated
-Hermes unit `systemd-analyze verify/security` invocations completed, and actual
-per-role store, capability, seccomp, namespace, family and device probes passed.
-Exposure scores remain heuristic reports, not enforcement proof. Bounded
-verbatim logs, commands, exit statuses and store identities are attached to task
-`t_6010650d`. The offline full-matrix timeout, default-on dependency failure and
-unmet startup NFR remain open; no risk exception, owner acceptance, software
-acceptance or release authorization is inferred.
+All three focused guests reached their success marker, then reported
+`[FAILED] Failed unmounting /nix/store`; the host-side runner was terminated
+(exit 143) after the guest marker. This is not clean guest teardown. The full
+offline integration run, the complete failure/lifecycle matrix and default-on
+Headroom/skills are not established on this candidate. In the latest completed
+default-on reproduction, the peer gateway remained inactive and its start job
+failed with `dependency`; the main host controller logged a restart transaction
+for itself, then the observer exited when its configuration file disappeared.
+The log does not identify what requested that restart. The owner explicitly
+prohibits peer `.env` access; the observed denial is expected and no ACL widening
+is proposed. A later run using the additional related-job diagnostic did not
+progress past guest login, so it is inconclusive.
+
+The 15 s startup maximum remains unmet. The owner directed startup time to remain
+as-is, prioritizing security and requesting no further optimization (task comment
+124). This is an accepted operational tradeoff, not evidence that the timing
+target was met. No software acceptance, release authorization or claim of a full
+offline/default-on pass is inferred.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,
