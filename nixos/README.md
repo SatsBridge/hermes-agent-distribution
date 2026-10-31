@@ -331,14 +331,16 @@ records. The test guest and host
 must have outbound DNS and HTTPS access to that resolver and `example.com`.
 It does not change the Hermes module's firewall or per-agent permissions. The
 runtime smoke requires guest host-namespace DNS and certificate-verified HTTPS
-positive controls, then verifies the generated per-agent resolver, public DNS,
-TCP/443, certificate-verified HTTPS 200 and expected page content as each service
-identity with zero effective capabilities. It repeats the public checks after the
-main agent/network restart. External DNS, route, endpoint, or CA failures fail the
-test and print guest routes, resolver configuration and nftables diagnostics;
-there is no skip or local endpoint substitute. Public IPv6 reachability is not
-tested. Use the standard restricted VM for offline runs without external
-connectivity or model credentials.
+positive controls. For each service identity, it checks the complete resolver
+nameserver list, a single-host-resolver A/AAAA lookup through the normal resolver
+path, and failure when that host DNS server is blocked; it repeats these probes
+after networkd restart. It also verifies public DNS, TCP/443, and
+certificate-verified HTTPS 200 with expected content and zero effective
+capabilities, including after recovery. External DNS, route, endpoint, or CA
+failures fail the test and print guest routes, resolver configuration and
+nftables diagnostics; there is no skip or local endpoint substitute. Public IPv6
+reachability is not tested. Use the standard restricted VM for offline runs
+without external connectivity or model credentials.
 
 To exercise a main-agent dashboard configured through an explicit loopback
 mapping (`127.0.0.1:18199 -> agent loopback:9119`), build the companion variant:
