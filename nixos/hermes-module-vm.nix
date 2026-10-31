@@ -2627,6 +2627,7 @@ let
         start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
         start_peer_probes hermes@vm-peer.service "$peer_agent_ip" "$peer_agent_ip6" || return 1
         check_agent_network hermes@vm.service hb0 "$host_vm_ip" "$agent_vm_ip" "$peer_agent_ip" "$host_vm_ip6" "$agent_vm_ip6" "$peer_agent_ip6" || return 1
+        check_agent_network hermes@vm-peer.service hb1 "$host_peer_ip" "$peer_agent_ip" "$agent_vm_ip" "$host_peer_ip6" "$peer_agent_ip6" "$agent_vm_ip6" || return 1
         echo "networkd restart rebuilt DHCP/SLAAC, firewall and DNS in fresh namespaces with stable DHCP client identity ($new_mac)"
       }
 

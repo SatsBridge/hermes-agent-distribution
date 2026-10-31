@@ -344,13 +344,13 @@ identity profile checks succeeded for both agents and printed
 First dashboard log was 70.496 s after the network-start boundary and READY was
 87.409 s.
 
-Focused Internet guest `/nix/store/7sskzspp8nb15ljgj8zxn8d920nrd2sw-nixos-vm`
-used system closure `/nix/store/z71h734j4ny00wrz8riqghbr57xijkxq-nixos-system-nixos-26.11.20261014.55bfb4d`.
+Focused Internet guest `/nix/store/fvfrh8ir3nqw7nhcxbsaxx1r1d4219r8-nixos-vm`
+used system closure `/nix/store/5wv5bkkbbwa1yn0q82r76381pfavpjsd-nixos-system-nixos-26.11.20261014.55bfb4d`.
 It printed `Hermes focused Internet recovery checks passed`: both agents passed
-the exact single-host-resolver positive/blocked-negative check, public DNS,
-TCP/443, certificate-verified HTTPS HTTP 200, and repeats after nftables and
-networkd recovery. Public IPv6 remains untested. The run measured 69.526 s to the
-first dashboard log and 84.783 s to READY.
+the exact single-host-resolver positive/blocked-negative check, including after
+networkd restart, public DNS, TCP/443, and certificate-verified HTTPS HTTP 200
+before and after nftables/networkd recovery. Public IPv6 remains untested. The
+run measured 69.526 s to the first dashboard log and 84.783 s to READY.
 
 The networkd activation guest `/nix/store/rxyfd3hcbzmlk53xmqnz0vy50220p9v2-nixos-vm`
 used system closure `/nix/store/aahp60k5vah9jlkfn2syy80wfqm01y7m-nixos-system-nixos-26.11.20261014.55bfb4d`.
