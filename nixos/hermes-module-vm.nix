@@ -860,7 +860,7 @@ let
         for child in "''${children[@]}"; do
           [[ -r "/proc/$child/cmdline" ]] || continue
           cmdline=$(tr '\0' ' ' <"/proc/$child/cmdline")
-          if [[ "$cmdline" == *"headroom proxy --port 18080"* ]]; then headroom_pid="$child"; break; fi
+          if [[ "$cmdline" == *"headroom-wrapped proxy --port 18080"* ]]; then headroom_pid="$child"; break; fi
         done
         [[ -n "$headroom_pid" ]] || { echo "Default-on Headroom proxy child is not running" >&2; return 1; }
         cap=$(awk '/^CapEff:/ { print $2; exit }' "/proc/$headroom_pid/status")
@@ -2781,7 +2781,12 @@ let
         exit 0
       fi
       if [[ "''${HERMES_VM_SECURITY_ONLY:-0}" == 1 ]]; then
-        check_profiles_in_service_namespaces 0 || { diagnose; exit 1; }
+        if [[ "''${HERMES_VM_PROFILE_IDENTITY_ONLY:-0}" == 1 ]]; then
+          check_profile vm hermes-vm-peer "hermes-vm-peer" || { diagnose; exit 1; }
+          check_profile vm-peer hermes-vm "hermes-vm" || { diagnose; exit 1; }
+        else
+          check_profiles_in_service_namespaces 0 || { diagnose; exit 1; }
+        fi
         check_dhcp_renewal 0 || { diagnose; exit 1; }
         stop_peer_probes
         timeout --kill-after=5s 180 systemctl stop "''${units[@]}" || { diagnose; exit 1; }
@@ -3200,6 +3205,7 @@ in
       pkgs.util-linux
     ];
     serviceConfig = {
+      ExecStartPre = "${pkgs.coreutils}/bin/readlink -f /run/current-system";
       Type = "oneshot";
       StandardOutput = "tty";
       StandardError = "tty";
@@ -3261,6 +3267,7 @@ in
     };
     serviceConfig = {
       ExecStart = lib.getExe vmAgentRuntimeSmoke;
+      ExecStartPre = "${pkgs.coreutils}/bin/readlink -f /run/current-system";
       StandardError = "journal+console";
       StandardOutput = "journal+console";
       # The complete 2-GiB fault and lifecycle matrix can exceed one hour; production limits are unchanged.

@@ -108,6 +108,8 @@ elif role in ("host-control", "network-ready", "host-proxy", "agent-relay"):
     assert len(observation_directories) == 1, (role, observation_directories)
     directory = observation_directories[0]
     assert directory.is_dir()
+    if role == "host-control":
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o755, directory.stat()
     mounts = [line.split() for line in pathlib.Path("/proc/self/mountinfo").read_text().splitlines()]
     mount = next((fields for fields in mounts if fields[4].endswith(str(directory))), None)
     assert mount is not None and "ro" in mount[5].split(","), (role, directory, mount)

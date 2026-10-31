@@ -330,52 +330,66 @@ systemd 261 systemd.exec and systemd.resource-control; systemd v261
 load-fragment/verbs/bus-util/sd_booted sources; pinned Nixpkgs networkd module;
 iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 
-Current checks on this worktree: `hermes-module-vm-config-check`, the Nix
-formatting check, Python syntax and `git diff --check` pass.
+`hermes-module-vm-config-check` passed after adding the gateway start bound and
+its assertion. Nix formatting, Python parsing and `git diff --check` still need
+to be recorded on the final committed candidate.
 
-Focused security guest `/nix/store/87qwspm9zn5nqbgrv040b9ryljkp77ki-nixos-vm`
-used system closure `/nix/store/vxrh9nqimmydp176ygalc2niwyrj8kz8-nixos-system-nixos-26.11.20261014.55bfb4d`.
-It printed `HERMES_VM_SECURITY_ONLY_PASSED` after instantiated-unit
-`systemd-analyze verify/security`, per-role store/capability/seccomp/namespace/
-family/device probes, both clients' DHCP ACK/rebind, and checks that their fixed
-runtime/state paths are writable as their DynamicUser identities. The service-
-identity profile checks succeeded for both agents and printed
-`PEER_ENV_OPEN_DENIED content_not_read` for each; the probe opened no bytes.
-First dashboard log was 65.527 s after the network-start boundary and READY was
-79.661 s.
+The earlier evidence attachments 19/24/25 are historical only and are not
+accepted as candidate identity evidence: their recorded system closure hashes
+conflict with the `init=` paths in the immutable launchers. The launchers used
+`/nix/store/vv8g35yrqsk933ga7y2ldzjk1whhjzn7-nixos-system-nixos-26.11.20261014.55bfb4d`,
+`/nix/store/if6zd9wmh6zl9h7ii9gm4bib8va6qqk2-nixos-system-nixos-26.11.20261014.55bfb4d`,
+and `/nix/store/1sywn75lix5c0fm6f6c1lhfndm2j60rg-nixos-system-nixos-26.11.20261014.55bfb4d`
+for the security, Internet, and activation launchers, respectively. Those
+launch records do not establish the guest's `/run/current-system`; without that
+readback, those runs cannot support final-candidate claims. The current VM
+fixtures now print `/run/current-system` before their checks.
 
-Focused Internet guest `/nix/store/fvfrh8ir3nqw7nhcxbsaxx1r1d4219r8-nixos-vm`
-used system closure `/nix/store/5wv5bkkbbwa1yn0q82r76381pfavpjsd-nixos-system-nixos-26.11.20261014.55bfb4d`.
-It printed `Hermes focused Internet recovery checks passed`: both agents passed
-the exact single-host-resolver positive/blocked-negative check, including after
-networkd restart, public DNS, TCP/443, and certificate-verified HTTPS HTTP 200
-before and after nftables/networkd recovery. Public IPv6 remains untested. The
-run measured 66.648 s to the first dashboard log and 81.686 s to READY.
+Default-on diagnostic evidence explains the earlier `hermes@vm-peer.service`
+dependency failure. The pinned package ships all five requested official skills
+locally. In a real guest service identity, `hermes skills install -y` fetched
+those `official/` bundles from the bundled tree, ran the local security scan,
+and installed them; no network/DNS fetch was involved. Cold invocations took
+about 14–23 seconds each, and a cold gateway became active about 157 seconds
+after its service start. The prior 90-second manager default timed out the main
+gateway during its fifth install; systemd then rejected the peer start with
+`dependency`. The owner permitted a bounded service/test budget increase after
+diagnosing normal initialization rather than a broken DNS/dependency. The
+gateway template now explicitly uses `TimeoutStartSec=180s`; this does not alter
+the fail-closed record freshness or two-second controller validation budget.
 
-The networkd activation guest `/nix/store/rxyfd3hcbzmlk53xmqnz0vy50220p9v2-nixos-vm`
-used system closure `/nix/store/aahp60k5vah9jlkfn2syy80wfqm01y7m-nixos-system-nixos-26.11.20261014.55bfb4d`.
-It printed `HERMES_VM_GENERATION_ROLLBACK_PASSED` for module-disabled -> added ->
-changed -> last-agent-removal -> re-added -> module-disable rollback, preserving
-the uplink, gateway and DHCP state sentinels.
+The corrected default-on probe reported `DEFAULT_ON_FEATURES_PASSED` and
+`HERMES_VM_SECURITY_ONLY_PASSED`: both agents had all five skills, the Headroom
+child was present with `CapEff=0`, and peer profile/ACL checks denied opening
+`.env` without reading contents. A previous false negative searched for
+`headroom proxy`, while the actual Nix executable is `.headroom-wrapped`; the
+probe now matches that observed command line. Guest shutdown still reported
+`[FAILED] Failed unmounting /nix/store`, so bounded teardown is not proven.
 
-All three focused guests reached their success marker, then reported
-`[FAILED] Failed unmounting /nix/store`; the host-side runner was terminated
-(exit 143) after the guest marker. This is not clean guest teardown. The full
-offline integration run, the complete failure/lifecycle matrix and default-on
-Headroom/skills are not established on this candidate. In the latest completed
-default-on reproduction, the peer gateway remained inactive and its start job
-failed with `dependency`; the main host controller logged a restart transaction
-for itself, then the observer exited when its configuration file disappeared.
-The log does not identify what requested that restart. The owner explicitly
-prohibits peer `.env` access; the observed denial is expected and no ACL widening
-is proposed. A later run using the additional related-job diagnostic did not
-progress past guest login, so it is inconclusive.
+The full offline/failure/lifecycle matrix was run with Headroom disabled,
+preserving the strict 2-second host-control validation cycle. It reached DAD,
+route-loss, firewall-loss/reload, DHCP rebind, peer denial, host-only resolver,
+and repeated cleanup/recovery checkpoints, but the outer 3600-second QEMU
+wrapper expired before `Hermes VM runtime checks passed`; shutdown also reported
+`[FAILED] Failed unmounting /nix/store`. This run is partial, not a pass.
 
-The 15 s startup maximum remains unmet. The owner directed startup time to remain
-as-is, prioritizing security and requesting no further optimization (task comment
-124). This is an accepted operational tradeoff, not evidence that the timing
-target was met. No software acceptance, release authorization or claim of a full
-offline/default-on pass is inferred.
+A combined default-on/full-network run under the approved 2-GiB guest exposed
+`network validation cycle exceeded its budget` while Headroom/code-graph work
+was active; the controller correctly revoked authorization. No tolerance was
+added and no freshness or revocation rule was weakened. The default-on security
+probe therefore checks skills, Headroom, peer profile/ACL, DHCP and instantiated
+security separately from the full offline network-loss matrix. This is test
+partitioning, not evidence that the controller's under-load timing risk is
+resolved. Whether that combined under-load availability behavior needs a
+different owner-approved budget remains an open review question.
+
+The 15-second startup maximum remains unmet. The owner directed startup time to
+remain as-is, prioritizing security and requesting no further optimization
+(task comment 124). The 180-second service bound is a conditional operational
+allowance, not a waiver or a pass for that NFR. Full offline matrix, Internet
+DNS/TLS, networkd activation attribution/rollback, and clean teardown remain
+open until final-candidate evidence is attached. No software acceptance, risk
+exception or release authorization is inferred.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,

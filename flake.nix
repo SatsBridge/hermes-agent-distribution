@@ -61,6 +61,11 @@
 
             systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_DEFAULT_ON_TEST =
               lib.mkForce "1";
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_SECURITY_ONLY = lib.mkForce "1";
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_PROFILE_IDENTITY_ONLY =
+              lib.mkForce "1";
+            systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY =
+              lib.mkOverride 40 "0";
           })
         ];
       };
@@ -1498,6 +1503,10 @@
                   || builtins.trace "Hermes config assertion 212: units.\"hermes-network-ready@\".serviceConfig.TimeoutStartSec == \"60s\"" false
                 )
                 && (
+                  (units."hermes@".serviceConfig.TimeoutStartSec == "180s")
+                  || builtins.trace "Hermes config assertion 318: units.\"hermes@\".serviceConfig.TimeoutStartSec == \"180s\"" false
+                )
+                && (
                   (builtins.elem "hermes-network-ready@%i.service" units."hermes@".bindsTo)
                   || builtins.trace "Hermes config assertion 213: builtins.elem \"hermes-network-ready@%i.service\" units.\"hermes@\".bindsTo" false
                 )
@@ -2056,13 +2065,13 @@
                   defaultOnRuntimeVm.config.services.hermes-specialised-agent.installDefaultSkills
                   && defaultOnRuntimeVm.config.services.hermes-specialised-agent.agents.vm.headroomEnable
                   &&
-                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
-                    == "1"
-                  &&
-                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
-                    == "1"
-                  &&
                     defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_DEFAULT_ON_TEST
+                    == "1"
+                  &&
+                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_SECURITY_ONLY
+                    == "1"
+                  &&
+                    defaultOnRuntimeVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_PROFILE_IDENTITY_ONLY
                     == "1"
                   || builtins.trace "Hermes config assertion 312: runtime default-on probe enables skills and Headroom" false
                 )

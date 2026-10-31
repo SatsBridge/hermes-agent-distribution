@@ -214,10 +214,11 @@ run arbitrary host `/nix/store` paths or discover packages through NixOS profile
 aliases. Add runtime tools through the service PATH/package configuration,
 plugins through `extraPlugins`, or reference store-backed resources in the
 declared agent configuration. The offline VM fixture disables Headroom and
-default-skill pre-install, so their default-on closure coverage is evaluated
-separately; the standard VM run does not exercise their runtime startup. The
-five default skills are packaged locally; these installs do not require a network
-download.
+default-skill pre-install. A separate default-on VM enables both, verifies each
+agent's five installed skills, the zero-capability Headroom child, peer-profile
+access, and peer `.env` denial. The skills are packaged locally: installation
+fetches from the bundled official tree and does not depend on DNS or Internet
+access. Headroom's optional model warm-up is a separate Internet dependency.
 
 The module no longer adds Nixpkgs' `mnemosyne` package to Hermes PATH or
 generates a Mnemosyne config, directory, or environment defaults: that package
@@ -236,8 +237,12 @@ service start time. Every service family has an isolated `RootDirectory` and
 private runtime tree. Network setup alone gets a narrow writable host
 `/run/systemd/network` bind; readiness sees only its resolver publication path
 and manager socket. The DHCP root has no host dhcpcd configuration or hooks.
-The longer start/restart bounds apply only to the VM smoke test, not production
-systemd timeouts.
+The gateway template uses `TimeoutStartSec=180s`: the previous 90-second
+manager default expired while the first gateway was installing five bundled
+skills one CLI invocation at a time under the 2-GiB QEMU guest. A measured cold
+gateway activation took about 157 seconds from unit start to active; the
+180-second bound is a bounded
+operational allowance, not a claim that the 15-second startup target is met.
 
 For diagnostics, inspect `systemctl status hermes-network@NAME.service
 hermes-dhcp@NAME.service hermes-network-ready@NAME.service`,
@@ -390,15 +395,15 @@ main activation, the first real dashboard-process log, and
 `HERMES_DASHBOARD_READY`. Restart timing starts immediately before
 `systemctl restart hermes@vm.service`. It reports whether first-log latency met
 the 10-second target or 15-second maximum, but timing is informational and does
-not fail the broader smoke. The latest focused security-mode guest measured
-65.527s from the network-start boundary to the first real dashboard log and
-79.661s to `HERMES_DASHBOARD_READY`. The Internet-recovery guest measured
-66.648s to its first log and 81.686s to READY. The 15-second maximum remains
-unmet. The owner directed
-that startup time remain as-is, with security prioritized and no further
-optimization requested (task comment 124). This is an accepted operational
-tradeoff, not evidence that the timing target was met. The security and Internet
-fixtures are focused runs, not a full offline-matrix pass.
+not fail the broader smoke. In the default-on security diagnostic guest,
+`network-online.target` occurred at 135.072s, the first real dashboard log
+160.461s later, and
+`HERMES_DASHBOARD_READY` 182.792s later. The 15-second maximum remains unmet.
+The owner directed that startup time remain as-is, prioritizing security and
+requesting no further optimization (task comment 124). The 180-second gateway
+start bound is a budget based on measured local skill installation and runtime
+startup, not a waiver or evidence that the 15-second target is met. The focused
+security and Internet fixtures are separate from the full offline matrix.
 `HERMES_DASHBOARD_READY` and the independent loopback packaged-UI HTTP check
 remain required. No startup optimization was accepted: the proposed materialized
 closure view's storage cost cannot rely on reflinks or deduplication. It also
@@ -408,7 +413,9 @@ replaces the peer process. `ExecMainStartTimestampMonotonic` is reported
 separately and is not used as the sole startup boundary.
 Gateway start/restart commands are bounded at 180 seconds and the smoke unit at
 5400 seconds for the full per-store-path, security, loss and lifecycle
-network-policy probes in the 2-GiB guest. A smoke timeout is a failure; a QEMU
+network-policy probes in the 2-GiB guest. DAD recovery retains its 90-second
+test bound and still requires current observation, authorization, and policy
+before startup. A smoke timeout is a failure; a QEMU
 runner exit after the guest requests poweroff is not a substitute for the
 `Hermes VM runtime checks passed` marker or for a clean `/nix/store` unmount.
 The RAM limit increased from 1 GiB

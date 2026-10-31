@@ -1566,6 +1566,7 @@ let
               ReadOnlyPaths = [ "/proc/cpuinfo" ];
               RemoveIPC = true;
               Restart = "always";
+              TimeoutStartSec = "180s";
               RestrictAddressFamilies = [
                 "AF_INET"
                 "AF_INET6"
