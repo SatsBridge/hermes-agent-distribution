@@ -302,13 +302,13 @@ trigger without enabling networkd on a host with no active agent. Runtime RA
 drop-ins remain outside NixOS and still require the helper's explicit
 reload/reconfigure.
 
-The supported host contract for active Hermes agents is
-`networking.useNetworkd=true`; the module asserts this prerequisite and does not
-set it. NetworkManager may be enabled at the same time; Hermes veths remain
-excluded from NetworkManager and dhcpcd, without changing unrelated uplink
-ownership. Hosts with `networking.useNetworkd=false` are outside this task's
-supported configuration. Keep NixOS's standard networkd wait-online default;
-do not add a Hermes-specific override. First/change/last-agent-removal/rollback
+Active Hermes agents enable `systemd.network` for their generated veths but do
+not change `networking.useNetworkd`; dhcpcd or NetworkManager may continue to own
+the host uplink. If the host does not use networkd for its uplink, a `mkDefault`
+disables the extra networkd wait-online gate. This preserves an explicit
+`systemd.network.wait-online.enable` policy and leaves networkd users' existing
+wait-online setting intact. Hermes veths remain excluded from NetworkManager and
+dhcpcd, without changing unrelated uplink ownership. First/change/last-agent-removal/rollback
 with networkd already running must be exercised using ordinary activation, not
 manual reload or trigger evaluation alone.
 

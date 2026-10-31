@@ -1652,10 +1652,6 @@ in
         assertion = !(cfg.enable && activeAgentNames != [ ]) || config.services.dbus.enable;
         message = "Hermes host control requires the host system D-Bus service; explicit services.dbus.enable=false is incompatible";
       }
-      {
-        assertion = !(cfg.enable && activeAgentNames != [ ]) || config.networking.useNetworkd;
-        message = "services.hermes-agent: active agents require networking.useNetworkd=true; NetworkManager may also be enabled";
-      }
     ];
 
     services.dbus.enable = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (lib.mkDefault true);
@@ -1707,6 +1703,9 @@ in
       [
         {
           network.enable = lib.mkIf (cfg.enable && activeAgentNames != [ ]) true;
+          network.wait-online.enable = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
+            lib.mkDefault config.networking.useNetworkd
+          );
           network.networks = lib.mkIf (cfg.enable && activeAgentNames != [ ]) (
             lib.mapAttrs' (_: network: {
               name = "40-hermes-agent-${toString network.index}";

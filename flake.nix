@@ -91,6 +91,12 @@
       existingNetworkdProbe = hermesModuleVm.extendModules {
         modules = [ ({ lib, ... }: { networking.useNetworkd = lib.mkForce true; }) ];
       };
+      dhcpcdUplinkProbe = hermesModuleVm.extendModules {
+        modules = [ ({ lib, ... }: { networking.useNetworkd = lib.mkForce false; }) ];
+      };
+      explicitNetworkdWaitOnlineProbe = dhcpcdUplinkProbe.extendModules {
+        modules = [ ({ lib, ... }: { systemd.network.wait-online.enable = lib.mkForce true; }) ];
+      };
       # Keep the activation fixture's uplink networkd-owned; the Internet VM tests NM coexistence separately.
       networkdActivationBaseVm = hermesModuleVm;
       networkdRemovedVm = networkdActivationBaseVm.extendModules {
@@ -1759,6 +1765,18 @@
                 && (
                   networkManagerProbe.config.systemd.network.wait-online.enable
                   || builtins.trace "Hermes config assertion 261: networkManagerProbe preserves networkd wait-online default" false
+                )
+                && (
+                  (!dhcpcdUplinkProbe.config.networking.useNetworkd)
+                  && dhcpcdUplinkProbe.config.networking.dhcpcd.enable
+                  && dhcpcdUplinkProbe.config.systemd.network.enable
+                  && (!dhcpcdUplinkProbe.config.systemd.network.wait-online.enable)
+                  && (!dhcpcdUplinkProbe.config.systemd.services.systemd-networkd-wait-online.enable)
+                  || builtins.trace "Hermes config assertion: dhcpcd uplinks retain dhcpcd ownership without a new networkd wait-online gate" false
+                )
+                && (
+                  explicitNetworkdWaitOnlineProbe.config.systemd.network.wait-online.enable
+                  || builtins.trace "Hermes config assertion: explicit networkd wait-online policy is preserved" false
                 )
                 && (
                   (

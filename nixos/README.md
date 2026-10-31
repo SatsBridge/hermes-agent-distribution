@@ -140,11 +140,10 @@ must be restricted to a particular host interface.
 
 This changes host-wide NixOS firewall/NAT behavior: the firewall backend becomes
 nftables, forwarding is enabled for IPv4 and IPv6, and unconfigured forwarded
-traffic is filtered. Active Hermes agents require
-`networking.useNetworkd = true`; the module does not change that setting. It
-adds the generated Hermes veth networks to systemd-networkd and excludes those
-interfaces from host dhcpcd and NetworkManager. NetworkManager may also be
-enabled. The module does not otherwise take over unrelated uplink ownership.
+traffic is filtered. Active Hermes agents add the generated veth networks to
+systemd-networkd without changing `networking.useNetworkd`; the host may keep
+dhcpcd or NetworkManager as its uplink owner. The module excludes Hermes veths
+from both and does not otherwise take over unrelated uplink ownership.
 NAT remains NixOS `networking.nat`, including the existing `externalInterface`
 restriction semantics. Existing routed networks must be represented by the
 NixOS firewall/NAT configuration (or explicit nftables forward rules). Existing
@@ -154,9 +153,10 @@ fail. The module uses NixOS `systemd.network.networks` for generated
 `40-hermes-agent-N.network` files, so ordinary generation activation reloads
 networkd when those files are added, changed, or removed. A content-addressed
 membership trigger covers removals in the pinned NixOS switch implementation.
-Dynamic RA drop-ins still use the existing runtime reload path. The standard
-networkd wait-online policy remains enabled and host-owned. The module does not
-change the host's systemd-resolved setting; the NixOS default applies. IPv6 egress
+Dynamic RA drop-ins still use the existing runtime reload path. When the host
+does not use networkd for its uplink, the module avoids adding networkd's default
+wait-online gate; an explicit `systemd.network.wait-online.enable` setting is
+preserved. Existing networkd users retain their wait-online policy. IPv6 egress
 depends on host IPv6 connectivity.
 
 The main agent's dashboard stays bound to namespace loopback and defaults to a
