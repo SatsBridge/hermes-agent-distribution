@@ -333,16 +333,16 @@ iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 Current checks on this worktree: `hermes-module-vm-config-check`, the Nix
 formatting check, Python syntax and `git diff --check` pass.
 
-Focused security guest `/nix/store/yn1ys9c8l4in99yv9nick6rzx1rkd1cc-nixos-vm`
-used system closure `/nix/store/5a33505y4bgck076nhz2v1kidk2cv98j-nixos-system-nixos-26.11.20261014.55bfb4d`.
+Focused security guest `/nix/store/87qwspm9zn5nqbgrv040b9ryljkp77ki-nixos-vm`
+used system closure `/nix/store/vxrh9nqimmydp176ygalc2niwyrj8kz8-nixos-system-nixos-26.11.20261014.55bfb4d`.
 It printed `HERMES_VM_SECURITY_ONLY_PASSED` after instantiated-unit
 `systemd-analyze verify/security`, per-role store/capability/seccomp/namespace/
 family/device probes, both clients' DHCP ACK/rebind, and checks that their fixed
 runtime/state paths are writable as their DynamicUser identities. The service-
 identity profile checks succeeded for both agents and printed
 `PEER_ENV_OPEN_DENIED content_not_read` for each; the probe opened no bytes.
-First dashboard log was 70.496 s after the network-start boundary and READY was
-87.409 s.
+First dashboard log was 65.527 s after the network-start boundary and READY was
+79.661 s.
 
 Focused Internet guest `/nix/store/fvfrh8ir3nqw7nhcxbsaxx1r1d4219r8-nixos-vm`
 used system closure `/nix/store/5wv5bkkbbwa1yn0q82r76381pfavpjsd-nixos-system-nixos-26.11.20261014.55bfb4d`.
@@ -350,7 +350,7 @@ It printed `Hermes focused Internet recovery checks passed`: both agents passed
 the exact single-host-resolver positive/blocked-negative check, including after
 networkd restart, public DNS, TCP/443, and certificate-verified HTTPS HTTP 200
 before and after nftables/networkd recovery. Public IPv6 remains untested. The
-run measured 69.526 s to the first dashboard log and 84.783 s to READY.
+run measured 66.648 s to the first dashboard log and 81.686 s to READY.
 
 The networkd activation guest `/nix/store/rxyfd3hcbzmlk53xmqnz0vy50220p9v2-nixos-vm`
 used system closure `/nix/store/aahp60k5vah9jlkfn2syy80wfqm01y7m-nixos-system-nixos-26.11.20261014.55bfb4d`.
