@@ -234,19 +234,20 @@ let
         networkd_pid_before=$(systemctl show --property=MainPID --value systemd-networkd.service)
         echo "Applying NixOS generation $label ($target) without changing the disposable VM bootloader"
         timeout --kill-after=10s 240 "$target/bin/switch-to-configuration" test
+        reload_after=$(systemctl show --property=StateChangeTimestampMonotonic --value systemd-networkd.service)
+        networkd_pid_after=$(systemctl show --property=MainPID --value systemd-networkd.service)
+        [[ "$reload_before" =~ ^[0-9]+$ && "$reload_after" =~ ^[0-9]+$ \
+          && "$reload_after" -gt "$reload_before" && "$networkd_pid_after" == "$networkd_pid_before" ]] || {
+          echo "NixOS activation did not reload (without restarting) systemd-networkd before helper startup for generation $label: state=$reload_before -> $reload_after pid=$networkd_pid_before -> $networkd_pid_after" >&2
+          return 1
+        }
+        echo "NETWORKD_RELOAD_AFTER_SWITCH label=$label state=$reload_before->$reload_after pid=$networkd_pid_before->$networkd_pid_after"
         if [[ "$target" != "$previous_system" && "$target" != "$removed_system" ]]; then
           timeout 30s systemctl reset-failed
           timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
             hermes-pf@vm.service hermes-pf@vm-peer.service
         fi
         wait_for_generation "$target"
-        reload_after=$(systemctl show --property=StateChangeTimestampMonotonic --value systemd-networkd.service)
-        networkd_pid_after=$(systemctl show --property=MainPID --value systemd-networkd.service)
-        [[ "$reload_before" =~ ^[0-9]+$ && "$reload_after" =~ ^[0-9]+$ \
-          && "$reload_after" -gt "$reload_before" && "$networkd_pid_after" == "$networkd_pid_before" ]] || {
-          echo "NixOS activation did not reload (without restarting) systemd-networkd for generation $label: state=$reload_before -> $reload_after pid=$networkd_pid_before -> $networkd_pid_after" >&2
-          return 1
-        }
         grep -Fxq 'keep-across-generation-switches' "$main_sentinel"
         grep -Fxq 'keep-across-generation-switches' "$peer_sentinel"
         grep -Fxq 'keep-across-generation-switches' "$dhcp_main_sentinel"
@@ -554,11 +555,65 @@ let
         done
       }
 
+      dump_mount_holders() {
+        local phase="''${1:-final}" host_mount_ns process pid comm cgroup mount_ns reference target map_line
+        local store_refs=0 namespace_refs=0 mapped_store_refs=0 private_mount_ns=0
+        echo "HERMES_SHUTDOWN_DIAGNOSTICS_BEGIN phase=$phase"
+        findmnt -R /nix || true
+        host_mount_ns=$(readlink /proc/1/ns/mnt)
+        for process in /proc/[0-9]*; do
+          pid="''${process##*/}"
+          comm=$(<"$process/comm") || continue
+          cgroup=$(<"$process/cgroup") || cgroup=unknown
+          mount_ns=$(readlink "$process/ns/mnt" 2>/dev/null || true)
+          if [[ -n "$mount_ns" && "$mount_ns" != "$host_mount_ns" ]]; then
+            private_mount_ns=$((private_mount_ns + 1))
+            if (( private_mount_ns <= 80 )); then
+              printf 'PRIVATE_MOUNT_NS pid=%s comm=%s ns=%s cgroup=%s\n' "$pid" "$comm" "$mount_ns" "''${cgroup//$'\n'/;}"
+            fi
+          fi
+          for reference in "$process"/cwd "$process"/root "$process"/exe "$process"/fd/*; do
+            target=$(readlink "$reference" 2>/dev/null || true)
+            case "$target" in
+              /nix/store/*)
+                store_refs=$((store_refs + 1))
+                if (( store_refs <= 120 )); then
+                  printf 'STORE_REFERENCE pid=%s comm=%s ref=%s target=%s cgroup=%s\n' "$pid" "$comm" "''${reference##*/}" "$target" "''${cgroup//$'\n'/;}"
+                fi
+                ;;
+            esac
+            case "$target" in
+              net:\[*\]|mnt:\[*\]|pid:\[*\]|user:\[*\]|ipc:\[*\]|uts:\[*\])
+                namespace_refs=$((namespace_refs + 1))
+                if (( namespace_refs <= 120 )); then
+                  printf 'NAMESPACE_REFERENCE pid=%s comm=%s ref=%s target=%s cgroup=%s\n' "$pid" "$comm" "''${reference##*/}" "$target" "''${cgroup//$'\n'/;}"
+                fi
+                ;;
+            esac
+          done
+          while IFS= read -r map_line; do
+            if [[ "$map_line" == *"/nix/store/"* ]]; then
+              mapped_store_refs=$((mapped_store_refs + 1))
+              if (( mapped_store_refs <= 80 )); then
+                printf 'STORE_MAPPING pid=%s comm=%s mapping=%s\n' "$pid" "$comm" "$map_line"
+              fi
+            fi
+          done <"$process/maps" 2>/dev/null || true
+        done
+        printf 'HERMES_SHUTDOWN_DIAGNOSTICS_END phase=%s store_references=%s namespace_references=%s store_mappings=%s private_mount_namespaces=%s\n' "$phase" "$store_refs" "$namespace_refs" "$mapped_store_refs" "$private_mount_ns"
+      }
+
       diagnose() {
         echo "Hermes VM runtime check failed; unit status follows:" >&2
         timeout 15s systemctl status --no-pager --full "''${units[@]}" >&2 || true
         for unit in "''${units[@]}"; do
           timeout 15s journalctl -b -u "$unit" --no-pager -n 80 >&2 || true
+          control_pid=$(timeout 5s systemctl show --property=ControlPID --value "$unit" || true)
+          if [[ "$control_pid" =~ ^[1-9][0-9]*$ && -r "/proc/$control_pid/cmdline" ]]; then
+            printf 'HERMES_CONTROL_PROCESS unit=%s pid=%s cmd=' "$unit" "$control_pid" >&2
+            tr '\0' ' ' <"/proc/$control_pid/cmdline" >&2 || true
+            printf '\n' >&2
+          fi
         done
         getfacl -p -- /var/lib/hermes-vm /var/lib/hermes-vm/.hermes /var/lib/hermes-vm-peer /var/lib/hermes-vm-peer/.hermes >&2 || true
         ip -o link show >&2 || true
@@ -573,6 +628,13 @@ let
         nft list ruleset >&2 || true
         ss -H -lunpt 'sport = :53' >&2 || true
         cat /etc/resolv.conf >&2 || true
+        dump_mount_holders before_cleanup >&2
+        timeout --kill-after=5s 180 systemctl stop "''${units[@]}" || echo "HERMES_STOP_AFTER_FAILURE_TIMED_OUT_OR_FAILED" >&2
+        for unit in "''${units[@]}"; do
+          properties=$(timeout 10s systemctl show --property=Id,ActiveState,SubState,ControlGroup,MainPID,ControlPID --value "$unit" || true)
+          printf 'HERMES_UNIT_AFTER_STOP unit=%s properties=%s\n' "$unit" "''${properties//$'\n'/;}" >&2
+        done
+        dump_mount_holders after_cleanup >&2
       }
 
       assert_no_mnemosyne_provisioning() {
@@ -684,11 +746,11 @@ let
         ready_latency=$(awk -v start="$boundary" -v finish="$ready_usec" 'BEGIN { printf "%.3f", (finish - start) / 1000000 }')
         echo "Dashboard startup boundary=$mode at guest uptime ''${boundary_boot}s; first real dashboard PID=$pid log at $(awk -v value="$first_usec" 'BEGIN { printf "%.3f", value / 1000000 }')s (''${first_latency}s after boundary); HERMES_DASHBOARD_READY at $(awk -v value="$ready_usec" 'BEGIN { printf "%.3f", value / 1000000 }')s (''${ready_latency}s after boundary)"
         if awk -v value="$first_latency" 'BEGIN { exit !(value > 15) }'; then
-          echo "Startup latency requirement MISSED: first real dashboard log exceeds 15 seconds; timing is reported, not used to gate this smoke"
+          echo "Diagnostic startup latency: first real dashboard log exceeded 15 seconds; no startup target gates this smoke"
         elif awk -v value="$first_latency" 'BEGIN { exit !(value > 10) }'; then
-          echo "Startup latency target missed: first real dashboard log is within the 15-second maximum"
+          echo "Diagnostic startup latency: first real dashboard log exceeded 10 seconds but not 15 seconds"
         else
-          echo "Startup latency target met: first real dashboard log is within 10 seconds"
+          echo "Diagnostic startup latency: first real dashboard log was within 10 seconds"
         fi
       }
 
@@ -872,16 +934,16 @@ let
         import pathlib, sys
         root = pathlib.Path("/var/lib") / f"hermes-{sys.argv[1]}" / ".hermes/skills"
         skills = (
-            "official/creative/concept-diagrams",
-            "official/creative/creative-ideation",
-            "official/software-development/ast-grep",
-            "official/software-development/code-wiki",
-            "official/software-development/subagent-driven-development",
+            "creative/concept-diagrams",
+            "creative/creative-ideation",
+            "software-development/ast-grep",
+            "software-development/code-wiki",
+            "software-development/subagent-driven-development",
         )
         missing = [skill for skill in skills if not (root / skill / "SKILL.md").is_file()]
         assert not missing, missing
         print(f"DEFAULT_SKILLS_INSTALLED={len(skills)}")
-          ' "$agent"
+          ' "$agent" || return 1
         done
         echo "DEFAULT_ON_FEATURES_PASSED headroom-child=$headroom_pid CapEff=0; default skills installed for both agents"
       }
@@ -2727,7 +2789,8 @@ let
           echo "$failure_unit did not prove its confined asynchronous anchor-stop request" >&2
           return 1
         fi
-        timeout 30s systemctl reset-failed hermes@vm.service hermes-network@vm.service
+        # The injected link failure marks the dependent stack failed; clear it before retry.
+        timeout 30s systemctl reset-failed "''${units[@]}" hermes-vm-before-proxies.service
         timeout --kill-after=5s 180 systemctl start hermes@vm.service || { diagnose; return 1; }
         timeout --kill-after=5s 180 systemctl start hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
         wait_for_active || { diagnose; return 1; }
@@ -2765,7 +2828,7 @@ let
         ip route del "''${agent_vm_subnet4}" dev hvm-overlap || return 1
         ip link delete dev hvm-overlap || return 1
         assert_network_resources_clean ha0 hermes_agent_0 "''${agent_vm_subnet4}" "''${agent_vm_subnet6}" || return 1
-        timeout 30s systemctl reset-failed hermes@vm.service hermes-network@vm.service
+        timeout 30s systemctl reset-failed "''${units[@]}" hermes-vm-before-proxies.service
         timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
         wait_for_active || { diagnose; return 1; }
         echo "Route-overlap failure exited before gateway/proxy startup and cleaned owned resources"
@@ -2942,6 +3005,7 @@ let
       timeout --kill-after=5s 180 systemctl stop "''${units[@]}" || { diagnose; exit 1; }
       cleanup_test_network
       check_instantiated_security || { diagnose; exit 1; }
+      dump_mount_holders
       echo "Hermes VM runtime checks passed"
     '';
   };

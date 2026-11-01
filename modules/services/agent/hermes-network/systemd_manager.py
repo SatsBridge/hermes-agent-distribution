@@ -11,12 +11,28 @@ class SystemdManager:
         self.manager = dbus.Interface(proxy, "org.freedesktop.systemd1.Manager")
         self.properties = {}
         self.deadline = time.monotonic() + 2
+        self.slow_calls = []
 
     def call(self, method, *args):
+        started = time.monotonic()
+        name = getattr(method, "__name__", "systemd D-Bus method")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
+            print(f"systemd validation budget expired before {name}; slow_calls={self.slow_calls}", flush=True)
             raise TimeoutError("systemd validation deadline expired")
-        return method(*args, timeout=remaining)
+        try:
+            result = method(*args, timeout=remaining)
+        except Exception:
+            elapsed = time.monotonic() - started
+            if elapsed >= 0.2:
+                self.slow_calls.append((round(elapsed, 3), name))
+            if time.monotonic() >= self.deadline:
+                print(f"systemd validation call exceeded deadline method={name}; elapsed={elapsed:.3f}s prior_slow={self.slow_calls}", flush=True)
+            raise
+        elapsed = time.monotonic() - started
+        if elapsed >= 0.2:
+            self.slow_calls.append((round(elapsed, 3), name))
+        return result
 
     def unit_info(self, name, with_pid=False):
         if name not in self.properties:

@@ -8,6 +8,7 @@ import stat
 import sys
 role = sys.argv[1]
 sentinel_name = sys.argv[2]
+print(f"PAYLOAD_BOUNDARY_START role={role} pid={os.getpid()}", flush=True)
 expected_caps = {"gateway": 0, "pf": (1 << 2) | (1 << 3), "dhcp": (1 << 10) | (1 << 12) | (1 << 13),
     "host-control": 1 << 12, "network-failure": 0, "netns": 0, "network-observer": 0, "dns": 1 << 10,
     "host-proxy": 0, "agent-relay": 0, "network-ready": 0}[role]
@@ -17,6 +18,7 @@ assert int(status["CapBnd"], 16) == expected_caps, (role, status)
 assert int(status["CapPrm"], 16) == expected_caps, (role, status)
 assert int(status["CapAmb"], 16) == (0 if role in ("host-control", "netns") else expected_caps), (role, status)
 assert int(status["NoNewPrivs"]) == 1 and int(status["Seccomp"]) == 2
+print(f"PAYLOAD_BOUNDARY_STAGE role={role} stage=credentials-seccomp", flush=True)
 libc = ctypes.CDLL(None, use_errno=True)
 assert libc.setns(-1, 0) == -1 and ctypes.get_errno() == errno.EPERM
 assert libc.unshare(0x40000000) == -1 and ctypes.get_errno() == errno.EPERM
@@ -36,6 +38,7 @@ for family in families + (socket.AF_VSOCK,):
     else:
         descriptor.close()
         raise AssertionError((role, "forbidden family succeeded", family))
+print(f"PAYLOAD_BOUNDARY_STAGE role={role} stage=address-families", flush=True)
 assert stat.S_IMODE(os.stat("/").st_mode) == 0o700, (role, os.stat("/"))
 mounts = [line.split() for line in pathlib.Path("/proc/self/mountinfo").read_text().splitlines()]
 nix_root = next((fields for fields in mounts if fields[4].endswith("/nix")), None)
@@ -69,6 +72,7 @@ for alias in ("/run/current-system", "/run/booted-system", "/run/wrappers", "/et
     "/root/.nix-defexpr", "/root/.nix-profile/bin/bash", "/run/wrappers/bin/sudo"):
     assert not pathlib.Path(alias).exists(), (role, alias)
 print(f"STORE_BOUNDARY_PASSED role={role} read-only-mounts={len(store_mounts)} sentinel=denied", flush=True)
+print(f"PAYLOAD_BOUNDARY_STAGE role={role} stage=store-and-aliases", flush=True)
 for root in os.environ.get("RUNTIME_DIRECTORY", "").split(":"):
     if not root.endswith("/root") or not pathlib.Path(root).exists():
         continue
@@ -121,10 +125,13 @@ elif role in ("host-control", "network-ready", "host-proxy", "agent-relay"):
         os.close(descriptor)
         os.unlink(directory / ".boundary-probe")
         raise AssertionError((role, "observer record write succeeded"))
+print(f"PAYLOAD_BOUNDARY_STAGE role={role} stage=runtime-paths-and-producer-mounts", flush=True)
 if role == "gateway":
     with open("/dev/kvm", "r+b", buffering=0) as device:
+        print(f"PAYLOAD_BOUNDARY_STAGE role={role} stage=kvm-positive", flush=True)
         assert fcntl.ioctl(device, 0xAE00, 0) == 12
 elif role not in ("netns",):
+    print(f"PAYLOAD_BOUNDARY_STAGE role={role} stage=kvm-denial", flush=True)
     try:
         descriptor = os.open("/dev/kvm", os.O_RDWR)
     except OSError as error:

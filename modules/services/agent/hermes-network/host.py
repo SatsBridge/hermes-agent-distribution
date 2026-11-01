@@ -31,12 +31,31 @@ nft = settings['tools']['nft']
 ss = settings['tools']['ss']
 startup_deadline = None
 authorized = False
+cycle_started = time.monotonic()
+last_command = None
+slow_commands = []
 
 def run(*args, input=None):
+    global last_command
+    started = time.monotonic()
+    command = ' '.join(args)
     remaining = cycle_deadline - time.monotonic()
     if remaining <= 0:
+        print(f'{name}: validation budget expired before {command}; elapsed={started - cycle_started:.3f}s previous={last_command} slow_commands={slow_commands} slow_systemd={manager.slow_calls}', flush=True)
         raise RuntimeError('network validation cycle exceeded its budget')
-    return subprocess.run(args, input=input, text=True, stdout=subprocess.PIPE, check=True, timeout=remaining).stdout
+    last_command = command
+    try:
+        result = subprocess.run(args, input=input, text=True, stdout=subprocess.PIPE, check=True, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - started
+        if elapsed >= 0.2:
+            slow_commands.append((round(elapsed, 3), command))
+        print(f'{name}: validation command exceeded remaining budget; command={command} elapsed={elapsed:.3f}s cycle={time.monotonic() - cycle_started:.3f}s prior_slow={slow_commands} slow_systemd={manager.slow_calls}', flush=True)
+        raise
+    elapsed = time.monotonic() - started
+    if elapsed >= 0.2:
+        slow_commands.append((round(elapsed, 3), command))
+    return result.stdout
 
 def rules(text, live=False):
     result = []
@@ -80,10 +99,15 @@ descriptor = None
 try:
     manager = SystemdManager()
     cycle_deadline = time.monotonic() + 30
+    cycle_started = time.monotonic()
     expected, descriptor = initialize(settings, manager, verify_policy)
     while True:
+        cycle_started = time.monotonic()
+        last_command = None
+        slow_commands = []
         cycle_deadline = time.monotonic() + 2
         manager.deadline = cycle_deadline
+        manager.slow_calls = []
         watched = (f"hermes@{name}.service", f"hermes-host-control@{name}.service", f"hermes-network@{name}.service", f"hermes-network-ready@{name}.service")
         all_jobs = manager.jobs()
         jobs = [job for job in all_jobs if job[1] in watched]

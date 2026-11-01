@@ -69,6 +69,17 @@
           })
         ];
       };
+      defaultOnFullProbe = defaultOnRuntimeVm.extendModules {
+        modules = [
+          ({ lib, ... }: {
+            systemd.services.hermes-module-vm-agent-smoke.environment = {
+              HERMES_VM_SECURITY_ONLY = lib.mkOverride 40 "0";
+              HERMES_VM_PROFILE_IDENTITY_ONLY = lib.mkOverride 40 "0";
+              HERMES_VM_INTERNET_RECOVERY_ONLY = lib.mkOverride 30 "0";
+            };
+          })
+        ];
+      };
       securityOnlyVm = hermesModuleVm.extendModules {
         modules = [
           ({ lib, ... }: {
@@ -2076,6 +2087,26 @@
                   || builtins.trace "Hermes config assertion 312: runtime default-on probe enables skills and Headroom" false
                 )
                 && (
+                  defaultOnFullProbe.config.services.hermes-specialised-agent.installDefaultSkills
+                  && defaultOnFullProbe.config.services.hermes-specialised-agent.agents.vm.headroomEnable
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_DEFAULT_ON_TEST
+                    == "1"
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_TEST
+                    == "1"
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_SECURITY_ONLY
+                    == "0"
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_PROFILE_IDENTITY_ONLY
+                    == "0"
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
+                    == "0"
+                  || builtins.trace "Hermes config assertion 319: full Internet matrix enables default skills and Headroom" false
+                )
+                && (
                   securityOnlyVm.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_SECURITY_ONLY
                   == "1"
                   || builtins.trace "Hermes config assertion 315: focused security probe enables instantiated-unit verification" false
@@ -2199,6 +2230,7 @@
       nixosConfigurations.hermes-module-vm-explicit-dashboard = explicitDashboardProbe;
       nixosConfigurations.hermes-module-vm-internet = internetEnabledVm;
       nixosConfigurations.hermes-module-vm-default-on = defaultOnRuntimeVm;
+      nixosConfigurations.hermes-module-vm-default-on-full = defaultOnFullProbe;
       nixosConfigurations.hermes-module-vm-security = securityOnlyVm;
       nixosConfigurations.hermes-module-vm-networkd-activation = networkdActivationVm;
       overlays.default =

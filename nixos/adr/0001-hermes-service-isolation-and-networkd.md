@@ -156,9 +156,11 @@ records are accepted only when at most 2 seconds old. Readiness polls every
 0.1 seconds. The first implementation's repeated manager queries missed the
 2-second authorization bound; the current validator batches producer queries
 and removes redundant per-address calls without increasing that freshness
-limit. Final-candidate VM results, including loss and stop timing, are recorded
-in the attached evidence. No freshness or end-to-end loss-bound waiver is
-inferred.
+limit. A prior combined Headroom/network-failure diagnostic exceeded the
+controller's cycle budget and correctly failed closed; this establishes an
+availability issue under that test load, not a freshness/revocation waiver or
+proof that supported production load is affected. Final-candidate timing and
+loss evidence is still required.
 
 ### Startup, stop and recovery
 
@@ -331,8 +333,8 @@ load-fragment/verbs/bus-util/sd_booted sources; pinned Nixpkgs networkd module;
 iproute2 and Linux rtnetlink namespace-FD path; packaged dhcpcd 10.3.2 paths.
 
 `hermes-module-vm-config-check` passed after adding the gateway start bound and
-its assertion. Nix formatting, Python parsing and `git diff --check` still need
-to be recorded on the final committed candidate.
+its assertion. Every VM smoke run must record the immutable launcher identity,
+guest `/run/current-system`, command and both test/wrapper exit statuses.
 
 The earlier evidence attachments 19/24/25 are historical only and are not
 accepted as candidate identity evidence: their recorded system closure hashes
@@ -383,13 +385,15 @@ partitioning, not evidence that the controller's under-load timing risk is
 resolved. Whether that combined under-load availability behavior needs a
 different owner-approved budget remains an open review question.
 
-The 15-second startup maximum remains unmet. The owner directed startup time to
-remain as-is, prioritizing security and requesting no further optimization
-(task comment 124). The 180-second service bound is a conditional operational
-allowance, not a waiver or a pass for that NFR. Full offline matrix, Internet
-DNS/TLS, networkd activation attribution/rollback, and clean teardown remain
-open until final-candidate evidence is attached. No software acceptance, risk
-exception or release authorization is inferred.
+The owner cancelled the 15-second startup requirement and directed that startup
+remain as-is, prioritizing security (task comment 135). Startup latency remains
+diagnostic and is not an acceptance criterion. The 180-second service bound is
+an operational budget supported by measured local skill-installation time; it
+does not relax the two-second authorization/revocation bound. Full offline
+matrix, default-on interaction, Internet DNS/TLS, activation attribution and
+rollback, and clean teardown remain open until final-candidate evidence is
+attached. No software acceptance, risk exception or release authorization is
+inferred.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,

@@ -38,11 +38,12 @@ before notifying systemd that the gateway may start. Address/route or firewall
 generation loss revokes the sets and stops the gateway. `hermes-pf@NAME` remains
 in its own private namespace; it uses numeric shared-group ACLs without importing
 host `/etc/group`, and denies socket creation through its syscall filter.
-Both setup payloads have only `CAP_NET_ADMIN`, with setns and namespace creation
-denied. Local setup uses its own dynamic identity and ambient NET_ADMIN; only
-the zero-capability anchor and trusted host controller retain root UID for
-namespace-FD and manager API access; the zero-capability OnFailure reaper uses
-root D-Bus credentials only to stop the anchor after failed host setup. The host
+Local setup runs as a distinct dynamic identity with ambient `CAP_NET_ADMIN`;
+readiness has zero capabilities and no manager socket. The anchor has root UID
+and zero capabilities for namespace-FD access. The trusted host controller has
+root UID and bounded `CAP_NET_ADMIN` plus manager API access; its D-Bus socket is
+not a restricted API. The zero-capability OnFailure reaper uses root D-Bus
+credentials only to stop the anchor after failed host setup. The host
 controller acknowledges peer
 movement before waiting for carrier-dependent allocation/RA work; its
 notification is not final readiness.
@@ -116,17 +117,18 @@ resolver snapshot. Late-created veths are excluded from the network-online wait
 with `RequiredForOnline=no`. Resolver changes after startup are not watched;
 restart the agent service (`systemctl restart hermes@NAME.service`) to rebuild
 its network and refresh the DNS upstreams. DHCP uses a per-instance dynamic
-service identity. PID/control files are volatile under `RuntimeDirectory`;
-lease/DUID state persists under `StateDirectory=hermes-dhcp-NAME` (separate
-from the DHCP server's runtime leases). Its namespace-side veth uses a locally
-administered stable MAC so the single-address DHCP lease can be reacquired after
-namespace replacement. Assigned IPs remain runtime state, not a stable API. The
-client runs in a per-agent `RootDirectory`, with only its own DHCP runtime
-closure. The existing start wrapper links its fixed `/var/run/dhcpcd` path
-to the managed runtime directory; a native state alias supplies `/var/lib/dhcpcd`.
-One private `/var/run` tmpfs allows that link without a privileged pre-start.
-It retains a closed device policy, a syscall allowlist, and the three
-capabilities needed for DHCP/network configuration. It has no host resolver or
+service identity. PID/control files are volatile in the per-instance
+`RuntimeDirectory`; lease/DUID state persists in the owner-approved
+`StateDirectory=hermes-dhcp-NAME` (separate from runtime DHCP-server leases).
+Its namespace-side veth uses a locally administered stable MAC so the
+single-address DHCP lease can be reacquired after namespace replacement.
+Assigned IPs remain runtime state, not a stable API. The client runs in a
+per-agent `RootDirectory`, with only its own DHCP closure. The start wrapper
+links its fixed `/var/run/dhcpcd` path to the managed runtime directory and
+creates `/var/lib/dhcpcd` as a link to its idmapped persistent state directory
+inside the private root. No host `/run` or `/var` is exposed. It retains a
+closed device policy, a syscall allowlist, and the capabilities needed for
+DHCP/network configuration. It has no host resolver or
 hostname hooks. If DHCP, SLAAC,
 networkd, resolver, or firewall setup does not
 complete within the bounded startup timeout, the agent remains stopped.
@@ -318,6 +320,20 @@ nix --extra-experimental-features 'nix-command flakes' build .#nixosConfiguratio
 NIX_DISK_IMAGE="$TMPDIR/hermes-networkd-activation.qcow2" ./result/bin/run-nixos-vm
 ```
 
+To exercise the full failure/lifecycle matrix with default skills and Headroom
+enabled, build and run
+`nixosConfigurations.hermes-module-vm-default-on-full.config.system.build.vm`
+with unrestricted QEMU networking. This variant uses the real host DNS/HTTPS
+regression because default-on Headroom initialization has external dependencies;
+external failures are test failures, not skipped or replaced with local results.
+The two-second authorization freshness/revocation boundary is unchanged.
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm-default-on-full.config.system.build.vm
+disk="$TMPDIR/hermes-module-vm-default-on-full.qcow2"
+QEMU_NET_OPTS='restrict=off' NIX_DISK_IMAGE="$disk" ./result/bin/run-nixos-vm
+```
+
 The default fixture intentionally uses restricted QEMU networking and remains an
 offline policy test; it does not claim Internet reachability. To run the separate
 real-Internet regression, the host must have working outbound DNS and HTTPS, and
@@ -393,17 +409,17 @@ For cold boot, the timing regression uses the systemd start event for
 guest-boot-relative timestamps for `network-online.target`, the network helper,
 main activation, the first real dashboard-process log, and
 `HERMES_DASHBOARD_READY`. Restart timing starts immediately before
-`systemctl restart hermes@vm.service`. It reports whether first-log latency met
-the 10-second target or 15-second maximum, but timing is informational and does
-not fail the broader smoke. In the default-on security diagnostic guest,
-`network-online.target` occurred at 135.072s, the first real dashboard log
-160.461s later, and
-`HERMES_DASHBOARD_READY` 182.792s later. The 15-second maximum remains unmet.
-The owner directed that startup time remain as-is, prioritizing security and
-requesting no further optimization (task comment 124). The 180-second gateway
-start bound is a budget based on measured local skill installation and runtime
-startup, not a waiver or evidence that the 15-second target is met. The focused
-security and Internet fixtures are separate from the full offline matrix.
+`systemctl restart hermes@vm.service`. It reports first-log latency for
+diagnostics but does not fail the broader smoke. The owner cancelled the
+15-second startup requirement and directed that startup remain as-is,
+prioritizing security (task comment 135). Reported latency is diagnostic only;
+no startup-latency target remains an acceptance criterion. A previous default-on
+run measured `HERMES_DASHBOARD_READY` about 183 seconds after network-online;
+that result is historical and does not establish final-candidate behavior. The
+180-second gateway start bound is an operational budget based on measured local
+skill installation and runtime startup, not a startup-latency requirement.
+Focused security and Internet fixtures remain separate from the full offline
+matrix.
 `HERMES_DASHBOARD_READY` and the independent loopback packaged-UI HTTP check
 remain required. No startup optimization was accepted: the proposed materialized
 closure view's storage cost cannot rely on reflinks or deduplication. It also
@@ -414,8 +430,8 @@ separately and is not used as the sole startup boundary.
 Gateway start/restart commands are bounded at 180 seconds and the smoke unit at
 5400 seconds for the full per-store-path, security, loss and lifecycle
 network-policy probes in the 2-GiB guest. DAD recovery retains its 90-second
-test bound and still requires current observation, authorization, and policy
-before startup. A smoke timeout is a failure; a QEMU
+test-specific wait and still requires current observation, authorization, and
+policy before startup. A smoke timeout is a failure; a QEMU
 runner exit after the guest requests poweroff is not a substitute for the
 `Hermes VM runtime checks passed` marker or for a clean `/nix/store` unmount.
 The RAM limit increased from 1 GiB
