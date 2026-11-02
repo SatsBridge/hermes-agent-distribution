@@ -260,6 +260,35 @@ python313Packages.overrideScope (
     };
 
     # These pure-Python packages use DuckDB only in their optional test backends.
+    # strands-agents 1.24 requires mcp<2.0.0. nixpkgs-unstable moved to mcp 2.x,
+    # which is a different package (httpx2, mcp-types), so pin the 1.x release
+    # that the locked nixpkgs-unstable ships.
+    mcp = prev.mcp.overridePythonAttrs (_: {
+      dependencies = builtins.attrValues {
+        inherit (final)
+          anyio
+          httpx
+          httpx-sse
+          jsonschema
+          pydantic
+          pydantic-settings
+          pyjwt
+          python-multipart
+          sse-starlette
+          starlette
+          uvicorn
+          ;
+      };
+      doCheck = false; # The 1.x sdist test suite is not part of this scope's contract.
+      src = fetchFromGitHub {
+        hash = "sha256-lRlj5RT/R5zrYL5XpdQR2l9t99G94WTsubN0gSQekMc=";
+        owner = "modelcontextprotocol";
+        repo = "python-sdk";
+        tag = "v1.29.0";
+      };
+      version = "1.29.0";
+    });
+
     narwhals = prev.narwhals.overridePythonAttrs (_: {
       doCheck = false;
       nativeCheckInputs = [ ];
