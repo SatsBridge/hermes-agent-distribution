@@ -196,6 +196,54 @@ Commit messages follow [Conventional Commits](https://www.conventionalcommits.or
 The `nix develop .#headroom` shell installs a `convco` git hook that does a
 check of each message.
 
+### 6. Clean up disk space
+
+The repository itself is small. Most disk use comes from the Nix store
+(`/nix/store`). Each build and each NixOS generation keeps store paths alive
+until you remove them.
+
+1. Remove the build symlink. It is a garbage collection root, and it is
+   ignored by git:
+
+   ```sh
+   rm result
+   ```
+
+2. Check how much space the store uses and how much is free:
+
+   ```sh
+   du -sh /nix/store
+   df -h /
+   ```
+
+3. Remove old NixOS generations. Keep at least one older generation if you
+   want a rollback option:
+
+   ```sh
+   sudo nix-collect-garbage --delete-older-than 7d
+   ```
+
+   To keep only the current generation, run `sudo nix-collect-garbage -d`.
+
+4. Remove old user-profile generations and unused store paths:
+
+   ```sh
+   nix-collect-garbage -d
+   ```
+
+5. Optional. Replace duplicate store files with hard links. This can take a
+   long time:
+
+   ```sh
+   sudo nix-store --optimise
+   ```
+
+6. Check the result with `df -h /`.
+
+> [!CAUTION]
+> Steps 3 and 4 delete data permanently. After you delete a generation, you
+> cannot roll back to it.
+
 ## Repository layout
 
 ```text
