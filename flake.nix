@@ -72,11 +72,16 @@
       defaultOnFullProbe = defaultOnRuntimeVm.extendModules {
         modules = [
           ({ lib, ... }: {
+            virtualisation.memorySize = lib.mkForce 3072;
+            # Repeated default-on recovery exercises measured multi-minute local skill startup.
+            systemd.services.hermes-module-vm-agent-smoke.serviceConfig.TimeoutStartSec = lib.mkForce "9000s";
             systemd.services.hermes-module-vm-agent-smoke.environment = {
               HERMES_VM_SECURITY_ONLY = lib.mkOverride 40 "0";
               HERMES_VM_PROFILE_IDENTITY_ONLY = lib.mkOverride 40 "0";
               HERMES_VM_INTERNET_RECOVERY_ONLY = lib.mkOverride 30 "0";
             };
+            systemd.services.hermes-module-vm-smoke.environment.HERMES_VM_MEMORY_LIMIT_KIB =
+              lib.mkForce "3145728";
           })
         ];
       };
@@ -2104,6 +2109,17 @@
                   &&
                     defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.environment.HERMES_VM_INTERNET_RECOVERY_ONLY
                     == "0"
+                  && defaultOnFullProbe.config.virtualisation.memorySize == 3072
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-smoke.environment.HERMES_VM_MEMORY_LIMIT_KIB
+                    == "3145728"
+                  &&
+                    defaultOnFullProbe.config.systemd.services.hermes-module-vm-agent-smoke.serviceConfig.TimeoutStartSec
+                    == "9000s"
+                  && hermesModuleVm.config.virtualisation.memorySize == 2048
+                  &&
+                    hermesModuleVm.config.systemd.services.hermes-module-vm-smoke.environment.HERMES_VM_MEMORY_LIMIT_KIB
+                    == "2097152"
                   || builtins.trace "Hermes config assertion 319: full Internet matrix enables default skills and Headroom" false
                 )
                 && (

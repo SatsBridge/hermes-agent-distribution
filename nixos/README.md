@@ -326,7 +326,9 @@ enabled, build and run
 with unrestricted QEMU networking. This variant uses the real host DNS/HTTPS
 regression because default-on Headroom initialization has external dependencies;
 external failures are test failures, not skipped or replaced with local results.
-The two-second authorization freshness/revocation boundary is unchanged.
+This combined test guest is capped at 3 GiB by owner authorization; ordinary
+offline/security guests remain 2 GiB and production service resource policy is
+unchanged. The two-second authorization freshness/revocation boundary is unchanged.
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.hermes-module-vm-default-on-full.config.system.build.vm
@@ -427,15 +429,22 @@ reports peer `ExecStart`/active latency relative to main
 activation and dashboard readiness, and verifies that a main-agent restart
 replaces the peer process. `ExecMainStartTimestampMonotonic` is reported
 separately and is not used as the sole startup boundary.
-Gateway start/restart commands are bounded at 180 seconds and the smoke unit at
-5400 seconds for the full per-store-path, security, loss and lifecycle
-network-policy probes in the 2-GiB guest. DAD recovery retains its 90-second
-test-specific wait and still requires current observation, authorization, and
-policy before startup. A smoke timeout is a failure; a QEMU
+Gateway unit start policy remains 180 seconds. The smoke unit is bounded at
+5400 seconds in the 2-GiB offline guest and 9000 seconds in the
+owner-authorized 3-GiB default-on combined guest. In the combined guest, three
+recovery transactions took 389, 395 and 422 seconds while local skills and
+Headroom were enabled; the longer bound is test-only and allows the maintained
+full restart/loss matrix to finish. DAD recovery uses a 420-second test-only
+start/active-observation bound; IPv6-route and split-producer recovery use
+900-second bounds for the multi-unit restart transactions under the measured
+9p/local-skill load. These test-only bounds still require current observation,
+authorization, and policy before startup; production start and
+freshness/revocation settings are unchanged. A smoke timeout is a failure; a QEMU
 runner exit after the guest requests poweroff is not a substitute for the
 `Hermes VM runtime checks passed` marker or for a clean `/nix/store` unmount.
-The RAM limit increased from 1 GiB
-to 2 GiB with operator approval; the 1-GiB disk limit is unchanged.
+The offline RAM limit increased from 1 GiB to 2 GiB with operator approval; the
+default-on combined test guest may use up to 3 GiB with owner authorization. The
+1-GiB disk limit is unchanged.
 For each real agent, the smoke check also runs `hermes profile list` from that
 agent's captured network namespace with its own `HOME` and verifies its default
 profile and the other agent's profile are visible. It stops the gateways while

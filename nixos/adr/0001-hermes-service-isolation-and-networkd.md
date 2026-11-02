@@ -399,38 +399,76 @@ Internet recovery marker passed; shutdown again failed to unmount `/nix/store`,
 and the wrapper was manually terminated. The activation guest passed
 module-disabled -> add -> source change -> last-agent removal -> re-add ->
 rollback through ordinary `switch-to-configuration test`; it sampled networkd's
-reload timestamp immediately after each switch and before helper startup, kept
-MainPID 515, and preserved uplink/gateway/DHCP sentinels and residue checks. Its
+reload timestamp after each switch, kept MainPID 515, and preserved
+uplink/gateway/DHCP sentinels and residue checks. This demonstrates the ordinary
+generation-switch recovery path alongside the evaluated NixOS reload-trigger
+integration; it does not attribute the reload to the declarative trigger rather
+than a runtime helper or establish that it preceded every helper start. Its
 guest marker passed; shutdown again failed the store unmount. Attachments 31 and
 32 contain bounded verbatim evidence. Neither focused guest proves a natural
 QEMU shutdown; bootloader/reboot/public IPv6 remain untested.
 
-The combined default-on/full-network run on the current candidate, using the
-same 2-GiB guest, OOM-killed the Headroom wrapper at guest uptime 553s (about
-1.0-GiB anonymous RSS); the peer gateway then failed with `Result=signal`, and
-the full test could not start. The later observer `config.json` error occurred
-during stop/cleanup, not the initiating failure. No validation-budget-expired
-message occurred in that serial run. A prior combined default-on/code-graph
-run did report `network validation cycle exceeded its budget` and correctly
-revoked authorization; the current OOM run neither reproduces nor clears that
-separate under-load validation finding. No tolerance/freshness rule was changed.
-The human has been asked whether 2 GiB is a supported minimum that must sustain
-two default-on Headroom instances, or whether a separate higher-memory full-test
-guest is permitted; until answered, do not increase test memory, relax
-validation/revocation, or disable features. Attachment 30 has the current OOM
-excerpt. The focused default-on security/profile probe is not a substitute for
-the combined full matrix.
+The prior 2-GiB combined default-on run OOM-killed the Headroom wrapper at guest
+uptime 553s (about 1.0-GiB anonymous RSS); the owner authorized a test-only
+increase to 3 GiB. Production resource policy, default-on features, and the
+two-second authorization/revocation bound remain unchanged. Historical OOM
+details are in attachment 30.
+
+Current-candidate default-on evidence is still incomplete. Run15 used launcher
+`/nix/store/xgjnby5wqlwhssi738kpiad2nagvcfn0-nixos-vm` and guest system
+`/nix/store/5c2vgwhvgmplz5rnj4a8qxgva55pgqjz-nixos-system-nixos-26.11.20261014.55bfb4d`.
+It passed default-on features, host-only DNS and the first five split-loss
+recovery cases, measuring 389, 395, 422, 423 and 404 seconds. The remaining
+host-proxy-child recovery was active when the inherited 5400-second smoke bound
+expired at guest uptime 5944; no full success marker was reached. The wrapper
+was later terminated during the `/nix/store` unmount stall.
+
+Run16 used launcher `/nix/store/pr2zqb9mdhb220xb8kbrk7c40wsz7ylz-nixos-vm` and
+guest system
+`/nix/store/5y2crfp5ap4nwcmpwn90d891a1sc7zyk-nixos-system-nixos-26.11.20261014.55bfb4d`.
+It passed the eight split-loss cases under the 900-second test-only recovery
+bound, then failed at guest uptime 7217 during recovery after host-permission
+revocation. The main gateway was active while the peer had just entered
+`start-pre`; the remaining 180-second aggregate start command was the diagnosed
+test-side bound. The VM then failed to unmount `/nix/store`; the smoke did not
+reach its success marker.
+
+The test harness now uses 900-second bounds for the measured multi-unit
+default-on recovery transactions, including split-loss and permission-recovery
+paths, and a 9000-second smoke bound only in the owner-authorized 3-GiB combined
+fixture. The 2-GiB offline smoke remains bounded at 5400 seconds. These are
+test-only limits; production `TimeoutStartSec=180s`, current-policy checks and
+the two-second revocation contract are unchanged. Run17 used launcher
+`/nix/store/rmy1r55pd40gs2npgs0npbwzyj5fcj3k-nixos-vm` and guest system
+`/nix/store/hcnwr4c332hy1fdrv7h9zjxqcwryi9qc-nixos-system-nixos-26.11.20261014.55bfb4d`;
+it was terminated during DAD recovery before the integrated matrix completed.
+The 9000-second test bound has not yet been exercised through a full success
+marker. No full default-on acceptance or resolution of the separate prior
+under-load validation-cycle finding is claimed.
+
+The `/nix/store` shutdown stall was compared against a no-Hermes control using
+the same VM fixture, 9p read-only store, and 2-GiB memory. Nix evaluation
+confirmed the Hermes module was disabled and none of the production gateway,
+network, DHCP, or readiness units existed. The no-Hermes smoke service finished
+successfully, then systemd reported `[FAILED] Failed unmounting /nix/store`; its
+300-second outer QEMU timeout exited 124. The current Hermes VM also reports
+the failure. This establishes a test-fixture baseline limitation independent of
+Hermes services, not a clean shutdown or an exact kernel-level busy-mount cause;
+the observed PID1/store mappings are not asserted as the sole cause.
 
 The owner cancelled the 15-second startup requirement and directed that startup
 remain as-is, prioritizing security (task comment 135). Startup latency remains
 diagnostic and is not an acceptance criterion. The 180-second service bound is
 an operational budget supported by measured local skill-installation time; it
 does not relax the two-second authorization/revocation bound. The offline full
-matrix, focused Internet/DNS recovery, activation/rollback, and effective unit
-enforcement have current-candidate guest success markers, but clean shutdown,
-the combined default-on resource decision, and the separate prior under-load
-validation-budget finding remain open. This ADR does not infer software
-acceptance, a risk exception, or release authorization.
+matrix, focused Internet/DNS recovery, activation/rollback, and
+effective unit enforcement have guest success markers from the previously
+reviewed candidate; exact current-candidate revalidation and the 3-GiB
+default-on full matrix remain open. Natural clean shutdown remains unproven; the
+matching no-Hermes control reproduced the fixture's `/nix/store` unmount
+failure. The separate prior under-load validation-budget finding remains open.
+This ADR does not infer software acceptance, a risk exception, or release
+authorization.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,

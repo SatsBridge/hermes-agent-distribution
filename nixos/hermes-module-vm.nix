@@ -605,6 +605,11 @@ let
 
       diagnose() {
         echo "Hermes VM runtime check failed; unit status follows:" >&2
+        local unit properties
+        for unit in hermes@vm.service hermes@vm-peer.service; do
+          properties=$(timeout 10s systemctl show --property=Id,Type,ActiveState,SubState,Result,TimeoutStartUSec,InvocationID,MainPID,ControlPID,ExecMainStartTimestampMonotonic,ExecStartPre,ExecStart,ExecStartPost "$unit" || true)
+          printf 'HERMES_START_DIAGNOSTICS unit=%s properties=%s\n' "$unit" "''${properties//$'\n'/;}" >&2
+        done
         timeout 15s systemctl status --no-pager --full "''${units[@]}" >&2 || true
         for unit in "''${units[@]}"; do
           timeout 15s journalctl -b -u "$unit" --no-pager -n 80 >&2 || true
@@ -766,7 +771,7 @@ let
       }
 
       wait_for_active() {
-        local deadline=$((SECONDS + 180)) next_report=$SECONDS ready state unit
+        local deadline=$((SECONDS + 600)) next_report=$SECONDS ready state unit
         while (( SECONDS < deadline )); do
           ready=1
           for unit in "''${units[@]}"; do
@@ -1763,7 +1768,9 @@ let
         echo "Revoked private permission blocked both an established flow's next packet and a new connection"
         stop_peer_probes
         timeout --kill-after=5s 30 systemctl restart nftables.service || { diagnose; return 1; }
-        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        echo "PRIVATE_PERMISSION_RECOVERY_START"
+        timeout --kill-after=5s 900 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        echo "PRIVATE_PERMISSION_RECOVERY_START_RETURNED"
         wait_for_active || { diagnose; return 1; }
         assert_distinct_namespaces || return 1
         start_peer_probes hermes@vm.service "''${agent_vm_ip}" "''${agent_vm_ip6}" || return 1
@@ -1804,8 +1811,10 @@ let
         assert_network_resources_clean ha0 hermes_agent_0 "''${agent_vm_subnet4}" "''${agent_vm_subnet6}" || return 1
         assert_network_resources_clean ha1 hermes_agent_1 "''${peer_agent_subnet4}" "''${peer_agent_subnet6}" || return 1
         timeout 30s systemctl reset-failed
-        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
+        echo "HOST_PERMISSION_RECOVERY_START"
+        timeout --kill-after=5s 900 systemctl start hermes@vm.service hermes@vm-peer.service \
           hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+        echo "HOST_PERMISSION_RECOVERY_START_RETURNED"
         wait_for_active || { diagnose; return 1; }
         assert_distinct_namespaces || return 1
         discover_network_values || return 1
@@ -1993,6 +2002,7 @@ let
         local scenario unit pid started deadline ready gateway set_output revoked elapsed
         stop_peer_probes
         for scenario in normal-slow-stop host-control netns network-observer dns-child host-proxy-child agent-relay-child stale-observer; do
+          echo "SPLIT_LOSS_SCENARIO_START scenario=$scenario"
           split_frozen_pid=
           started=$(python3 -c 'import time; print(time.monotonic_ns())')
           case "$scenario" in
@@ -2045,8 +2055,11 @@ let
           assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
           assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
           systemctl reset-failed
-          timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
+          echo "SPLIT_LOSS_RECOVERY_START scenario=$scenario"
+          timeout --kill-after=5s 900 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
+          echo "SPLIT_LOSS_RECOVERY_START_RETURNED scenario=$scenario"
           wait_for_active || return 1
+          echo "SPLIT_LOSS_RECOVERY_PASSED scenario=$scenario"
           assert_distinct_namespaces || return 1
         done
         start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
@@ -2112,7 +2125,8 @@ let
         assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
         restore_test_ipv6_ra || return 1
         systemctl reset-failed
-        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
+        # The default-on 9p guest serializes gateway activation; allow its full recovery transaction to finish.
+        timeout --kill-after=5s 900 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
         wait_for_active || return 1
         assert_distinct_namespaces || return 1
         discover_network_values || return 1
@@ -2195,7 +2209,7 @@ let
         systemctl daemon-reload
         systemctl reset-failed
         ipv6_route_pid="" ipv6_route_gateway=""
-        timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
+        timeout --kill-after=5s 600 systemctl start hermes@vm.service hermes@vm-peer.service hermes-pf@vm.service hermes-pf@vm-peer.service || return 1
         wait_for_active || return 1
         assert_distinct_namespaces || return 1
         discover_network_values || return 1
@@ -2207,6 +2221,7 @@ let
         local set_output main_ready peer_ready main_gateway peer_gateway scenario chain
         echo "Testing per-chain missing/stale guard-policy rejection with live allocation sets"
         for scenario in input-missing forward-stale; do
+          echo "GUARD_LOSS_SCENARIO_START scenario=$scenario"
           stop_peer_probes
           for entry in "ha0_peer4 $agent_vm_ip" "ha1_peer4 $peer_agent_ip"; do
             read -r set address <<< "$entry"
@@ -2240,6 +2255,7 @@ let
               echo "Readiness or gateway remained active after $scenario" >&2
               return 1
             }
+          echo "GUARD_LOSS_GATE_CLEARED scenario=$scenario"
           assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
           assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
           for set in ha0_peer4 ha1_peer4; do
@@ -2250,8 +2266,10 @@ let
             fi
           done
           timeout --kill-after=5s 30 systemctl restart nftables.service || { diagnose; return 1; }
-          timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
+          echo "GUARD_LOSS_RESTORED scenario=$scenario"
+          timeout --kill-after=5s 900 systemctl start hermes@vm.service hermes@vm-peer.service \
             hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
+          echo "GUARD_LOSS_START_RETURNED scenario=$scenario"
           wait_for_active || { diagnose; return 1; }
           assert_distinct_namespaces || return 1
           echo "Both agents revoked and reacquired after $scenario with current policy"
@@ -2390,13 +2408,19 @@ let
           }
         }
         wait_gateway_ready() {
-          local gateway="$1" ready="$2"
-          for _ in {1..900}; do
-            if [[ $(systemctl show --property=ActiveState --value "$gateway") == active \
-              && $(systemctl show --property=ActiveState --value "$ready") == active ]]; then return 0; fi
+          local gateway="$1" ready="$2" deadline=$((SECONDS + 420)) next_report=$((SECONDS + 30)) gateway_state ready_state
+          # Local skill setup and the VM-only boundary probe can delay DAD recovery under default-on 9p load.
+          while (( SECONDS < deadline )); do
+            gateway_state=$(systemctl show --property=ActiveState --value "$gateway")
+            ready_state=$(systemctl show --property=ActiveState --value "$ready")
+            if [[ "$gateway_state" == active && "$ready_state" == active ]]; then return 0; fi
+            if (( SECONDS >= next_report )); then
+              echo "DAD_RECOVERY_WAIT gateway=$gateway state=$gateway_state readiness=$ready_state elapsed=$((420 - deadline + SECONDS))s"
+              next_report=$((SECONDS + 30))
+            fi
             sleep 0.1
           done
-          echo "$gateway did not recover with its network readiness barrier within 90s" >&2
+          echo "$gateway did not recover with its network readiness barrier within 420s" >&2
           return 1
         }
         stop_peer_probes
@@ -2404,6 +2428,7 @@ let
         assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
         assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
         for agent in vm vm-peer; do
+          echo "DAD_READINESS_AGENT_START agent=$agent"
           if [[ "$agent" == vm ]]; then
             host_if=ha0; peer_if=hb0; subnet4="$agent_vm_subnet4"; subnet6="$agent_vm_subnet6"
           else
@@ -2413,12 +2438,14 @@ let
           ready="hermes-network-ready@$agent.service"
           network="hermes-network@$agent.service"
           dhcp="hermes-dhcp@$agent.service"
+          echo "DAD_READINESS_BASELINE_START agent=$agent ready=$ready"
           timeout --kill-after=5s 90 systemctl start "$ready" || { diagnose; return 1; }
           [[ $(systemctl show --property=ActiveState --value "$ready") == active ]] || {
             echo "$ready did not establish a valid pre-DAD readiness baseline" >&2
             diagnose
             return 1
           }
+          echo "DAD_READINESS_BASELINE_ACTIVE agent=$agent"
           client_pid=$(service_pid "$dhcp") || return 1
           peer6=$(nsenter --target "$client_pid" --net -- ip -j -6 address show dev "$peer_if" | python3 ${agentAddressFilter} inet6 64 | awk 'NR == 1 { print; exit }')
           [[ -n "$peer6" ]] || { echo "$peer_if has no usable peer IPv6 allocation after readiness" >&2; return 1; }
@@ -2429,10 +2456,13 @@ let
           publication="/run/hermes-agent-network-$index"
           before_controller=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["controller"])' "$publication/authorization.json")
           before_observer=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["invocation"])' "/run/hermes-observation-$agent/observation.json")
+          echo "DAD_READINESS_INJECT_START agent=$agent interface=$peer_if address=$peer6"
           inject_dadfailed_peer_address "$client_pid" "$peer_if" "$host_if" "$host_link_local" "$peer6" || return 1
           start_before=$(systemctl show --property=ExecMainStartTimestampMonotonic --value "$gateway")
+          echo "DAD_READINESS_BLOCKED_START agent=$agent gateway=$gateway"
           if timeout --kill-after=5s 60 systemctl start "$gateway"; then start_result=0; else start_result=$?; fi
           start_after=$(systemctl show --property=ExecMainStartTimestampMonotonic --value "$gateway")
+          echo "DAD_READINESS_BLOCKED_START_RETURNED agent=$agent status=$start_result execstart_before=$start_before execstart_after=$start_after"
           if [[ "$start_after" != "$start_before" ]]; then
             wait_gateway_ready "$gateway" "$ready" || { diagnose; return 1; }
             current_controller=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); a=json.load(open(sys.argv[2])); o=json.load(open(sys.argv[3])); assert a["authorized"] is True and a["generation"] == c["generation"]; assert a["controller"] != sys.argv[4]; assert o["generation"] == c["generation"] and o["invocation"] == a["observer"]; assert o["peer4"] and o["peer6"] and o["route4"] and o["route6"] and not o["dadfailed"]; assert o["invocation"] != sys.argv[5]; print(a["controller"])' "$publication/config.json" "$publication/authorization.json" "/run/hermes-observation-$agent/observation.json" "$before_controller" "$before_observer") || { echo "$gateway started without a new authorized observer generation" >&2; return 1; }
@@ -2465,8 +2495,11 @@ let
           fi
           cleanup_dad_fault
           timeout 30s systemctl reset-failed "$gateway" "$network" "$dhcp" "$ready"
-          timeout --kill-after=5s 180 systemctl start "$gateway" || { diagnose; return 1; }
+          echo "DAD_READINESS_RECOVERY_START agent=$agent gateway=$gateway"
+          timeout --kill-after=5s 420 systemctl start "$gateway" || { diagnose; return 1; }
+          echo "DAD_READINESS_RECOVERY_START_RETURNED agent=$agent"
           wait_gateway_ready "$gateway" "$ready" || { diagnose; return 1; }
+          echo "DAD_READINESS_RECOVERY_BARRIER_PASSED agent=$agent"
           if [[ "$agent" == vm-peer ]]; then discover_network_values || return 1; fi
         done
         for agent in vm vm-peer; do
@@ -2483,7 +2516,9 @@ let
           [[ -n "$peer6" ]] || { echo "$peer_if has no usable IPv6 allocation for address-loss test" >&2; return 1; }
           host_link_local=$(ip -j -6 address show dev "$host_if" | python3 -c 'import json,sys; print(next((a["local"] for link in json.load(sys.stdin) for a in link.get("addr_info", []) if a.get("family") == "inet6" and a.get("scope") == "link"), ""))')
           [[ -n "$host_link_local" ]] || { echo "$host_if has no host link-local IPv6 source for address-loss test" >&2; return 1; }
+          echo "DAD_ACTIVE_PROBE_START agent=$agent"
           inject_dadfailed_peer_address "$client_pid" "$peer_if" "$host_if" "$host_link_local" "$peer6" active || return 1
+          echo "DAD_ACTIVE_PROBE_INJECTED agent=$agent observed=$dad_event_observed revoked=$dad_namespace_revoked"
           for _ in {1..100}; do
             if [[ $(systemctl show --property=ActiveState --value "$ready") != active \
               && $(systemctl show --property=ActiveState --value "$gateway") != active ]]; then break; fi
@@ -2494,6 +2529,7 @@ let
             echo "$agent retained readiness/application after its IPv6 identity entered dadfailed" >&2
             return 1
           }
+          echo "DAD_ACTIVE_PROBE_GATE_CLEARED agent=$agent"
           ready_log=$(journalctl -u "hermes-network-observer@$agent.service" -b --no-pager -o cat)
           if (( dad_event_observed )); then
             grep -Fq "SLAAC DAD failed on $peer_if" <<< "$ready_log" || {
@@ -2511,8 +2547,11 @@ let
           timeout 30s systemctl reset-failed "$gateway" "hermes-network@$agent.service" "$dhcp" "$ready"
           recovery_units=("$gateway")
           if [[ "$agent" == vm ]]; then recovery_units+=(hermes@vm-peer.service); fi
-          timeout --kill-after=5s 180 systemctl start "''${recovery_units[@]}" || { diagnose; return 1; }
+          echo "DAD_ACTIVE_PROBE_RECOVERY_START agent=$agent units=''${recovery_units[*]}"
+          timeout --kill-after=5s 420 systemctl start "''${recovery_units[@]}" || { diagnose; return 1; }
+          echo "DAD_ACTIVE_PROBE_RECOVERY_START_RETURNED agent=$agent"
           wait_gateway_ready "$gateway" "$ready" || { diagnose; return 1; }
+          echo "DAD_ACTIVE_PROBE_RECOVERY_BARRIER_PASSED agent=$agent"
           discover_network_values || return 1
         done
         timeout --kill-after=5s 180 systemctl start hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
@@ -2596,6 +2635,7 @@ let
         echo "Testing main and peer startup rejection for independently missing/stale nftables policy"
         stop_peer_probes
         for scenario in input-missing forward-stale; do
+          echo "GUARD_POLICY_SCENARIO_START scenario=$scenario"
           case "$scenario" in
             input-missing) chain=hermes_agent_input_guard; other_chain=hermes_agent_forward_guard ;;
             forward-stale) chain=hermes_agent_forward_guard; other_chain=hermes_agent_input_guard ;;
@@ -2605,12 +2645,14 @@ let
           assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
           assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
           prime_dhcp_clients || { diagnose; return 1; }
+          echo "GUARD_POLICY_CLIENTS_READY scenario=$scenario"
           case "$scenario" in
             input-missing) nft flush chain inet hermes-agent-guard "$chain" ;;
             forward-stale)
               printf 'add rule inet hermes-agent-guard %s ip saddr 203.0.113.0/24 accept comment "vm-startup-stale-policy"\n' "$chain" | nft -f -
               ;;
           esac
+          echo "GUARD_POLICY_MUTATED scenario=$scenario chain=$chain"
           for unit in hermes@vm.service hermes@vm-peer.service; do
             start_before=$(systemctl show --property=ExecMainStartTimestampMonotonic --value "$unit")
             if timeout --kill-after=5s 60 systemctl start "$unit"; then
@@ -2639,6 +2681,7 @@ let
             assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
             assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
             timeout 30s systemctl reset-failed "''${units[@]}" hermes-network-failure@vm.service hermes-network-failure@vm-peer.service
+            echo "GUARD_POLICY_REJECTED unit=$unit scenario=$scenario"
           done
           [[ "$(nft -n list chain inet hermes-agent-guard "$other_chain")" == "$other_before" ]] || {
             echo "$scenario unexpectedly changed the other nftables guard chain" >&2
@@ -2647,12 +2690,15 @@ let
           timeout --kill-after=5s 60 systemctl stop hermes@vm.service hermes@vm-peer.service || return 1
           assert_network_resources_clean ha0 hermes_agent_0 "$agent_vm_subnet4" "$agent_vm_subnet6" || return 1
           assert_network_resources_clean ha1 hermes_agent_1 "$peer_agent_subnet4" "$peer_agent_subnet6" || return 1
+          echo "GUARD_POLICY_SCENARIO_PASSED scenario=$scenario"
           timeout --kill-after=5s 30 systemctl restart nftables.service || { diagnose; return 1; }
           timeout 30s systemctl reset-failed "''${units[@]}"
+          echo "GUARD_POLICY_RESTORED scenario=$scenario"
           timeout --kill-after=5s 180 systemctl start hermes@vm.service hermes@vm-peer.service \
             hermes-pf@vm.service hermes-pf@vm-peer.service || { diagnose; return 1; }
           wait_for_active || { diagnose; return 1; }
           assert_distinct_namespaces || return 1
+          echo "GUARD_POLICY_RECOVERY_PASSED scenario=$scenario"
           echo "Main and peer gateway ExecStart stayed blocked until nftables restored $scenario policy"
         done
         start_peer_probes hermes@vm.service "$agent_vm_ip" "$agent_vm_ip6" || return 1
@@ -3268,6 +3314,7 @@ in
       pkgs.gawk
       pkgs.util-linux
     ];
+    environment.HERMES_VM_MEMORY_LIMIT_KIB = "2097152";
     serviceConfig = {
       ExecStartPre = "${pkgs.coreutils}/bin/readlink -f /run/current-system";
       Type = "oneshot";
@@ -3282,10 +3329,11 @@ in
       test "$store_fs" = 9p
       case ",$store_options," in *,ro,*) ;; *) echo "/nix/.ro-store is not read-only" >&2; exit 1 ;; esac
       memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
-      test "$memory_kib" -le 2097152
+      memory_limit_kib="''${HERMES_VM_MEMORY_LIMIT_KIB:-2097152}"
+      test "$memory_kib" -le "$memory_limit_kib"
       findmnt --target /nix/.ro-store
       findmnt --target /nix/store
-      printf 'Guest MemTotal: %s kB (limit: 2097152 kB)\n' "$memory_kib"
+      echo "Guest MemTotal: $memory_kib kB (limit: $memory_limit_kib kB)"
       df -h /
       echo "Hermes VM smoke checks passed"
     '';
