@@ -368,32 +368,69 @@ child was present with `CapEff=0`, and peer profile/ACL checks denied opening
 probe now matches that observed command line. Guest shutdown still reported
 `[FAILED] Failed unmounting /nix/store`, so bounded teardown is not proven.
 
-The full offline/failure/lifecycle matrix was run with Headroom disabled,
-preserving the strict 2-second host-control validation cycle. It reached DAD,
-route-loss, firewall-loss/reload, DHCP rebind, peer denial, host-only resolver,
-and repeated cleanup/recovery checkpoints, but the outer 3600-second QEMU
-wrapper expired before `Hermes VM runtime checks passed`; shutdown also reported
-`[FAILED] Failed unmounting /nix/store`. This run is partial, not a pass.
+The current candidate's full offline/failure/lifecycle VM (`/run/current-system`
+`/nix/store/4q4ixzxvgkwpzq15a1xj5zslb0qg3ah7-nixos-system-nixos-26.11.20261014.55bfb4d`)
+ran with Headroom and default-skill installation disabled, as configured by the
+offline fixture. It reached `Hermes VM runtime checks passed` after DAD and
+route-loss startup/revocation, all eight bounded producer/child-loss cases,
+host-only DNS, DHCP ACK/rebind and blocked/stale-resolver recovery, nftables
+publication/readback failure and reload, mappings, interface collision, route
+overlap, peer `.env` denial, cleanup/recovery, and instantiated `systemd-analyze
+verify/security` plus payload-boundary probes for both agents and internal
+roles. Full-log search found no host-control validation-budget-expired diagnostic
+in this Headroom-disabled run. Verbatim excerpts, launcher command, closure
+identity, test marker, mount inventory, and shutdown failure are in attachment 33.
 
-A combined default-on/full-network run under the approved 2-GiB guest exposed
-`network validation cycle exceeded its budget` while Headroom/code-graph work
-was active; the controller correctly revoked authorization. No tolerance was
-added and no freshness or revocation rule was weakened. The default-on security
-probe therefore checks skills, Headroom, peer profile/ACL, DHCP and instantiated
-security separately from the full offline network-loss matrix. This is test
-partitioning, not evidence that the controller's under-load timing risk is
-resolved. Whether that combined under-load availability behavior needs a
-different owner-approved budget remains an open review question.
+The same guest's final pre-unmount inventory recorded 17 store references, zero
+namespace references, 644 store mappings, and ten private mount namespaces from
+host services including PID 1/systemd, networkd, resolved, udev, D-Bus, nsncd,
+logind, and dnsmasq. It did not identify the exact mount-busy holder. Shutdown
+then reported `[FAILED] Failed unmounting /nix/store`; the 5700-second outer
+timeout terminated QEMU, which printed `wrapper_exit=0` after handling SIGTERM.
+The guest test marker is a pass, but this is not natural clean shutdown and does
+not prove a baseline-only fixture limitation. Do not claim one until compared
+with an equivalent baseline shutdown.
+
+The focused current-candidate Internet guest independently passed both agents'
+exact-one-host-resolver A/AAAA positive and blocked-resolver negative checks
+before/after networkd restart, UDP/TCP DNS, public DNS, TCP/443 and
+certificate-verified HTTPS 200 with zero effective capabilities. Its focused
+Internet recovery marker passed; shutdown again failed to unmount `/nix/store`,
+and the wrapper was manually terminated. The activation guest passed
+module-disabled -> add -> source change -> last-agent removal -> re-add ->
+rollback through ordinary `switch-to-configuration test`; it sampled networkd's
+reload timestamp immediately after each switch and before helper startup, kept
+MainPID 515, and preserved uplink/gateway/DHCP sentinels and residue checks. Its
+guest marker passed; shutdown again failed the store unmount. Attachments 31 and
+32 contain bounded verbatim evidence. Neither focused guest proves a natural
+QEMU shutdown; bootloader/reboot/public IPv6 remain untested.
+
+The combined default-on/full-network run on the current candidate, using the
+same 2-GiB guest, OOM-killed the Headroom wrapper at guest uptime 553s (about
+1.0-GiB anonymous RSS); the peer gateway then failed with `Result=signal`, and
+the full test could not start. The later observer `config.json` error occurred
+during stop/cleanup, not the initiating failure. No validation-budget-expired
+message occurred in that serial run. A prior combined default-on/code-graph
+run did report `network validation cycle exceeded its budget` and correctly
+revoked authorization; the current OOM run neither reproduces nor clears that
+separate under-load validation finding. No tolerance/freshness rule was changed.
+The human has been asked whether 2 GiB is a supported minimum that must sustain
+two default-on Headroom instances, or whether a separate higher-memory full-test
+guest is permitted; until answered, do not increase test memory, relax
+validation/revocation, or disable features. Attachment 30 has the current OOM
+excerpt. The focused default-on security/profile probe is not a substitute for
+the combined full matrix.
 
 The owner cancelled the 15-second startup requirement and directed that startup
 remain as-is, prioritizing security (task comment 135). Startup latency remains
 diagnostic and is not an acceptance criterion. The 180-second service bound is
 an operational budget supported by measured local skill-installation time; it
-does not relax the two-second authorization/revocation bound. Full offline
-matrix, default-on interaction, Internet DNS/TLS, activation attribution and
-rollback, and clean teardown remain open until final-candidate evidence is
-attached. No software acceptance, risk exception or release authorization is
-inferred.
+does not relax the two-second authorization/revocation bound. The offline full
+matrix, focused Internet/DNS recovery, activation/rollback, and effective unit
+enforcement have current-candidate guest success markers, but clean shutdown,
+the combined default-on resource decision, and the separate prior under-load
+validation-budget finding remain open. This ADR does not infer software
+acceptance, a risk exception, or release authorization.
 
 Rollout is local-only and requires independent review. Ordinary generation
 activation/rollback must preserve both state sentinels, persistent DHCP state,
