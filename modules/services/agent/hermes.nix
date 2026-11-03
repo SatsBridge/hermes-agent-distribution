@@ -355,7 +355,8 @@ let
       uid="$(stat --printf=%u -- "''${RUNTIME_DIRECTORY%%:*}")"
       gid="$(stat --printf=%g -- "''${RUNTIME_DIRECTORY%%:*}")"
 
-      exec chown -R "$uid:$gid" -- "$HOME"
+      # $HOME is a symlink into /var/lib/private; chown -R does not follow it, so resolve it first.
+      exec chown -R "$uid:$gid" -- "$(readlink -f -- "$HOME")"
     '';
   };
 
@@ -1058,6 +1059,7 @@ let
       agentNetwork = agentNetworks.${name};
       portMappings = portMappingsForAgent name;
       networkSetup = mkAgentNetworkSetup name agentNetwork portMappings;
+      dhcpLeaseFile = "/run/systemd/netif/dhcp-server-lease/${agentNetwork.hostIf}";
       dhcpExecStart = pkgs.writeShellApplication {
         name = "hermes-dhcp-${toString agentNetwork.index}";
         runtimeInputs = [ pkgs.dhcpcd ];
@@ -1209,8 +1211,15 @@ let
           overrideStrategy = "asDropin";
           serviceConfig = {
             BindReadOnlyPaths = [ "/etc/resolv.conf:/run/hermes-host-resolv.conf" ] ++ networkClosure;
+            # networkd keeps a DHCP server lease per interface name, even after the
+            # veth is removed. A stale lease for an older agent blocks the new client.
+            # The "+" prefix runs these outside the unit's sandbox, which cannot write there.
+            ExecStartPre = [ "+${lib.getExe' pkgs.coreutils "rm"} -f -- ${dhcpLeaseFile}" ];
             ExecStart = "${lib.getExe networkSetup} setup";
-            ExecStopPost = "${lib.getExe networkSetup} cleanup";
+            ExecStopPost = [
+              "${lib.getExe networkSetup} cleanup"
+              "+${lib.getExe' pkgs.coreutils "rm"} -f -- ${dhcpLeaseFile}"
+            ];
           };
         };
         "hermes-dhcp@${name}" = {
@@ -1521,7 +1530,9 @@ let
             ProtectHostname = "private";
             ProtectKernelLogs = true;
             ProtectKernelModules = true;
-            ProtectKernelTunables = true;
+            # dhcpcd writes /proc/sys/net/ipv6/conf/<if>/{autoconf,accept_ra}. With
+            # ProtectKernelTunables it fails with "Read-only file system" and exits.
+            ProtectKernelTunables = false;
             ProtectProc = "invisible";
             ProtectSystem = "strict";
             ReadWritePaths = [
@@ -1835,6 +1846,11 @@ let
     "d ${sharedStatePath}/kanban 2770 root ${sharedStateId} - -"
     "d ${sharedStatePath}/kanban/logs 2770 root ${sharedStateId} - -"
     "d ${sharedStatePath}/kanban/workspaces 2770 root ${sharedStateId} - -"
+    # Every agent writes the shared kanban board, kanban.db sits in the share root.
+    # Default ACL entries make new files (and sqlite journals) group-writable under
+    # the agent's umask; the access entries cover the directory itself.
+    "A+ ${sharedStatePath} - - - - d:g:${sharedStateId}:rwX,g:${sharedStateId}:rwX"
+    "A+ ${sharedStatePath}/kanban - - - - d:g:${sharedStateId}:rwX,g:${sharedStateId}:rwX"
   ];
   sharedStateId = "hermes-shared";
   sharedStatePath = "%S/${sharedStateId}";
