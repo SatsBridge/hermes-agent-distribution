@@ -785,6 +785,8 @@ let
                 line = line.replace("meta l4proto tcp", "meta l4proto 6")
                 line = line.replace("meta l4proto udp", "meta l4proto 17")
                 line = line.replace("meta l4proto ipv6-icmp", "meta l4proto 58")
+                # nft prints a one-element set without braces: { "ha0" } -> "ha0"
+                line = re.sub(r"[{] ([\x22][^\x22]*[\x22]) [}]", r"\1", line)
                 def canonicalize_addresses(match):
                     keyword, values = match.groups()
                     networks = [ipaddress.ip_network(value.strip(), strict=False) for value in values.split(",")]

@@ -222,6 +222,9 @@ python313Packages.overrideScope (
         prices.write_text(json.dumps(model_cost, indent=4) + "\n")
         PY
       '';
+      # nixpkgs' patches target litellm 1.106.x; the retry-for-import patch
+      # does not apply to the 1.101.0 source pinned here. Drop them.
+      patches = [ ];
       src = fetchFromGitHub {
         hash = "sha256-rYsMMuk3/DgSJclKrK354m9mJli3Ug2gR16+mIx0LDY=";
         owner = "BerriAI";

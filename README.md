@@ -454,6 +454,10 @@ project for Nix without network access. It covers these steps:
   the names of declarations in the Nix files. By default, it only shows the
   changes. Add `--write` to change the files. Do not use `--write` on `inherit`
   lines that have comments.
+- [`scripts/nix-build-tuned.sh`](scripts/nix-build-tuned.sh) runs `nix build`
+  with explicit `--jobs`, `--cores`, `--build-dir`, extra cache, and
+  `--keep-going` settings. Run `--help` for all options. The script changes no
+  system configuration.
 - [`.github/workflows/nix.yml`](.github/workflows/nix.yml) reads the
   `githubActions` matrix from the flake. Then it builds each check on each
   system.

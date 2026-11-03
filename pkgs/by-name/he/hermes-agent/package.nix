@@ -485,6 +485,9 @@ let
       "rich"
       "pillow"
       "croniter"
+      # upstream spells these prompt_toolkit / Markdown; the hook matches names literally
+      "prompt_toolkit"
+      "markdown"
     ];
 
     # Only used by upstream's icon generator, which is not installed.
