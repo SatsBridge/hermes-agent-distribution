@@ -383,6 +383,7 @@ let
       ./0021-fix-aux-omit-empty-service-tier-fields.patch
       ./0022-fix-curator-preserve-auxiliary-tier-on-fallback.patch
       ./0023-fix-aux-retain-service-tier-through-Codex-adapter.patch
+      ./0024-fix-launchers-honor-HERMES_PYTHON-for-gateway-restart.patch
     ];
     pname = "hermes-agent";
 

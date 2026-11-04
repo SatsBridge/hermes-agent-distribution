@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes-agent@localhost>
+Date: Tue, 3 Nov 2026 22:40:00 +0000
+Subject: [PATCH 24/24] fix(launchers): honor HERMES_PYTHON for gateway-restart child
+
+runtime_command() fell back to sys.executable and removed PYTHONPATH, so the
+restart child could not import ruamel.yaml under the Nix wrapper. Use the
+HERMES_PYTHON interpreter that the Nix build already sets.
+
+---
+--- a/hermes_cli/_launchers.py
++++ b/hermes_cli/_launchers.py
+@@ -45,7 +45,14 @@
+     No selected generation or ambient PYTHONPATH is captured in the command.
+     """
+     root = Path(repo_root).resolve()
+-    python = python or resolve_store_python(root) or Path(sys.executable)
++    # Nix sets HERMES_PYTHON to the interpreter whose site-packages hold the dependencies.
++    # sys.executable alone can be a bare interpreter, and the child drops PYTHONPATH.
++    python = (
++        python
++        or resolve_store_python(root)
++        or os.environ.get("HERMES_PYTHON")
++        or Path(sys.executable)
++    )
+     entry = f"exec({_inline_string_literal(code)})" if code is not None else (
+         f"runpy.run_module({_inline_string_literal(module)}, run_name='__main__', alter_sys=True)")
+     # A literal home is pinned up front; the default one needs ``hermes_constants`` from the
