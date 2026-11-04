@@ -406,22 +406,6 @@ let
       grep -q HERMES_DISABLE_LAZY_INSTALLS $out/bin/hermes
     '';
 
-    # These re-exec sys.executable, which is the bare interpreter without Hermes'
-    # dependencies under Nix. Use the wrapper-provided env.
-    postPatch = ''
-      substituteInPlace tui_gateway/server.py \
-        --replace-fail 'argv = [sys.executable, "-m", "tui_gateway.slash_worker"' \
-          'argv = [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "tui_gateway.slash_worker"'
-      substituteInPlace tools/browser_use_cli.py \
-        --replace-fail 'return [sys.executable, "-m", "browser_harness.run"]' \
-          'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "browser_harness.run"]'
-      substituteInPlace hermes_cli/doctor_platform.py \
-        --replace-fail '[sys.executable, "-c", "import hermes_cli.web_server"]' \
-          '[os.environ.get("HERMES_PYTHON", sys.executable), "-c", "import hermes_cli.web_server"]'
-      substituteInPlace hermes_cli/kanban_db_dispatch.py \
-        --replace-fail 'return [sys.executable, "-m", "hermes_cli.main"]' \
-          'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "hermes_cli.main"]'
-    '';
     pyproject = true;
 
     pythonImportsCheck = [
@@ -460,6 +444,11 @@ let
       "rich"
       "pillow"
       "croniter"
+      # upstream's == pins are newer than nixpkgs
+      "truststore"
+      # upstream spells these prompt_toolkit / Markdown; the hook matches names literally
+      "prompt_toolkit"
+      "markdown"
     ];
 
     # Only used by upstream's icon generator, which is not installed.
@@ -492,7 +481,7 @@ let
       cp -r "$TMPDIR/web-dist"/. $out/share/hermes-web/
       runHook postInstall
     '';
-    npmDepsHash = "sha256-45CV8Qavo5UQlUfSQuWzhZK1Xicx9iW8dDDsDvAM2Dc=";
+    npmDepsHash = "sha256-S+wEg5voD8xi4sIKCZJrxAAW5AetjD1zpcNLkN+CCQ4=";
 
     # The apps/desktop workspace pulls in electron; skip its binary download
     # and all install scripts — the esbuild/vite builds below don't need them.
@@ -578,7 +567,7 @@ let
   nemo-relay = python3.pkgs.buildPythonPackage rec {
 
     cargoDeps = rustPlatform.fetchCargoVendor {
-      hash = "sha256-P9+/lvxQVm+H1+qM8lPo2aXMLJTHM1F8HWS7x0I2jPs=";
+      hash = "sha256-cRHjFwGY2hjctwMiaDCZ/qEUGw2gGt3G0C9TH2Ju6so=";
       name = "nemo-relay-${version}";
       inherit src;
     };
@@ -608,12 +597,12 @@ let
     ];
 
     src = fetchFromGitHub {
-      hash = "sha256-+2jhLqjcYUWBhuwNMaVK/ICtnrwYuc5gtCo6b8EGp68=";
+      hash = "sha256-0U5Mcm/vHrk8bnH/VmpUG7Cl3CbAhGlpKQyYbrCL++U=";
       owner = "NVIDIA";
       repo = "NeMo-Relay";
       tag = version;
     };
-    version = "0.10.3";
+    version = "0.11.0";
   };
 
   optionalDeps = with python3.pkgs; {
@@ -715,7 +704,7 @@ let
   # resolves the gateway import root from HERMES_PYTHON_SRC_ROOT.
   pythonEnv = python3.withPackages (_: hermesDeps);
   # The source commit this build compiles; the install stamp reports it.
-  rev = "eeea898bd7f79c3c59ae4b82a79ca9afd0fa6e92";
+  rev = "0729dbc89e13c09f2d9eee677fc86897223c0824";
 
   # pyramid dropped its pkg_resources shim on python 3.14, so slack-bolt's
   # pyramid adapter tests fail at collection with ModuleNotFoundError.
@@ -735,10 +724,10 @@ let
       ];
     });
 
-  # The fork carries the distribution patches as commits on top of v0.22.2 (SatsBridge/hermes-agent
-  # PR #1). Pin the commit, not a tag: the patched head is not a release.
+  # The fork carries the distribution patches as commits on top of v0.22.7 (SatsBridge/hermes-agent
+  # PR #2). Pin the commit, not a tag: the patched head is not a release.
   src = fetchFromGitHub {
-    hash = "sha256-QkbnhQtS8+cHGqGbwkTk6fsdB0aJ9FYm66iBy0FY9NQ=";
+    hash = "sha256-bV35NkT22O2w5wtFqs84K7Ku6WkjR+BKVVCY8WJp9+A=";
     owner = "SatsBridge";
     # contributors/emails/ holds paths differing only in case; they collapse
     # on case-insensitive stores (APFS) so the NAR hash diverges between
@@ -752,6 +741,6 @@ let
   };
   treefmt = treefmtEval ./treefmt.nix;
 
-  version = "0.22.2";
+  version = "0.22.7";
 in
 hermes-agent
