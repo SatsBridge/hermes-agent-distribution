@@ -1698,7 +1698,11 @@ in
       enableIPv6 = true;
       internalInterfaces = map (network: network.hostIf) (builtins.attrValues agentNetworks);
     };
-    nix.settings.allowed-users = map (name: "hermes-${name}") (builtins.attrNames cfg.agents);
+    # A definition here replaces NixOS's default "*", so keep administrators next to the agents.
+    nix.settings.allowed-users = [
+      "@wheel"
+    ]
+    ++ map (name: "hermes-${name}") (builtins.attrNames cfg.agents);
 
     systemd = mkMerge (
       [
