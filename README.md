@@ -7,8 +7,9 @@ and its supporting tools. It also runs isolated Hermes agents on NixOS.
 
 This repository supplies these items:
 
-- **Hermes Agent 0.22.2.** The package builds the Nous Research release from
-  source. It adds 23 local patches, the terminal UI, and the web dashboard.
+- **Hermes Agent 0.22.7.** The package builds the Nous Research release from
+  source from the SatsBridge fork at a pinned commit. The fork carries the local
+  patches as commits, plus the terminal UI and the web dashboard.
 - **The NixOS module `hermes-specialised-agent`.** The module runs one or more
   Hermes agents as systemd services. Each agent has its own user, state
   directory, network namespace, firewall rules, and read-only Nix store view.
@@ -220,7 +221,6 @@ check of each message.
 │       └── headroom-source/      Headroom source pin and patches
 ├── headroom-nix/AGENTS.md        Notes for coding agents (Headroom)
 ├── .agents/skills/               Skills for coding agents
-├── scripts/                      Maintenance scripts
 └── .github/workflows/nix.yml     CI
 ```
 
@@ -305,18 +305,25 @@ The internet variant needs outbound DNS and HTTPS on the host. Start it with
 
 Location: [`pkgs/by-name/he/hermes-agent/`](pkgs/by-name/he/hermes-agent/)
 
-The package builds tag `v0.22.2` of `NousResearch/hermes-agent`. It has no
-README. These are its important properties:
+The package builds commit `0729dbc89e` of `SatsBridge/hermes-agent`
+([PR #2](https://github.com/SatsBridge/hermes-agent/pull/2)). That commit is
+upstream `v0.22.7` with the local patches applied as commits. The patch
+history, the fixes, and the review live in that repository, not here. These
+are its important properties:
 
-- **Patches 0001–0002** correct the Kanban worker home and scope Kanban claims
-  to the UID.
-- **Patches 0003–0023** add service tiers (`flex`, `priority`, fast mode). They
-  apply to Gemini, OpenRouter, the TUI, auxiliary models, the curator, and the
-  Codex adapter. Patch 0010 adds an opt-in TTFT tier escalation.
+- **Kanban.** The patches correct the Kanban worker home and scope Kanban claims
+  to the UID. The gateway owner accepts cards for its `kanban.agent_profile_name`
+  alias, which the NixOS module sets for each agent.
+- **Service tiers.** The patches add service tiers (`flex`, `priority`, fast
+  mode) for Gemini, OpenRouter, the TUI, auxiliary models, the curator, and the
+  Codex adapter, with an opt-in TTFT tier escalation.
 - **Frontends.** The `hermes-frontend` derivation builds the terminal UI and
   the web dashboard from the upstream npm workspaces.
 - **Wrapper.** `HERMES_MANAGED=nixos` stops `hermes update` from changes to the
-  Nix store. `HERMES_DISABLE_LAZY_INSTALLS=1` stops `pip` installs at runtime.
+  Nix store. With it, Hermes starts its own child processes (Kanban worker, cron
+  worker, slash worker) on `HERMES_PYTHON`, the interpreter with the
+  dependencies. `HERMES_DISABLE_LAZY_INSTALLS=1` stops `pip` installs at
+  runtime.
 - **Runtime tools.** The wrapper adds `node`, `cosign`, `tirith`,
   `agent-browser`, `playwright`, `chromium`, and `gh` to `PATH`.
 - **Optional extras.** The package includes all extras that Nixpkgs has. It
@@ -402,10 +409,6 @@ project for Nix without network access. It covers these steps:
   `nix fmt`. They include `nixfmt`, `deadnix`, `statix`, `rustfmt`, `rumdl`,
   `yamllint`, `actionlint`, and `zizmor`. Each package also has its own
   `treefmt.nix`.
-- [`scripts/sort_nix_declarations.py`](scripts/sort_nix_declarations.py) sorts
-  the names of declarations in the Nix files. By default, it only shows the
-  changes. Add `--write` to change the files. Do not use `--write` on `inherit`
-  lines that have comments.
 - [`.github/workflows/nix.yml`](.github/workflows/nix.yml) reads the
   `githubActions` matrix from the flake. Then it builds each check on each
   system.

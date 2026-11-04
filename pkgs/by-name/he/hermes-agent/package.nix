@@ -359,31 +359,6 @@ let
       inherit hermes-frontend installStamp nemo-relay;
     };
 
-    patches = [
-      ./0001-fix-kanban-preserve-declared-home-for-identity-worke.patch
-      ./0002-fix-kanban-scope-claims-to-uid-and-refresh-crash-gra.patch
-      ./0003-feat-fast-service_tier-flex-one-edit-in-the-centrali.patch
-      ./0004-feat-gemini-emit-service_tier-as-a-top-level-generat.patch
-      ./0005-fix-tui-send-the-configured-tier-from-TUI-desktop-bu.patch
-      ./0006-fix-align-service-tier-flex-runtime-boundaries.patch
-      ./0007-fix-tui-reject-invalid-fast-mode-mirror-requests.patch
-      ./0008-fix-tui-validate-lazy-service-tier-against-resolved-.patch
-      ./0009-feat-openrouter-service-tiers-flex-priority-and-per-.patch
-      ./0010-feat-agent-opt-in-TTFT-service-tier-escalation-for-O.patch
-      ./0011-fix-agent-principal-review-hardening-for-service-tie.patch
-      ./0012-fix-service-tier-preserve-route-and-session-compatib.patch
-      ./0013-fix-tui-validate-and-persist-fast-tier-pins.patch
-      ./0014-fix-tui-validate-fast-tier-before-worker-writes.patch
-      ./0015-fix-tui-complete-live-fast-slash-authority.patch
-      ./0016-fix-tui-preserve-fast-pins-across-compute-hosts.patch
-      ./0017-fix-tui-preserve-fast-pin-through-host-bootstrap.patch
-      ./0018-fix-aux-resolve-service-tiers-across-auxiliary-paths.patch
-      ./0019-fix-aux-preserve-tier-intent-through-route-changes.patch
-      ./0020-fix-aux-keep-auxiliary-tier-config-route-aware.patch
-      ./0021-fix-aux-omit-empty-service-tier-fields.patch
-      ./0022-fix-curator-preserve-auxiliary-tier-on-fallback.patch
-      ./0023-fix-aux-retain-service-tier-through-Codex-adapter.patch
-    ];
     pname = "hermes-agent";
 
     # Upstream keeps runtime data outside site-packages and locates it through
@@ -431,22 +406,6 @@ let
       grep -q HERMES_DISABLE_LAZY_INSTALLS $out/bin/hermes
     '';
 
-    # These re-exec sys.executable, which is the bare interpreter without Hermes'
-    # dependencies under Nix. Use the wrapper-provided env.
-    postPatch = ''
-      substituteInPlace tui_gateway/server.py \
-        --replace-fail 'argv = [sys.executable, "-m", "tui_gateway.slash_worker"' \
-          'argv = [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "tui_gateway.slash_worker"'
-      substituteInPlace tools/browser_use_cli.py \
-        --replace-fail 'return [sys.executable, "-m", "browser_harness.run"]' \
-          'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "browser_harness.run"]'
-      substituteInPlace hermes_cli/doctor_platform.py \
-        --replace-fail '[sys.executable, "-c", "import hermes_cli.web_server"]' \
-          '[os.environ.get("HERMES_PYTHON", sys.executable), "-c", "import hermes_cli.web_server"]'
-      substituteInPlace hermes_cli/kanban_db_dispatch.py \
-        --replace-fail 'return [sys.executable, "-m", "hermes_cli.main"]' \
-          'return [os.environ.get("HERMES_PYTHON", sys.executable), "-m", "hermes_cli.main"]'
-    '';
     pyproject = true;
 
     pythonImportsCheck = [
@@ -485,6 +444,11 @@ let
       "rich"
       "pillow"
       "croniter"
+      # upstream's == pins are newer than nixpkgs
+      "truststore"
+      # upstream spells these prompt_toolkit / Markdown; the hook matches names literally
+      "prompt_toolkit"
+      "markdown"
     ];
 
     # Only used by upstream's icon generator, which is not installed.
@@ -517,7 +481,7 @@ let
       cp -r "$TMPDIR/web-dist"/. $out/share/hermes-web/
       runHook postInstall
     '';
-    npmDepsHash = "sha256-45CV8Qavo5UQlUfSQuWzhZK1Xicx9iW8dDDsDvAM2Dc=";
+    npmDepsHash = "sha256-S+wEg5voD8xi4sIKCZJrxAAW5AetjD1zpcNLkN+CCQ4=";
 
     # The apps/desktop workspace pulls in electron; skip its binary download
     # and all install scripts — the esbuild/vite builds below don't need them.
@@ -603,7 +567,7 @@ let
   nemo-relay = python3.pkgs.buildPythonPackage rec {
 
     cargoDeps = rustPlatform.fetchCargoVendor {
-      hash = "sha256-P9+/lvxQVm+H1+qM8lPo2aXMLJTHM1F8HWS7x0I2jPs=";
+      hash = "sha256-cRHjFwGY2hjctwMiaDCZ/qEUGw2gGt3G0C9TH2Ju6so=";
       name = "nemo-relay-${version}";
       inherit src;
     };
@@ -633,12 +597,12 @@ let
     ];
 
     src = fetchFromGitHub {
-      hash = "sha256-+2jhLqjcYUWBhuwNMaVK/ICtnrwYuc5gtCo6b8EGp68=";
+      hash = "sha256-0U5Mcm/vHrk8bnH/VmpUG7Cl3CbAhGlpKQyYbrCL++U=";
       owner = "NVIDIA";
       repo = "NeMo-Relay";
       tag = version;
     };
-    version = "0.10.3";
+    version = "0.11.0";
   };
 
   optionalDeps = with python3.pkgs; {
@@ -739,7 +703,8 @@ let
   # PTY path copies wrapper env into a nested Node subprocess, which then
   # resolves the gateway import root from HERMES_PYTHON_SRC_ROOT.
   pythonEnv = python3.withPackages (_: hermesDeps);
-  rev = "d923a5eb487a17c0a68801bba9ef0f56c81040a8";
+  # The source commit this build compiles; the install stamp reports it.
+  rev = "0729dbc89e13c09f2d9eee677fc86897223c0824";
 
   # pyramid dropped its pkg_resources shim on python 3.14, so slack-bolt's
   # pyramid adapter tests fail at collection with ModuleNotFoundError.
@@ -759,9 +724,11 @@ let
       ];
     });
 
+  # The fork carries the distribution patches as commits on top of v0.22.7 (SatsBridge/hermes-agent
+  # PR #2). Pin the commit, not a tag: the patched head is not a release.
   src = fetchFromGitHub {
-    hash = "sha256-Zs5Jr2BZ89RHbyj2WX2y4hIh4Vuwz8mJvGJooWytCk4=";
-    owner = "NousResearch";
+    hash = "sha256-bV35NkT22O2w5wtFqs84K7Ku6WkjR+BKVVCY8WJp9+A=";
+    owner = "SatsBridge";
     # contributors/emails/ holds paths differing only in case; they collapse
     # on case-insensitive stores (APFS) so the NAR hash diverges between
     # Linux and darwin. Unused at build/runtime. Upstream:
@@ -770,10 +737,10 @@ let
       rm -rf "$out/contributors"
     '';
     repo = "hermes-agent";
-    tag = "v${version}";
+    inherit rev;
   };
   treefmt = treefmtEval ./treefmt.nix;
 
-  version = "0.22.2";
+  version = "0.22.7";
 in
 hermes-agent
